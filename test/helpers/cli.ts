@@ -2,9 +2,11 @@
 // interoperability tests.
 import { spawn, type ChildProcess } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 
-export const CLI_BIN = process.env.SIMPLEX_CHAT_BIN ?? '/dev/shm/sx/bin/simplex-chat';
+export const CLI_BIN = process.env.SIMPLEX_CHAT_BIN ?? 'simplex-chat';
+const DATA_DIR = process.env.CLI_DATA_DIR ?? path.join(os.tmpdir(), 'duplex-cli');
 
 export interface CliEvent {
   corrId?: string;
@@ -26,12 +28,14 @@ export class Cli {
     readonly dir: string,
   ) {}
 
-  static async start(name: string, port: number, server: string, extra: string[] = []): Promise<Cli> {
-    const dir = path.join('/dev/shm/sx/cli', `${name}-${port}`);
+  /** server: the SMP server for new queues, or undefined for the preset servers of the SimpleX network */
+  static async start(name: string, port: number, server: string | undefined, extra: string[] = []): Promise<Cli> {
+    const dir = path.join(DATA_DIR, `${name}-${port}`);
     fs.rmSync(dir, { recursive: true, force: true });
     fs.mkdirSync(dir, { recursive: true });
     const c = new Cli(name, port, dir);
-    const args = ['-d', path.join(dir, 'db'), '-s', server, '-p', String(port), '--user-display-name', name, '--smp-proxy', 'never', '--smp-web-port-servers', 'off', ...extra];
+    const net = server ? ['-s', server, '--smp-proxy', 'never', '--smp-web-port-servers', 'off'] : [];
+    const args = ['-d', path.join(dir, 'db'), '-p', String(port), '--user-display-name', name, ...net, ...extra];
     c.proc = spawn(CLI_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     c.proc.stdout!.on('data', (d) => c.log.push(String(d)));
     c.proc.stderr!.on('data', (d) => c.log.push(String(d)));
