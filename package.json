@@ -11,7 +11,8 @@
     "typecheck": "tsc --noEmit -p .",
     "test": "node --import tsx --test test/unit/*.test.ts",
     "test:local": "node --import tsx --test --test-concurrency=1 test/local/*.test.ts",
-    "relay": "node relay/wisp-relay.mjs"
+    "relay": "node relay/wisp-relay.mjs",
+    "test:interop": "node --import tsx --test --test-concurrency=1 test/interop/*.test.ts"
   },
   "dependencies": {
     "@noble/ciphers": "^2.4.0",
