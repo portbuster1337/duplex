@@ -1,0 +1,142 @@
+# Duplex
+
+An unofficial, privacy-focused web client compatible with the [SimpleX network](https://simplex.chat).
+It runs entirely in the browser, as static files: there is no Duplex server, no account and nothing
+to install.
+
+**Open it: <https://portbuster.codeberg.page/duplex/>** (about: <https://portbuster.codeberg.page/duplex/about/>)
+
+Duplex is independent and is not affiliated with or endorsed by SimpleX Chat Ltd. SimpleX and SimpleX
+Chat are trademarks of SimpleX Chat Ltd.
+
+## What it does
+
+- **No user IDs.** You connect by sharing a 1-time link (or its QR code), or a contact address that
+  people can send contact requests to. Links of the SimpleX Chat apps work too, short and full ones.
+- **Works with the SimpleX Chat apps**: text with SimpleX markdown, replies, edits, deletion (for
+  everyone or for you), reactions, delivery receipts, received disappearing messages, profile
+  pictures, contact addresses with automatic or manual acceptance of requests.
+- **End-to-end encrypted** with the double ratchet (X448, AES-256-GCM, header encryption), per-queue
+  NaCl boxes, and TLS 1.3 to servers that are pinned to the fingerprint in their address.
+- **Encrypted at rest.** Everything stored in the browser (IndexedDB) is encrypted with
+  XChaCha20-Poly1305 under a random key, which is encrypted with a key derived from your passphrase
+  (Argon2id, 64 MiB). Record names are keyed hashes and sizes are padded, so the storage does not show
+  your contacts or how much you chat. The app can lock itself after a period of inactivity.
+- **Nothing from elsewhere.** The page loads no third-party scripts, fonts, analytics or cookies, and
+  fetches no link previews; the Content Security Policy only allows its own files and WebSocket
+  connections to relays.
+
+## How it works
+
+The SimpleX network carries messages through queues on SimpleX servers (SMP routers). Each
+conversation uses its own pair of queues, created by the two clients, and nothing links your
+conversations to each other or to you.
+
+Browsers cannot open the TCP connections that SimpleX servers need, so Duplex asks a
+[Wisp](https://github.com/MercuryWorkshop/wisp-protocol) relay (TCP streams over a WebSocket) for a
+connection and runs its own TLS 1.3 inside it (`src/core/net/tls13.ts`), checking the server's
+certificate chain against the fingerprint in the server address. On top of that it implements the
+SimpleX Messaging Protocol, the SMP agent protocol (fast duplex handshake, short links, contact
+addresses, message integrity, receipts) and the chat protocol, following
+[simplexmq](https://github.com/simplex-chat/simplexmq) and
+[simplex-chat](https://github.com/simplex-chat/simplex-chat).
+
+```
+this page ──WebSocket──▶ Wisp relay ──TCP──▶ SimpleX servers ◀── your contact's app
+   └──────────── TLS 1.3, SMP, e2e encryption ────────────┘
+```
+
+By default the page uses public Wisp relays (Wasmer, AnuraOS, Mercury Workshop), tried in order, so
+it works without installing anything.
+
+### Privacy model
+
+| | can see | cannot see |
+|---|---|---|
+| the Wisp relay | your IP address, which SimpleX servers you connect to, when and how much (fixed-size blocks) | messages, contacts, profile, queue IDs (all inside TLS) |
+| SimpleX servers | the relay's IP address, the queues you use on that server and when messages pass through them (encrypted fixed-size blocks) | your IP address, messages and profile; there are no accounts or user IDs |
+| your contacts | the profile you share and your messages | your IP address and your other contacts |
+| Codeberg Pages | that the page was loaded, from which IP address | everything after that |
+| someone with this browser | that Duplex was used, the number and rough size of stored records | anything else, without the passphrase |
+
+A public relay is run by someone you do not know. For more privacy, run your own relay, optionally
+through Tor (below). Duplex uses one connection per server, so a server can tell that the queues you
+use on it belong to the same client.
+
+### Limitations
+
+- No groups or channels, files, voice or video messages, calls (they are shown as unsupported).
+- No post-quantum key exchange, private message routing, per-connection transport isolation or
+  queue rotation.
+- No push notifications: messages arrive while the page is open (it can show notifications while it
+  is in a background tab). One tab at a time, no syncing between devices.
+- The data lives only in this browser: clearing the site data or forgetting the passphrase loses it.
+
+## Your own relay (optional)
+
+`relay/wisp-relay.mjs` is a Wisp relay and static file server in one file, with no dependencies:
+
+```sh
+npm run relay                  # ws://127.0.0.1:8745/, and the built app at http://127.0.0.1:8745/
+npm run relay -- --tor         # connect through Tor (SOCKS at 127.0.0.1:9050), allows .onion servers
+```
+
+In Duplex, choose **Settings → Network → Relay on this computer** and save; with `--tor`, also turn
+on **Use .onion addresses**. The relay accepts pages served on this computer and
+`https://portbuster.codeberg.page` (add others with `--allow-origin`), only connects to public
+addresses (`--allow-private` for testing) and logs nothing (`--verbose` logs destinations).
+
+## Development
+
+Requires Node.js 24.
+
+```sh
+npm install
+npm run dev          # http://127.0.0.1:5173/ (uses the relay of `npm run relay` at /wisp/)
+npm run build        # dist/
+npm run typecheck
+```
+
+Tests:
+
+| command | what |
+|---|---|
+| `npm test` | unit tests: crypto against libsodium and OpenSSL vectors, links of the official client, certificate pinning, compressed messages, the encrypted storage |
+| `SMP_SERVER=smp://…@localhost:7001 npm run test:local` | two agents connecting through a local `smp-server`: invitations, short links, addresses, receipts |
+| `SMP_SERVER=… SIMPLEX_CHAT_BIN=… npm run test:interop` | the chat client against the official SimpleX Chat CLI |
+| `CHROME_PATH=… SIMPLEX_CHAT_BIN=… npm run e2e` | the production build in headless Chrome on the real SimpleX network, chatting with the official CLI (run `npm run build` and `npm run relay` first, or set `APP_URL` to the published page; without `CHROME_PATH`, it uses a browser installed with `npx playwright install chromium`) |
+
+`npm run check-server -- smp://… [wss://relay/]` connects to a server (directly or through a relay)
+and makes a queue.
+
+| path | |
+|---|---|
+| `src/core/net` | TLS 1.3 client, Wisp client, X.509 |
+| `src/core/smp` | SMP client: handshake, block encryption, commands |
+| `src/core/crypto` | primitives (noble), double ratchet |
+| `src/core/agent` | SMP agent: connections, short links, addresses, delivery |
+| `src/core/chat` | chat protocol messages |
+| `src/app` | chat client, encrypted vault, session and relays |
+| `src/ui` | the Preact interface |
+| `relay` | the optional Wisp relay |
+| `site` | the about page, `404.html`, and `_headers` (Content Security Policy) for Codeberg Pages |
+
+### Codeberg Pages
+
+The page is served by [Codeberg Pages](https://docs.codeberg.org/codeberg-pages/) from the `pages`
+branch, which holds only the app built from a commit of `main` (`dist/`) plus `site/`.
+`npm run site:publish` builds the current commit, commits the result to `pages`, pushes it and tells
+git-pages to deploy it.
+
+The page's origin, `https://portbuster.codeberg.page`, is shared with the other Codeberg Pages sites
+of the same user, which can access each other's pages and storage (the stored data is encrypted).
+For an origin of its own, put `dist/` and `site/` on any other static hosting (GitHub Pages, a
+custom domain, a plain web server): the app only uses relative paths. Hosts that ignore `_headers`
+still get the Content Security Policy of `index.html`, except `frame-ancestors`.
+
+## License
+
+AGPL-3.0, like simplexmq and simplex-chat, whose protocols this follows. Dependencies:
+[noble](https://paulmillr.com/noble/) cryptography, [fzstd](https://github.com/101arrowz/fzstd),
+[Preact](https://preactjs.com), [qrcode-generator](https://github.com/kazuhikoarase/qrcode-generator)
+(all MIT). The icons are adapted from [Feather](https://feathericons.com) (MIT).

@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="color-scheme" content="light dark" />
+    <meta name="referrer" content="no-referrer" />
+    <meta name="description" content="Duplex: an unofficial, privacy-focused web client compatible with the SimpleX network. End-to-end encrypted, no user IDs, encrypted at rest, and it runs entirely in your browser." />
+    <title>Duplex: private messaging on the SimpleX network, in your browser</title>
+    <link rel="icon" href="../favicon.svg" type="image/svg+xml" />
+    <link rel="stylesheet" href="style.css" />
+  </head>
+  <body>
+    <header class="top">
+      <a class="brand" href="./">
+        <img src="../favicon.svg" alt="" width="32" height="32" />
+        <span>Duplex</span>
+      </a>
+      <nav aria-label="Sections">
+        <a class="sec" href="#features">Features</a>
+        <a class="sec" href="#how">How it works</a>
+        <a class="sec" href="#privacy">Privacy</a>
+        <a class="sec" href="#limits">Limitations</a>
+        <a class="sec" href="#relay">Your own relay</a>
+        <a href="https://codeberg.org/portbuster/duplex">Source</a>
+        <a class="nav-open" href="../">Open Duplex</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="hero-text">
+          <h1>Private messaging on the SimpleX network, in your browser.</h1>
+          <p class="lead">
+            Duplex is an unofficial, privacy-focused web client compatible with the <a href="https://simplex.chat">SimpleX network</a>. It speaks the SimpleX protocols itself — TLS 1.3, the SimpleX Messaging Protocol, the double ratchet and the chat protocol — entirely inside this page. You can talk with people who use the SimpleX Chat apps without installing anything.
+          </p>
+          <div class="actions">
+            <a class="button primary" href="../">Open Duplex</a>
+            <a class="button" href="https://codeberg.org/portbuster/duplex">Source code on Codeberg</a>
+          </div>
+          <p class="small muted">Duplex is independent and is not affiliated with or endorsed by SimpleX Chat Ltd.</p>
+        </div>
+        <figure class="shot">
+          <img src="screenshots/chat.png" alt="A conversation in Duplex with a contact who uses the SimpleX Chat app: a reply, a reaction and delivery receipts" width="1180" height="760" />
+        </figure>
+      </section>
+
+      <section id="features">
+        <h2>Features</h2>
+        <div class="grid">
+          <div class="feature">
+            <h3>No user IDs</h3>
+            <p>There are no phone numbers, usernames or account IDs. You connect by sharing a 1-time link or QR code, or a contact address that people can send requests to.</p>
+          </div>
+          <div class="feature">
+            <h3>End-to-end encrypted</h3>
+            <p>Messages are encrypted with the double ratchet (X448, AES-256-GCM), then again for each message queue, and sent over TLS 1.3 to servers that are identified by their key fingerprint.</p>
+          </div>
+          <div class="feature">
+            <h3>Works with the SimpleX Chat apps</h3>
+            <p>Text with formatting, replies, edits, deletion, reactions, delivery receipts, disappearing messages from your contacts, profile pictures, contact addresses and requests.</p>
+          </div>
+          <div class="feature">
+            <h3>Encrypted at rest</h3>
+            <p>Everything stored in the browser is encrypted with a key derived from your passphrase (Argon2id). Record names are hashed and sizes are padded, so the storage does not reveal your contacts or how much you chat.</p>
+          </div>
+          <div class="feature">
+            <h3>Just static files</h3>
+            <p>There is no Duplex server and no account. The page loads nothing from other sites: no analytics, cookies, fonts or third-party scripts, and no link previews.</p>
+          </div>
+          <div class="feature">
+            <h3>Your choice of network path</h3>
+            <p>Use the public relays, or run your own relay on your computer — optionally through Tor, with the .onion addresses of the servers.</p>
+          </div>
+        </div>
+      </section>
+
+      <section id="how">
+        <h2>How it works</h2>
+        <p>
+          The SimpleX network carries messages through <em>queues</em> on SimpleX servers (SMP routers). Each conversation uses its own pair of queues, one for each direction, created by the clients. Servers do not know which queues belong together, and there is no identifier that links your conversations to each other or to you.
+        </p>
+        <p>
+          Browsers cannot open the TCP connections the SimpleX servers need, so Duplex asks a <a href="https://github.com/MercuryWorkshop/wisp-protocol">Wisp</a> relay for a TCP stream and runs its own TLS 1.3 inside it, checking the server's certificate against the fingerprint in the server address. The relay only passes encrypted bytes along.
+        </p>
+        <pre class="diagram" aria-label="Diagram: your browser connects through a WebSocket to a Wisp relay, which connects through TCP to SimpleX servers, which deliver to your contact's SimpleX Chat app">this page ──WebSocket──▶ Wisp relay ──TCP──▶ SimpleX servers ◀── your contact's app
+   └──────────── TLS 1.3, SMP, e2e encryption ────────────┘</pre>
+        <p>
+          While the page is open, Duplex stays subscribed to your queues and receives messages immediately. When it is closed, the servers keep the encrypted messages until you come back.
+        </p>
+      </section>
+
+      <section id="privacy">
+        <h2>Privacy model</h2>
+        <table>
+          <thead>
+            <tr>
+              <th scope="col"></th>
+              <th scope="col">Can see</th>
+              <th scope="col">Cannot see</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <th scope="row">The Wisp relay</th>
+              <td>Your IP address, which SimpleX servers you connect to, and when and how much data passes (in fixed-size blocks)</td>
+              <td>Your messages, contacts, profile and queue IDs — they are inside TLS</td>
+            </tr>
+            <tr>
+              <th scope="row">SimpleX servers</th>
+              <td>The relay's IP address, the queues you use on that server and when messages pass through them, as encrypted fixed-size blocks</td>
+              <td>Your IP address, your messages and profile — there are no accounts or user IDs</td>
+            </tr>
+            <tr>
+              <th scope="row">Your contacts</th>
+              <td>The profile you choose to share (a name, optionally a picture) and your messages</td>
+              <td>Your IP address and your other contacts</td>
+            </tr>
+            <tr>
+              <th scope="row">Codeberg Pages</th>
+              <td>That this page was loaded, from which IP address and browser</td>
+              <td>Everything after that: the page does not talk to it again</td>
+            </tr>
+            <tr>
+              <th scope="row">Someone with this browser</th>
+              <td>That Duplex was used, and the number and approximate size of the stored records</td>
+              <td>Without your passphrase: anything else</td>
+            </tr>
+          </tbody>
+        </table>
+        <p class="muted small">
+          The relay you use matters: a public relay is run by someone you do not know, so it learns your IP address and the servers you use. Running your own relay through Tor hides both. Duplex uses one connection per server, so a server can tell that the queues you use on it belong to the same client.
+        </p>
+      </section>
+
+      <section id="limits">
+        <h2>Limitations</h2>
+        <ul>
+          <li>Groups and channels, files, voice and video messages, and calls are not supported yet.</li>
+          <li>Connections use the double ratchet without the post-quantum key exchange that the apps can add.</li>
+          <li>No private message routing through other servers, no per-connection transport isolation, and no queue rotation.</li>
+          <li>No push notifications: messages arrive while the page is open (notifications can be shown while it is in a background tab).</li>
+          <li>One browser tab at a time, and no syncing between devices.</li>
+          <li>The data lives in this browser only. If you clear the site data or forget the passphrase, the profile and chats are gone.</li>
+        </ul>
+      </section>
+
+      <section id="relay">
+        <h2>Run your own relay</h2>
+        <p>The relay is a single file with no dependencies. With <a href="https://nodejs.org">Node.js</a> installed:</p>
+        <pre><code>git clone https://codeberg.org/portbuster/duplex
+cd duplex
+npm run relay              # or: npm run relay -- --tor</code></pre>
+        <p>
+          Then open Duplex, go to <b>Settings → Network</b>, choose <b>Relay on this computer</b> (<code>ws://127.0.0.1:8745/</code>) and save. With <code>--tor</code>, the relay connects through Tor (its SOCKS port at 127.0.0.1:9050), and you can turn on <b>Use .onion addresses</b>.
+        </p>
+      </section>
+    </main>
+
+    <footer>
+      <p>
+        <a href="../">Open Duplex</a> · <a href="https://codeberg.org/portbuster/duplex">Source code</a> (AGPL-3.0) · SimpleX and SimpleX Chat are trademarks of SimpleX Chat Ltd. Duplex is not affiliated with or endorsed by SimpleX Chat Ltd.
+      </p>
+    </footer>
+  </body>
+</html>

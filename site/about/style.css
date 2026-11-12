@@ -1,0 +1,282 @@
+:root {
+  --bg: #ffffff;
+  --bg2: #f3f5f8;
+  --fg: #111418;
+  --muted: #5f6b7a;
+  --border: #dde2e9;
+  --accent: #0053d0;
+  --accent-fg: #ffffff;
+  font-family: system-ui, -apple-system, 'Segoe UI', Roboto, Ubuntu, sans-serif;
+  font-size: 16px;
+  line-height: 1.55;
+  color: var(--fg);
+  background: var(--bg);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #111317;
+    --bg2: #1a1d23;
+    --fg: #e8eaed;
+    --muted: #9aa4b2;
+    --border: #2c323b;
+    --accent: #3d8bff;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+a {
+  color: var(--accent);
+}
+
+.top {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  flex-wrap: wrap;
+  padding: 12px max(16px, calc((100vw - 1100px) / 2));
+  background: var(--bg);
+  border-bottom: 1px solid var(--border);
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 700;
+  font-size: 20px;
+  color: var(--fg);
+  text-decoration: none;
+}
+
+nav {
+  display: flex;
+  gap: 16px;
+  flex-wrap: wrap;
+  align-items: center;
+  font-size: 15px;
+}
+
+nav a {
+  color: var(--fg);
+  text-decoration: none;
+}
+
+nav a:hover {
+  color: var(--accent);
+}
+
+@media (max-width: 640px) {
+  nav a.sec {
+    display: none;
+  }
+}
+
+nav .nav-open,
+.button {
+  display: inline-block;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 8px 16px;
+  text-decoration: none;
+  color: var(--fg);
+  background: var(--bg2);
+}
+
+nav .nav-open,
+.button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+}
+
+main {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 0 16px;
+}
+
+section {
+  padding: 40px 0 8px;
+}
+
+h1 {
+  font-size: clamp(30px, 4.5vw, 46px);
+  line-height: 1.15;
+  margin: 0 0 16px;
+}
+
+h2 {
+  font-size: 28px;
+  margin: 0 0 16px;
+}
+
+h3 {
+  font-size: 18px;
+  margin: 0 0 6px;
+}
+
+.hero {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: 32px;
+  align-items: center;
+  padding-top: 48px;
+}
+
+@media (min-width: 900px) {
+  .hero {
+    grid-template-columns: 5fr 6fr;
+  }
+}
+
+.lead {
+  font-size: 18px;
+}
+
+.actions {
+  display: flex;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 20px 0 12px;
+}
+
+.shot {
+  margin: 0;
+}
+
+.shot img {
+  width: 100%;
+  height: auto;
+  border-radius: 14px;
+  border: 1px solid var(--border);
+  box-shadow: 0 10px 40px rgba(0, 0, 0, 0.12);
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 16px;
+}
+
+.feature {
+  background: var(--bg2);
+  border-radius: 14px;
+  padding: 18px 20px;
+}
+
+.feature p {
+  margin: 0;
+  color: var(--muted);
+}
+
+pre {
+  background: var(--bg2);
+  border-radius: 12px;
+  padding: 14px 16px;
+  overflow-x: auto;
+  font-size: 14px;
+}
+
+code {
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+}
+
+.diagram {
+  font-family: ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 15px;
+}
+
+th,
+td {
+  text-align: left;
+  vertical-align: top;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--border);
+}
+
+thead th {
+  color: var(--muted);
+  font-weight: 600;
+}
+
+tbody th {
+  white-space: nowrap;
+}
+
+@media (max-width: 640px) {
+  table,
+  thead,
+  tbody,
+  tr,
+  th,
+  td {
+    display: block;
+  }
+  thead {
+    display: none;
+  }
+  tbody th {
+    padding-top: 16px;
+    border-bottom: none;
+  }
+  td {
+    border-bottom: none;
+    padding-top: 2px;
+  }
+}
+
+ul {
+  padding-left: 22px;
+}
+
+li {
+  margin: 4px 0;
+}
+
+.muted {
+  color: var(--muted);
+}
+
+.small {
+  font-size: 14px;
+}
+
+footer {
+  max-width: 1100px;
+  margin: 40px auto 0;
+  padding: 20px 16px 40px;
+  border-top: 1px solid var(--border);
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.notfound {
+  max-width: 520px;
+  margin: 15vh auto;
+  text-align: center;
+  padding: 0 16px;
+}
+
+.notfound p {
+  display: flex;
+  gap: 12px;
+  justify-content: center;
+  flex-wrap: wrap;
+}
