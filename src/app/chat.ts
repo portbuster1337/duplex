@@ -205,6 +205,13 @@ export class ChatClient {
     this.agent.stop();
   }
 
+  /** after stop: resolves when the event handlers and writes that were running have finished */
+  async idle(): Promise<void> {
+    await this.agent.idle();
+    await this.stateWrite;
+    await this.itemStore.idle();
+  }
+
   private saveState(): Promise<void> {
     const snapshot = structuredClone(this.state);
     this.stateWrite = this.stateWrite.then(() => this.vault.put('chat', snapshot)).catch((e) => console.error('save failed', e));

@@ -306,6 +306,11 @@ export class Agent {
     this.network.stop();
   }
 
+  /** resolves when the operations that were running when the agent stopped have finished */
+  async idle(): Promise<void> {
+    while (this.locks.size) await Promise.all([...this.locks.values()]);
+  }
+
   getConn(id: string): Conn | undefined {
     return this.conns.get(id);
   }
@@ -831,6 +836,7 @@ export class Agent {
   }
 
   private onRouterMessage(srv: ProtocolServer, entityId: Bytes, msg: BrokerMsg): void {
+    if (this.stopped) return;
     const connId = this.rcvIndex.get(qKey(srv, entityId));
     if (!connId) return;
     if (msg.tag === 'MSG') {
@@ -887,9 +893,11 @@ export class Agent {
       }
       // otherwise: a repeated confirmation, or a message without keys - ignored
     } catch (e) {
+      // stopped while processing (the app was locked): the router delivers the message again later
+      if (this.stopped) return;
       await this.emit({ type: 'ERR', connId, err: (e as Error).message });
     } finally {
-      if (ackNow) await this.ack(rq, srvMsgId);
+      if (ackNow && !this.stopped) await this.ack(rq, srvMsgId);
     }
   }
 
@@ -1013,8 +1021,11 @@ export class Agent {
         return true;
       }
       case 'A_MSG': {
-        await this.save(c);
+        // the ratchet state is saved after the client has stored the message: if the app stops in
+        // between, the message is not acknowledged and the router delivers it again
         const r = await this.emit({ type: 'MSG', connId: c.id, msgId, sndMsgId: am.sndMsgId, body: m.body, brokerTs, integrity, notification });
+        if (this.stopped) throw new AgentError('stopped');
+        await this.save(c);
         await this.ack(rq, srvMsgId);
         if (r && r.receipt && c.snd && c.status === 'ready') {
           this.enqueueAgentMsg(c, { tag: 'A_RCVD', receipts: [{ agentMsgId: am.sndMsgId, msgHash, rcptInfo: new Uint8Array(0) }] }, false);

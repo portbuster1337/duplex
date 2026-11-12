@@ -79,9 +79,19 @@ export class ItemStore<T extends { id: string }> {
     return next;
   }
 
-  async delete(chatId: string): Promise<void> {
-    const meta = await this.vault.get<{ chunks: number }>(`items:${chatId}:meta`);
-    if (meta) for (let i = 0; i < meta.chunks; i++) await this.vault.del(`items:${chatId}:${i}`);
-    await this.vault.del(`items:${chatId}:meta`);
+  delete(chatId: string): Promise<void> {
+    const prev = this.writes.get(chatId) ?? Promise.resolve();
+    const next = prev.then(async () => {
+      const meta = await this.vault.get<{ chunks: number }>(`items:${chatId}:meta`);
+      if (meta) for (let i = 0; i < meta.chunks; i++) await this.vault.del(`items:${chatId}:${i}`);
+      await this.vault.del(`items:${chatId}:meta`);
+    });
+    this.writes.set(chatId, next.catch(() => {}));
+    return next;
+  }
+
+  /** resolves when the pending writes are done */
+  async idle(): Promise<void> {
+    await Promise.all([...this.writes.values()]);
   }
 }

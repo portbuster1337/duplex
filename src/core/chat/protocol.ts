@@ -199,6 +199,22 @@ function parseUncompressed(b: Bytes): ParsedChatMsg[] {
   return [parseElement(b)];
 }
 
+/** the content size in a zstd frame header (RFC 8878, 3.1.1.1), undefined when it is not declared */
+export function zstdContentSize(b: Bytes): number | undefined {
+  if (b.length < 6 || b[0] !== 0x28 || b[1] !== 0xb5 || b[2] !== 0x2f || b[3] !== 0xfd) return undefined;
+  const fhd = b[4];
+  const fcsFlag = fhd >> 6;
+  const singleSegment = (fhd >> 5) & 1;
+  const dictIdLen = [0, 1, 2, 4][fhd & 3];
+  const fcsLen = fcsFlag === 0 ? singleSegment : 1 << fcsFlag;
+  if (fcsLen === 0) return undefined;
+  const off = 5 + (singleSegment ? 0 : 1) + dictIdLen;
+  if (b.length < off + fcsLen) return undefined;
+  let v = 0;
+  for (let i = fcsLen - 1; i >= 0; i--) v = v * 256 + b[off + i];
+  return fcsLen === 2 ? v + 256 : v;
+}
+
 /** parses an agent message body into chat messages */
 export function parseChatMessages(b: Bytes): ParsedChatMsg[] {
   if (!b.length) return [{ error: 'empty message' }];
@@ -211,14 +227,16 @@ export function parseChatMessages(b: Bytes): ParsedChatMsg[] {
       if (t === '1') return { plain: undefined as Bytes | undefined, zstd: d.large() as Bytes | undefined };
       throw new ParseError('bad Compressed tag');
     });
+    // like the official clients, the sizes are checked before decompressing
+    const sizes = parts.map((p) => (p.plain ? p.plain.length : zstdContentSize(p.zstd!)));
+    if (sizes.some((s) => s === undefined)) return [{ error: 'compressed size not specified' }];
+    if ((sizes as number[]).reduce((a, b) => a + b, 0) > MAX_DECOMPRESSED_LENGTH) return [{ error: 'decompressed size exceeds limit' }];
     const out: ParsedChatMsg[] = [];
-    let total = 0;
-    for (const p of parts) {
-      const raw: Bytes = p.plain ?? decompress(p.zstd!);
-      total += raw.length;
-      if (total > MAX_DECOMPRESSED_LENGTH) return [{ error: 'decompressed size exceeds limit' }];
+    parts.forEach((p, i) => {
+      // the output buffer has the declared size, which bounds the memory a peer can make us use
+      const raw = p.plain ?? decompress(p.zstd!, new Uint8Array(sizes[i]!));
       out.push(...parseUncompressed(raw));
-    }
+    });
     return limit(out);
   } catch (e) {
     return [{ error: `bad compressed message: ${(e as Error).message}` }];

@@ -129,11 +129,25 @@ export class WrongPassphraseError extends Error {
   }
 }
 
+export class VaultLockedError extends Error {
+  constructor() {
+    super('the storage is locked');
+  }
+}
+
 export class Vault {
+  private locked = false;
+
   private constructor(
     private backend: KvBackend,
     private master: Bytes,
   ) {}
+
+  /** the master key, while unlocked: writes that were still pending when locking must not use a wiped key */
+  private key(): Bytes {
+    if (this.locked) throw new VaultLockedError();
+    return this.master;
+  }
 
   static async exists(backend: KvBackend): Promise<boolean> {
     return (await backend.get(META_KEY)) !== undefined;
@@ -172,12 +186,12 @@ export class Vault {
     const salt = randomBytes(16);
     const pk = await Vault.deriveKey(passphrase, salt, kdf, onProgress);
     const nonce = randomBytes(24);
-    const meta: VaultMeta = { v: 1, salt: b64(salt), kdf, key: b64(concat(nonce, xchacha20poly1305(pk, nonce).encrypt(this.master))), created: Date.now() };
+    const meta: VaultMeta = { v: 1, salt: b64(salt), kdf, key: b64(concat(nonce, xchacha20poly1305(pk, nonce).encrypt(this.key()))), created: Date.now() };
     await this.backend.put(META_KEY, utf8(JSON.stringify(meta)));
   }
 
   private recordKey(name: string): string {
-    return 'r' + b64urlNoPad(hmac(sha256, this.master, utf8('record:' + name)));
+    return 'r' + b64urlNoPad(hmac(sha256, this.key(), utf8('record:' + name)));
   }
 
   private aad(name: string): Bytes {
@@ -187,14 +201,15 @@ export class Vault {
   async get<T>(name: string): Promise<T | undefined> {
     const raw = await this.backend.get(this.recordKey(name));
     if (!raw) return undefined;
-    const pt = xchacha20poly1305(this.master, raw.subarray(0, 24), this.aad(name)).decrypt(raw.subarray(24));
+    const pt = xchacha20poly1305(this.key(), raw.subarray(0, 24), this.aad(name)).decrypt(raw.subarray(24));
     return deserialize<T>(unpadRecord(pt));
   }
 
   async put(name: string, value: unknown): Promise<void> {
+    const key = this.recordKey(name);
     const nonce = randomBytes(24);
-    const ct = xchacha20poly1305(this.master, nonce, this.aad(name)).encrypt(padRecord(serialize(value)));
-    await this.backend.put(this.recordKey(name), concat(nonce, ct));
+    const ct = xchacha20poly1305(this.key(), nonce, this.aad(name)).encrypt(padRecord(serialize(value)));
+    await this.backend.put(key, concat(nonce, ct));
   }
 
   async del(name: string): Promise<void> {
@@ -203,11 +218,16 @@ export class Vault {
 
   /** deletes everything, including the KDF parameters */
   async wipe(): Promise<void> {
+    this.lock();
     await this.backend.clear();
-    this.master.fill(0);
   }
 
   lock(): void {
+    this.locked = true;
     this.master.fill(0);
+  }
+
+  get isLocked(): boolean {
+    return this.locked;
   }
 }
