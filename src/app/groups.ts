@@ -710,8 +710,8 @@ export class GroupManager {
         if (groupPrefOn(g.profile, 'history')) await this.sendHistory(g, m).catch((e) => console.warn('sending the history failed', e));
         return;
       default: {
-        await this.event(g, `${memberName(m)} connected`, m.memberId);
-        // the admin who introduced us stops forwarding between us
+        // no event in the chat: the members list shows who is still connecting. The admin who
+        // introduced us stops forwarding between us
         const inviter = g.members[(m.category === 'pre' ? g.hostMemberId : m.invitedBy) ?? ''];
         if (inviter?.connId && !memberGone(inviter)) await this.sendTo(inviter, xGrpMemCon(m.memberId)).catch(() => {});
         await this.save(g);

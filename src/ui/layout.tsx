@@ -38,7 +38,11 @@ function lastItemPreview(items: ChatItem[] | undefined, g?: Group): { text: stri
   if (!items?.length) return { text: '' };
   for (let i = items.length - 1; i >= 0; i--) {
     const it = items[i];
-    if (it.dir === 'event') return { text: contentText(it.content), ts: it.ts };
+    if (it.dir === 'event') {
+      // the "X connected" events of earlier versions are not shown
+      if (g && it.memberId && contentText(it.content).endsWith(' connected')) continue;
+      return { text: contentText(it.content), ts: it.ts };
+    }
     const t = it.deleted ? 'message deleted' : plainText(contentText(it.content)) || mediaLabel(it);
     const who = it.dir === 'snd' ? 'you: ' : g && it.memberId ? `${memberName(g.members[it.memberId])}: ` : '';
     return { text: who + t, ts: it.brokerTs ?? it.ts };

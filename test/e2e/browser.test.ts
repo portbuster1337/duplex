@@ -161,6 +161,9 @@ test('reply and reaction from the CLI are shown', async () => {
   assert.equal(q.type, 'newChatItems', JSON.stringify(q).slice(0, 300));
   await page.locator('.msg.rcv .quote', { hasText: 'running entirely in a browser' }).waitFor({ timeout: NET });
   await shot('6-reply-reaction');
+  // the quote goes to the message it quotes
+  await page.locator('.msg.rcv .quote', { hasText: 'running entirely in a browser' }).click();
+  await page.locator('.msg.flash', { hasText: 'running entirely in a browser' }).filter({ hasNot: page.locator('.quote') }).waitFor({ timeout: 5000 });
   // relays that cannot be reached are skipped, everything else would be a bug (including CSP violations)
   assert.deepEqual(
     pageErrors.filter((e) => !/WebSocket connection to .* failed/.test(e)),

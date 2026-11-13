@@ -21,6 +21,12 @@ import { useChatUpdates } from './layout';
 
 const PAGE = 100;
 
+/**
+ * the items shown: not the expired ones, nor in groups the "X connected" events of earlier versions
+ * (the members list shows who is still connecting)
+ */
+const visibleItem = (i: ChatItem, group?: Group): boolean => (!i.deleteAt || i.deleteAt > Date.now()) && !(group && i.dir === 'event' && i.memberId && contentText(i.content).endsWith(' connected'));
+
 export function ChatView({ session, chatId, onBack, onDeleted, onOpen }: { session: Session; chatId: string; onBack: () => void; onDeleted: () => void; onOpen?: (chatId: string) => void }): JSX.Element {
   const chat = session.chat;
   useChatUpdates(session);
@@ -38,6 +44,9 @@ export function ChatView({ session, chatId, onBack, onDeleted, onOpen }: { sessi
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   const stick = useRef(true);
+  // the message a quote was clicked for: scrolled to once it is shown, and highlighted for a moment
+  const scrollTo = useRef<string>();
+  const [flash, setFlash] = useState<string>();
   const { atts, add: addFiles, remove: removeFile, clear: clearFiles, ready: filesReady } = useAttachments();
   const [dragging, setDragging] = useState(false);
   const [recorder, setRecorder] = useState<VoiceRecorder>();
@@ -102,6 +111,33 @@ export function ChatView({ session, chatId, onBack, onDeleted, onOpen }: { sessi
     const el = listRef.current;
     if (el && stick.current) el.scrollTop = el.scrollHeight;
   }, [items]);
+
+  useLayoutEffect(() => {
+    const id = scrollTo.current;
+    const el = id && listRef.current?.querySelector(`[data-item="${CSS.escape(id)}"]`);
+    if (!el) return;
+    scrollTo.current = undefined;
+    el.scrollIntoView({ block: 'center', behavior: 'smooth' });
+  });
+
+  useEffect(() => {
+    if (!flash) return;
+    const t = setTimeout(() => setFlash(undefined), 2000);
+    return () => clearTimeout(t);
+  }, [flash]);
+
+  /** goes to the message that a reply quotes */
+  const showQuoted = (q: NonNullable<ChatItem['quote']>) => {
+    const live = items.filter((i) => visibleItem(i, group));
+    const target = live.find((i) => !!q.sharedMsgId && i.sharedMsgId === q.sharedMsgId && i.dir === (q.sent ? 'snd' : 'rcv') && (!group || q.sent || !q.memberId || i.memberId === q.memberId));
+    if (!target) return toast('The original message is not in this chat');
+    // older messages are shown first
+    const need = live.length - live.indexOf(target);
+    if (need > limit) setLimit(need + 10);
+    stick.current = false;
+    scrollTo.current = target.id;
+    setFlash(target.id);
+  };
 
   const onScroll = () => {
     const el = listRef.current!;
@@ -173,7 +209,7 @@ export function ChatView({ session, chatId, onBack, onDeleted, onOpen }: { sessi
   };
 
   if (!contact && !group) return <div class="placeholder" />;
-  const shownItems = items.filter((i) => !i.deleteAt || i.deleteAt > Date.now()).slice(-limit);
+  const shownItems = items.filter((i) => visibleItem(i, group)).slice(-limit);
   const groupBlock = group ? chat.groups.canSend(group) : undefined;
   const canSend = contact ? contact.status === 'active' : !groupBlock;
   const allowsFiles = contact ? chat.peerAllowsFiles(contact) : groupPrefOn(group!.profile, 'files');
@@ -286,6 +322,8 @@ export function ChatView({ session, chatId, onBack, onDeleted, onOpen }: { sessi
                   it={it}
                   group={group}
                   showSender={showSender}
+                  flash={flash === it.id}
+                  onQuote={() => it.quote && showQuoted(it.quote)}
                   onMenu={(x, y) => setMenu({ item: it, x, y })}
                   onLink={(u) => (isSimplexLink(u) ? setOpenLink(u) : window.open(u, '_blank', 'noopener,noreferrer'))}
                   onReact={(emoji, add) => chat.react(chatId, it.id, emoji, add).catch((e) => toast(errorText(e), 'error'))}
@@ -532,6 +570,8 @@ function Bubble({
   it,
   group,
   showSender,
+  flash,
+  onQuote,
   onMenu,
   onLink,
   onReact,
@@ -541,6 +581,9 @@ function Bubble({
   it: ChatItem;
   group?: Group;
   showSender?: boolean;
+  /** just gone to from a reply that quotes it */
+  flash?: boolean;
+  onQuote: () => void;
   onMenu: (x: number, y: number) => void;
   onLink: (u: string) => void;
   onReact: (emoji: string, add: boolean) => void;
@@ -557,7 +600,7 @@ function Bubble({
     onMenu(e.clientX, e.clientY);
   };
   return (
-    <div class={`msg ${it.dir} ${group && it.dir === 'rcv' ? 'in-group' : ''}`}>
+    <div class={`msg ${it.dir} ${group && it.dir === 'rcv' ? 'in-group' : ''} ${flash ? 'flash' : ''}`} data-item={it.id}>
       {group && it.dir === 'rcv' && (showSender ? <Avatar profile={sender?.profile} size={28} /> : <span class="avatar-gap" />)}
       <div class={`bubble ${it.deleted ? 'deleted' : ''} ${it.file && (c.type === 'image' || c.type === 'video') ? 'has-media' : ''}`} onContextMenu={open}>
         {showSender && (
@@ -568,10 +611,10 @@ function Bubble({
         )}
         {it.forwarded && <div class="fwd">forwarded</div>}
         {it.quote && (
-          <div class="quote">
+          <button class="quote" onClick={onQuote} title="Go to the message">
             <span class="quote-who">{quoteWho}</span>
             <span class="quote-text">{plainText(it.quote.text) || '…'}</span>
-          </div>
+          </button>
         )}
         {it.deleted ? (
           <i>{it.moderated ? 'removed by a moderator' : 'message deleted'}</i>
