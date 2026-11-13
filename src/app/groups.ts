@@ -102,6 +102,8 @@ export interface Group {
   invitation?: { contactId: string; connRequest: string; itemId?: string };
   /** as an admin: the introductions we made, by member pair, until the members are connected */
   intros?: Record<string, 'sent' | 'forwarded' | 'connected'>;
+  /** as an admin: how many recent messages we send to new members (the apps send 100); 0 for all */
+  historySize?: number;
   link?: { connId: string; link: string; groupLinkId: string; role: GroupMemberRole };
   createdAt: number;
   lastActivity: number;
@@ -114,8 +116,8 @@ const DEBUG = typeof process !== 'undefined' && !!process.env?.DEBUG_GROUPS;
 
 /** the host of a group joined via a link, until its member ID is known */
 const HOST_PLACEHOLDER = '?host';
-/** the number of recent messages sent to new members, as in the apps */
-const HISTORY_ITEMS = 100;
+/** the number of recent messages sent to new members, unless chosen: as in the apps */
+export const HISTORY_ITEMS = 100;
 const pairKey = (a: string, b: string) => (a < b ? `${a}|${b}` : `${b}|${a}`);
 export const memberGone = (m: GroupMember): boolean => m.status === 'left' || m.status === 'removed';
 export const memberName = (m?: GroupMember): string => profileName(m?.profile);
@@ -531,12 +533,16 @@ export class GroupManager {
   /**
    * the recent messages of the group, for a member who joined (sendHistory of the apps): forwarded
    * with their authors and times, with the files that can still be downloaded, then the welcome
-   * message. Our messages sent after the member was added reached it directly.
+   * message. Our messages sent after the member was added reached it directly. A long history takes
+   * a while: the member's queue holds a limited number of messages, and sending continues as the
+   * member receives them.
    */
   private async sendHistory(g: Group, n: GroupMember): Promise<void> {
     if (!n.connId) return;
     const all = await this.chat.chatItems(g.id);
-    const items = all.filter((it) => it.sharedMsgId && (it.dir === 'rcv' || (it.dir === 'snd' && it.status !== 'error' && it.ts < n.createdAt)) && !it.deleted && it.content?.type !== 'report').slice(-HISTORY_ITEMS);
+    const limit = g.historySize ?? HISTORY_ITEMS;
+    const recent = all.filter((it) => it.sharedMsgId && (it.dir === 'rcv' || (it.dir === 'snd' && it.status !== 'error' && it.ts < n.createdAt)) && !it.deleted && it.content?.type !== 'report');
+    const items = limit > 0 ? recent.slice(-limit) : recent;
     const bySharedId = new Map(all.map((it) => [it.sharedMsgId, it]));
     const msgs: ChatMessage[] = [];
     for (const it of items) {
@@ -1027,7 +1033,7 @@ export class GroupManager {
   }
 
   /** settings that only we see */
-  async updateLocal(groupId: string, patch: Partial<Pick<Group, 'localAlias' | 'favorite' | 'muted'>>): Promise<void> {
+  async updateLocal(groupId: string, patch: Partial<Pick<Group, 'localAlias' | 'favorite' | 'muted' | 'historySize'>>): Promise<void> {
     const g = this.must(groupId);
     Object.assign(g, patch);
     await this.chat.saveState();

@@ -4,7 +4,7 @@ import type { JSX } from 'preact';
 import { useState } from 'preact/hooks';
 import type { Session } from '../app/session';
 import { profileName, type Contact } from '../app/chat';
-import { groupActive, groupName, memberGone, memberName, type Group, type GroupMember } from '../app/groups';
+import { groupActive, groupName, HISTORY_ITEMS, memberGone, memberName, type Group, type GroupMember } from '../app/groups';
 import { groupPrefOn, roleRank, type GroupMemberRole } from '../core/chat/groups';
 import type { Profile } from '../core/chat/protocol';
 import { Avatar, resizeImage } from './util';
@@ -102,6 +102,7 @@ export function GroupInfo({ session, group, onClose, onDeleted }: { session: Ses
   const g = chat.group(group.id) ?? group;
   const [alias, setAlias] = useState(g.localAlias ?? '');
   const [panel, setPanel] = useState<'add' | 'edit' | undefined>();
+  const [historySize, setHistorySize] = useState(g.historySize ?? HISTORY_ITEMS);
   const [confirm, setConfirm] = useState<'leave' | 'delete'>();
   const [busy, setBusy] = useState(false);
   const active = g.status === 'active';
@@ -136,8 +137,27 @@ export function GroupInfo({ session, group, onClose, onDeleted }: { session: Ses
           checked={groupPrefOn(g.profile, 'history')}
           onChange={(v) => run(() => chat.groups.updateProfile(g.id, { groupPreferences: { ...g.profile.groupPreferences, history: { enable: v ? 'on' : 'off' } } }))}
           label="Visible history"
-          hint="New members get the last 100 messages from the member who adds them."
+          hint="New members get the recent messages from the admin who adds them."
         />
+      )}
+      {admin && groupPrefOn(g.profile, 'history') && (
+        <label>
+          Recent messages you send to the members you add
+          <select
+            value={String(historySize)}
+            onChange={(e) => {
+              const v = Number((e.target as HTMLSelectElement).value);
+              setHistorySize(v);
+              void chat.groups.updateLocal(g.id, { historySize: v });
+            }}
+          >
+            <option value={String(HISTORY_ITEMS)}>The last {HISTORY_ITEMS}, as the apps send</option>
+            <option value="500">The last 500</option>
+            <option value="2000">The last 2000</option>
+            <option value="0">All the messages this browser has</option>
+          </select>
+          <span class="hint">More messages take longer to arrive: they go through the member's queue, which holds a limited number at a time. Other admins send their own choice.</span>
+        </label>
       )}
       <label>
         Local name (only you see it)

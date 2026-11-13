@@ -27,7 +27,8 @@ Chat are trademarks of SimpleX Chat Ltd.
   groups, add contacts, share a group link, set roles, remove members, leave. Groups are
   peer-to-peer: each member has an end-to-end encrypted connection with each other member; the
   admin who adds a member introduces it to the others and forwards messages until they are
-  connected, and sends it the last 100 messages (visible history, on in new groups as in the apps).
+  connected, and sends it the recent messages (visible history, on in new groups as in the apps):
+  the last 100 like the apps, or as many as that admin chooses, up to all of them.
 - **Audio and video calls** with the apps, over WebRTC: the call page of the apps is followed
   closely (the media frames are encrypted end to end with the key agreed in the chat), and calls go
   through the TURN server of SimpleX Chat by default, so contacts do not see your IP address. You
