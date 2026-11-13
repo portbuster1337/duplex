@@ -31,7 +31,8 @@ const pageErrors: string[] = [];
 before(async () => {
   fs.mkdirSync(OUT, { recursive: true });
   cli = await Cli.start(PEER, 5320, SERVER);
-  browser = await chromium.launch({ executablePath: CHROME, args: ['--no-sandbox'] });
+  // a fake microphone (a tone) for recording voice messages
+  browser = await chromium.launch({ executablePath: CHROME, args: ['--no-sandbox', '--use-fake-ui-for-media-stream', '--use-fake-device-for-media-stream'] });
   const ctx = await browser.newContext({ viewport: { width: 1180, height: 760 } });
   page = await ctx.newPage();
   page.on('pageerror', (e) => pageErrors.push(e.message));
@@ -257,6 +258,52 @@ test('images from the official CLI are shown, and files can be downloaded and sa
     pageErrors.filter((e) => !/WebSocket connection to .* failed/.test(e)),
     [],
   );
+});
+
+/** the duration of an audio element once its metadata is loaded */
+const audioDuration = (a: HTMLAudioElement) =>
+  new Promise<number>((resolve, reject) => {
+    if (a.readyState >= 1) return resolve(a.duration);
+    a.addEventListener('loadedmetadata', () => resolve(a.duration), { once: true });
+    a.addEventListener('error', () => reject(new Error(`cannot play: ${a.error?.message}`)), { once: true });
+  });
+
+test('voice messages are recorded in the browser and played from the official CLI', async () => {
+  await openPeer();
+  await page.getByLabel('Record a voice message').click();
+  await page.locator('.recording').waitFor({ timeout: 30000 });
+  await page.waitForTimeout(2600);
+  await page.getByLabel('Stop recording').click();
+  await page.locator('.voice-preview audio').waitFor({ timeout: 30000 });
+  await page.getByLabel('Send', { exact: true }).click();
+  const got = await cli.waitType('newChatItems', NET, (e) => e?.chatItems?.[0]?.chatItem?.content?.msgContent?.type === 'voice');
+  const ci = got.chatItems[0].chatItem;
+  assert.ok(ci.content.msgContent.duration >= 2, `duration ${ci.content.msgContent.duration}`);
+  const data = await cliReceive(ci.file.fileId);
+  // Chrome on Linux has no AAC encoder, so the recording is an 8 kHz μ-law WAV file, which the apps play
+  if (ci.file.fileName.endsWith('.wav')) {
+    assert.equal(data.subarray(0, 4).toString(), 'RIFF');
+    assert.equal(data.readUInt16LE(20), 7);
+    assert.equal(data.readUInt32LE(24), 8000);
+    assert.ok(data.length > 2 * 8000, `${data.length} bytes`);
+  } else assert.equal(data.subarray(4, 12).toString(), 'ftypM4A ');
+  // the browser plays its own recording
+  const own = page.locator('.msg.snd .voice audio[src^="blob:"]').last();
+  await own.waitFor({ timeout: NET });
+  assert.ok((await own.evaluate(audioDuration)) >= 2);
+  // a voice message like the apps record: AAC in M4A
+  const tail = await cli.cmd(`/tail @${ME} 1`);
+  const contactId = tail.chatItems[0].chatInfo.contact.contactId;
+  const src = path.join(cli.dir, 'voice_20261113_120000.m4a');
+  fs.copyFileSync(new URL('./fixtures/voice.m4a', import.meta.url), src);
+  const r = await cli.cmd(`/_send @${contactId} json ${JSON.stringify([{ filePath: src, msgContent: { type: 'voice', text: '', duration: 2 } }])}`);
+  assert.equal(r.type, 'newChatItems', JSON.stringify(r).slice(0, 300));
+  // downloaded automatically, like in the apps
+  const audio = page.locator('.msg.rcv .voice audio[src^="blob:"]').last();
+  await audio.waitFor({ timeout: NET });
+  const d = await audio.evaluate(audioDuration);
+  assert.ok(d > 1.5 && d < 3, `duration ${d}`);
+  await shot('12-voice');
 });
 
 test('another tab can take over, and this one disconnects', async () => {

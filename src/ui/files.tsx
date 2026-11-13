@@ -8,9 +8,10 @@ import { errorText, Modal, Spinner, toast } from './components';
 import { Icon } from './icons';
 import { fmtSize, safeImage } from './util';
 import { prepareOutgoing } from './media';
+import { playableAudio } from './recorder';
 
 /** an object URL of a stored file while the component is shown (enabled) */
-export function useFileUrl(session: Session, f: ChatFile | undefined, enabled: boolean): string | undefined {
+export function useFileUrl(session: Session, f: ChatFile | undefined, enabled: boolean, transform?: (b: Blob) => Promise<Blob>): string | undefined {
   const [url, setUrl] = useState<string>();
   const key = f && enabled && hasContent(f) ? `${f.id}:${f.pieces}:${f.status}` : '';
   useEffect(() => {
@@ -22,6 +23,7 @@ export function useFileUrl(session: Session, f: ChatFile | undefined, enabled: b
     let cancelled = false;
     session.chat
       .fileBlob(f, true)
+      .then((b) => (transform ? transform(b) : b))
       .then((b) => {
         if (cancelled) return;
         u = URL.createObjectURL(b);
@@ -160,7 +162,8 @@ export function FileContent({ session, contactId, it }: { session: Session; cont
   const [play, setPlay] = useState(false);
   // only content that is what the message says it is gets shown in the page
   const showable = !!f && (kind === 'image' ? isImageType(f.mime) : kind === 'video' ? isVideoType(f.mime) : kind === 'voice');
-  const url = useFileUrl(session, f, showable && (kind === 'image' || kind === 'voice' || (kind === 'video' && play)));
+  // μ-law WAV voice messages are converted for browsers that do not play them
+  const url = useFileUrl(session, f, showable && (kind === 'image' || kind === 'voice' || (kind === 'video' && play)), kind === 'voice' ? playableAudio : undefined);
   const { receive, modal } = useReceive(session, contactId, it);
   if (!f) return null;
   const progress = chat.files.progress.get(f.id);

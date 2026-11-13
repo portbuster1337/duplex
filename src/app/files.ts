@@ -74,9 +74,9 @@ export interface OutgoingFile {
   blob: Blob;
   name: string;
   /** an image or a video is shown with its preview (a data URL), a file with its name */
-  kind: 'image' | 'video' | 'file';
+  kind: 'image' | 'video' | 'voice' | 'file';
   preview?: string;
-  /** of a video, in seconds */
+  /** of a video or a voice message, in seconds */
   duration?: number;
 }
 
@@ -145,13 +145,14 @@ export function sniffType(b: Bytes): string | undefined {
   if (at(4, 'ftyp')) return at(8, 'M4A ') ? 'audio/mp4' : at(8, 'qt  ') ? 'video/quicktime' : 'video/mp4';
   if (b.length >= 4 && b[0] === 0x1a && b[1] === 0x45 && b[2] === 0xdf && b[3] === 0xa3) return 'video/webm';
   if (at(0, 'OggS')) return 'audio/ogg';
+  if (at(0, 'RIFF') && at(8, 'WAVE')) return 'audio/wav';
   return undefined;
 }
 
 export const isImageType = (t?: string): boolean => !!t && /^image\/(jpeg|png|gif|webp)$/.test(t);
 export const isVideoType = (t?: string): boolean => t === 'video/mp4' || t === 'video/webm';
 /** voice messages of the apps are AAC in MP4 containers */
-export const isAudioType = (t?: string): boolean => t === 'audio/mp4' || t === 'audio/ogg' || t === 'video/mp4' || t === 'video/webm';
+export const isAudioType = (t?: string): boolean => t === 'audio/mp4' || t === 'audio/ogg' || t === 'audio/wav' || t === 'video/mp4' || t === 'video/webm';
 
 /** a sent file, or a received one that was downloaded, is stored in this browser */
 export const hasContent = (f: ChatFile): boolean => f.pieces !== undefined && (f.status === 'rcvComplete' || f.status.startsWith('snd'));

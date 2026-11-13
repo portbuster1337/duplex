@@ -560,6 +560,7 @@ export class ChatClient {
   async sendFile(contactId: string, out: OutgoingFile, text = '', quoteItemId?: string): Promise<ChatItem> {
     const c = this.activeContact(contactId);
     if (!this.peerAllowsFiles(c)) throw new ChatError('the contact does not allow files and media');
+    if (out.kind === 'voice' && !this.peerAllowsVoice(c)) throw new ChatError('the contact does not allow voice messages');
     const size = out.blob.size;
     if (!size) throw new ChatError('the file is empty');
     if (size > MAX_FILE_SIZE) throw new ChatError(`the file is too large: files can be up to ${MAX_FILE_SIZE / GB} GB`);
@@ -577,7 +578,9 @@ export class ChatClient {
         ? { type: 'image', text, image: out.preview || FIXED_IMAGE_PREVIEW }
         : out.kind === 'video'
           ? { type: 'video', text, image: out.preview || FIXED_IMAGE_PREVIEW, duration: Math.max(0, Math.round(out.duration ?? 0)) }
-          : { type: 'file', text };
+          : out.kind === 'voice'
+            ? { type: 'voice', text, duration: Math.max(1, Math.round(out.duration ?? 0)) }
+            : { type: 'file', text };
     return this.sendContent(contactId, content, quoteItemId, file);
   }
 
@@ -813,6 +816,11 @@ export class ChatClient {
   /** whether the contact accepts files and media (the preference in its profile) */
   peerAllowsFiles(c: Contact): boolean {
     return c.profile.preferences?.files?.allow !== 'no';
+  }
+
+  /** whether the contact accepts voice messages */
+  peerAllowsVoice(c: Contact): boolean {
+    return c.profile.preferences?.voice?.allow !== 'no' && this.peerAllowsFiles(c);
   }
 
   /** the file servers for sending files: the configured ones, or the presets */

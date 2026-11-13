@@ -4,7 +4,8 @@ import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { Session } from '../app/session';
 import { contentText, itemText, profileName, TTL_CHOICES, ttlText, type ChatItem, type Contact } from '../app/chat';
 import { hasContent } from '../app/files';
-import { AttachmentStrip, FileContent, saveFile, useAttachments } from './files';
+import { AttachmentStrip, FileContent, fmtDuration, saveFile, useAttachments } from './files';
+import { canRecord, MAX_VOICE_SECONDS, VoiceRecorder, type Recording } from './recorder';
 import { REACTIONS } from '../core/chat/protocol';
 import { Avatar, fmtClock, fmtDay, isSimplexLink, Markdown, plainText, QRCode, safeImage } from './util';
 import { Icon } from './icons';
@@ -30,6 +31,44 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
   const stick = useRef(true);
   const { atts, add: addFiles, remove: removeFile, clear: clearFiles, ready: filesReady } = useAttachments();
   const [dragging, setDragging] = useState(false);
+  const [recorder, setRecorder] = useState<VoiceRecorder>();
+  const [recTick, setRecTick] = useState(0);
+  const [voice, setVoice] = useState<{ rec: Recording; url: string }>();
+
+  // the elapsed time and level of a recording, 10 times a second
+  useEffect(() => {
+    if (!recorder) return;
+    const t = setInterval(() => setRecTick(recorder.level()), 100);
+    return () => clearInterval(t);
+  }, [recorder]);
+  useEffect(() => () => voice && URL.revokeObjectURL(voice.url), [voice]);
+  useEffect(() => () => recorder?.cancel(), [recorder]);
+
+  const startRecording = async () => {
+    const r = new VoiceRecorder();
+    try {
+      await r.start();
+    } catch (e) {
+      return toast(`The microphone is not available: ${errorText(e)}`, 'error');
+    }
+    r.onLimit = () => void stopRecording(r);
+    setRecorder(r);
+  };
+  const stopRecording = async (r = recorder) => {
+    if (!r) return;
+    setRecorder(undefined);
+    try {
+      const rec = await r.stop();
+      if (rec.duration < 0.5) return;
+      setVoice({ rec, url: URL.createObjectURL(rec.blob) });
+    } catch (e) {
+      toast(`The recording failed: ${errorText(e)}`, 'error');
+    }
+  };
+  const cancelRecording = () => {
+    recorder?.cancel();
+    setRecorder(undefined);
+  };
 
   const reload = async () => setItems([...(await chat.chatItems(contact.id))]);
 
@@ -63,6 +102,18 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
 
   const send = async () => {
     const t = text.trim();
+    if (voice && !editing) {
+      const v = voice;
+      setVoice(undefined);
+      stick.current = true;
+      try {
+        await chat.sendFile(contact.id, { blob: v.rec.blob, name: v.rec.name, kind: 'voice', duration: v.rec.duration }, '', reply?.id);
+        setReply(undefined);
+      } catch (e) {
+        toast(errorText(e), 'error');
+      }
+      return;
+    }
     if (atts.length && !editing) {
       if (!filesReady) return toast('The files are still being prepared');
       const list = atts.filter((a) => a.prepared);
@@ -219,6 +270,33 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
           </div>
         )}
         <AttachmentStrip atts={atts} onRemove={removeFile} />
+        {voice && (
+          <div class="voice-preview">
+            <Icon name="mic" size={18} />
+            <audio src={voice.url} controls preload="metadata" aria-label="Recorded voice message" />
+            <span class="muted">{fmtDuration(voice.rec.duration)}</span>
+            <button class="icon-btn" onClick={() => setVoice(undefined)} aria-label="Delete the recording" title="Delete the recording">
+              <Icon name="trash" size={18} />
+            </button>
+          </div>
+        )}
+        {recorder && (
+          <div class="recording" role="status">
+            <span class="rec-dot" aria-hidden="true" />
+            <span class="rec-time">
+              {fmtDuration(recorder.elapsed)} / {fmtDuration(MAX_VOICE_SECONDS)}
+            </span>
+            <span class="rec-level" aria-hidden="true">
+              <span style={{ width: `${Math.round(Math.min(1, recTick * 1.6) * 100)}%` }} />
+            </span>
+            <button class="icon-btn" onClick={cancelRecording} aria-label="Cancel recording" title="Cancel">
+              <Icon name="trash" size={18} />
+            </button>
+            <button class="primary small" onClick={() => void stopRecording()} aria-label="Stop recording">
+              Stop
+            </button>
+          </div>
+        )}
         <div class="compose-row">
           <input
             ref={fileRef}
@@ -262,9 +340,15 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
             }}
             aria-label="Message"
           />
-          <button class="send" onClick={send} disabled={!canSend || (!text.trim() && !(atts.length && !editing))} aria-label="Send" title="Send">
-            <Icon name={editing ? 'check' : 'send'} />
-          </button>
+          {canAttach && chat.peerAllowsVoice(contact) && canRecord() && !text.trim() && !atts.length && !voice && !recorder ? (
+            <button class="send" onClick={startRecording} aria-label="Record a voice message" title="Record a voice message">
+              <Icon name="mic" />
+            </button>
+          ) : (
+            <button class="send" onClick={send} disabled={!canSend || !!recorder || (!text.trim() && !((atts.length || voice) && !editing))} aria-label="Send" title="Send">
+              <Icon name={editing ? 'check' : 'send'} />
+            </button>
+          )}
         </div>
       </footer>
       {menu && (

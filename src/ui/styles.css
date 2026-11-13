@@ -1029,6 +1029,57 @@ h3 {
   align-self: center;
 }
 
+.recording,
+.voice-preview {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 2px 6px 8px;
+}
+
+.voice-preview audio {
+  height: 36px;
+  flex: 1;
+  min-width: 0;
+}
+
+.rec-dot {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: var(--danger);
+  animation: rec-blink 1s ease-in-out infinite;
+}
+
+@keyframes rec-blink {
+  50% {
+    opacity: 0.3;
+  }
+}
+
+.rec-time {
+  font-variant-numeric: tabular-nums;
+}
+
+.rec-level {
+  flex: 1;
+  height: 6px;
+  border-radius: 3px;
+  background: var(--bg3);
+  overflow: hidden;
+}
+
+.rec-level span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.1s;
+}
+
+button.small {
+  padding: 5px 12px;
+}
+
 .chat.dragging .messages {
   outline: 2px dashed var(--accent);
   outline-offset: -8px;
