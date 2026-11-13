@@ -81,8 +81,11 @@ function png(w: number, h: number): Buffer {
 const fileOf = (e: any) => e?.chatItems?.[0]?.chatItem?.file;
 
 /** opens the chat with the CLI's first contact (not the incognito one) */
+/** a chat in the list by its exact name */
+const chatRow = (name: string) => page.locator('.chat-list .row').filter({ has: page.locator('.row-name', { hasText: new RegExp(`^${name}$`) }) });
+
 async function openPeer() {
-  await page.locator('.chat-list .row', { hasText: PEER }).filter({ hasNot: page.locator('.incog') }).first().click();
+  await chatRow(PEER).filter({ hasNot: page.locator('.incog') }).first().click();
   await page.locator('.chat-head .chat-name', { hasText: PEER }).waitFor({ timeout: 30000 });
 }
 
@@ -318,6 +321,59 @@ test('the receiving address can be changed, and the official CLI follows', async
   await page.locator('.messages .event', { hasText: 'you changed address' }).waitFor({ timeout: NET });
   await cli.cmd(`@${ME} to your new address`);
   await page.locator('.msg.rcv', { hasText: 'to your new address' }).waitFor({ timeout: NET });
+});
+
+test('the official CLI invites the browser to a group, which it joins', async () => {
+  await cli.cmd('/g #team');
+  await cli.cmd(`/a #team @${ME}`);
+  await openPeer();
+  // the invitation is shown in the chat with the contact
+  await page.getByRole('button', { name: 'Join group' }).click({ timeout: NET });
+  await page.locator('.chat-head .chat-name', { hasText: 'team' }).waitFor({ timeout: 30000 });
+  await page.locator('.messages .event', { hasText: 'you joined the group' }).waitFor({ timeout: NET });
+  await cli.cmd('#team hello group');
+  const m = page.locator('.msg.rcv.in-group', { hasText: 'hello group' });
+  await m.waitFor({ timeout: NET });
+  assert.equal((await m.locator('.sender').textContent())?.replace('owner', '').trim(), PEER);
+  const input = page.getByLabel('Message', { exact: true });
+  await input.fill('hi team');
+  await input.press('Enter');
+  await cli.waitType('newChatItems', NET, (e) => itemTexts(e).includes('hi team') && e.chatItems[0].chatInfo.type === 'group');
+  // the members panel
+  await page.getByLabel('Group info').click();
+  await page.locator('.members .member', { hasText: PEER }).waitFor({ timeout: 30000 });
+  await shot('13-group');
+  await page.getByLabel('Close').click();
+});
+
+test('the browser creates a group, adds the CLI user and makes a group link', async () => {
+  await page.getByLabel('New chat').first().click();
+  await page.getByRole('tab', { name: 'New group' }).click();
+  await page.getByLabel('Group name').fill('browser group');
+  await page.getByLabel('Welcome message (optional)').fill('Welcome to the group of the browser');
+  await page.getByRole('button', { name: 'Create group' }).click();
+  await page.locator('.chat-head .chat-name', { hasText: 'browser group' }).waitFor({ timeout: 30000 });
+  await page.getByLabel('Group info').click();
+  await page.getByRole('button', { name: 'Add members' }).click();
+  await page.locator('.pick-row', { hasText: PEER }).first().locator('input').check();
+  await page.getByRole('button', { name: /^Invite/ }).click();
+  const inv = await cli.waitType('receivedGroupInvitation', NET, (e) => e.groupInfo?.groupProfile?.displayName === 'browser group');
+  assert.equal(inv.groupInfo.groupProfile.description, 'Welcome to the group of the browser');
+  // names with spaces are quoted in CLI commands
+  const gname = `'${inv.groupInfo.localDisplayName}'`;
+  const j = await cli.cmd(`/j #${gname}`);
+  assert.equal(j.type, 'userAcceptedGroupSent', JSON.stringify(j).slice(0, 300));
+  await cli.waitType('userJoinedGroup', NET);
+  await page.locator('.members .member', { hasText: PEER }).filter({ hasNot: page.locator('.muted', { hasText: 'connecting' }) }).waitFor({ timeout: NET });
+  await page.getByRole('button', { name: 'Create group link' }).click();
+  const link = (await page.locator('.group-link .link-box .mono').textContent({ timeout: NET }))!.trim();
+  assert.match(link, /\/g#/);
+  await page.getByLabel('Close').click();
+  await cli.cmd(`#${gname} thanks for adding me`);
+  await page.locator('.msg.rcv.in-group', { hasText: 'thanks for adding me' }).waitFor({ timeout: NET });
+  await cli.cmd(`#${gname} and a second message`);
+  await page.locator('.msg.rcv.in-group', { hasText: 'and a second message' }).waitFor({ timeout: NET });
+  await shot('14-group-chat');
 });
 
 test('another tab can take over, and this one disconnects', async () => {

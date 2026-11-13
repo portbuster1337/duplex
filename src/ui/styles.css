@@ -1029,6 +1029,149 @@ h3 {
   align-self: center;
 }
 
+/* groups */
+
+.msg.in-group {
+  display: grid;
+  grid-template-columns: 28px minmax(0, auto);
+  column-gap: 6px;
+  align-items: start;
+}
+
+.msg.in-group > .avatar,
+.msg.in-group > .avatar-gap {
+  grid-column: 1;
+  grid-row: 1;
+}
+
+.msg.in-group > .bubble,
+.msg.in-group > .reactions {
+  grid-column: 2;
+  justify-self: start;
+}
+
+.avatar-gap {
+  width: 28px;
+}
+
+.bubble .sender {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--accent);
+  margin-bottom: 2px;
+}
+
+.bubble .sender .role,
+.member .role {
+  font-size: 11px;
+  font-weight: 500;
+  color: var(--muted);
+}
+
+.group-inv {
+  min-width: 240px;
+}
+
+.group-inv-head {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-bottom: 6px;
+}
+
+.group-inv-head span {
+  display: flex;
+  flex-direction: column;
+}
+
+.row-name .kind {
+  color: var(--muted);
+  margin-right: 4px;
+  vertical-align: -1px;
+}
+
+.members {
+  list-style: none;
+  padding: 0;
+  margin: 6px 0 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.member {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 6px 4px;
+  border-radius: 8px;
+}
+
+.member.gone {
+  opacity: 0.6;
+}
+
+.member-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.member-actions {
+  flex-basis: 100%;
+  display: flex;
+  align-items: flex-end;
+  gap: 10px;
+  padding: 4px 0 4px 42px;
+}
+
+.members-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 16px 0 4px;
+}
+
+.members-head button {
+  margin-left: auto;
+}
+
+.welcome {
+  white-space: pre-wrap;
+}
+
+.add-members {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px;
+  margin: 8px 0;
+}
+
+.pick {
+  list-style: none;
+  padding: 0;
+  margin: 0 0 8px;
+  max-height: 240px;
+  overflow: auto;
+}
+
+.pick-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 5px 2px;
+  cursor: pointer;
+}
+
+.group-link {
+  margin: 12px 0;
+}
+
 .address-change {
   display: flex;
   flex-direction: column;

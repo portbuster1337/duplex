@@ -481,6 +481,11 @@ export class ChatClient {
     return { kind: resolved.connReq.mode === 'invitation' ? 'invitation' : 'contact', resolved };
   }
 
+  /** creates a group, with us as the owner; incognito: members see a random profile */
+  createGroup(p: { displayName: string; fullName?: string; description?: string; image?: string }, incognito = false): Promise<Group> {
+    return this.groups.create(p, incognito ? randomProfile() : undefined);
+  }
+
   /** joins a group via its link (the group is shown once the admin accepts) */
   async joinGroup(link: string, opts: { resolved?: Awaited<ReturnType<Agent['resolveLink']>>; incognito?: boolean } = {}): Promise<Group> {
     const resolved = opts.resolved ?? (await this.agent.resolveLink(link));
@@ -840,6 +845,7 @@ export class ChatClient {
       if (c.status === 'active' && !c.incognito) await this.send(c, xInfo(this.ourProfile(c))).catch(() => {});
     }
     if (this.state.address) await this.agent.updateLinkData(this.state.address.connId, contactShortLinkData(this.ourProfile())).catch(() => {});
+    await this.groups.profileUpdated();
   }
 
   // ---- disappearing messages and security codes

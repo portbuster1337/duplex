@@ -1,4 +1,5 @@
-// Adding contacts: 1-time links, connecting via a link, and the contact address.
+// Adding contacts and groups: 1-time links, connecting via a link (or joining a group), the contact
+// address, and new groups.
 import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import type { Session } from '../app/session';
@@ -8,8 +9,9 @@ import { Avatar, copyText, QRCode } from './util';
 import { errorText, Modal, Spinner, toast, Toggle } from './components';
 import { Icon } from './icons';
 import type { Selection } from './layout';
+import { NewGroup } from './groups';
 
-type Tab = 'invite' | 'connect' | 'address';
+type Tab = 'invite' | 'connect' | 'address' | 'group';
 
 export function NewChat({ session, onClose, onOpen }: { session: Session; onClose: () => void; onOpen: (s: Selection) => void }): JSX.Element {
   const [tab, setTab] = useState<Tab>('invite');
@@ -25,10 +27,14 @@ export function NewChat({ session, onClose, onOpen }: { session: Session; onClos
         <button role="tab" aria-selected={tab === 'address'} class={tab === 'address' ? 'on' : ''} onClick={() => setTab('address')}>
           <Icon name="mail" size={16} /> Your address
         </button>
+        <button role="tab" aria-selected={tab === 'group'} class={tab === 'group' ? 'on' : ''} onClick={() => setTab('group')}>
+          <Icon name="users" size={16} /> New group
+        </button>
       </div>
       {tab === 'invite' && <Invite session={session} onOpen={onOpen} />}
       {tab === 'connect' && <Connect session={session} onOpen={onOpen} />}
       {tab === 'address' && <AddressTab session={session} />}
+      {tab === 'group' && <NewGroup session={session} onCreated={(g) => onOpen({ kind: 'group', id: g.id })} />}
     </Modal>
   );
 }
@@ -119,7 +125,7 @@ function Connect({ session, onOpen }: { session: Session; onOpen: (s: Selection)
     setBusy(true);
     try {
       const p = await session.chat.previewLink(link);
-      if (p.kind === 'group' || p.kind === 'channel') setErr(`This is a ${p.kind} link — groups and channels are not supported in Duplex yet.`);
+      if (p.kind === 'channel') setErr('This is a channel link — channels are not supported in Duplex yet.');
       else setPreview(p);
     } catch (e) {
       setErr(`This link cannot be used: ${errorText(e)}`);
@@ -131,6 +137,11 @@ function Connect({ session, onOpen }: { session: Session; onOpen: (s: Selection)
     setBusy(true);
     setErr('');
     try {
+      if (preview?.kind === 'group') {
+        const g = await session.chat.joinGroup(link, { resolved: preview.resolved, incognito });
+        onOpen({ kind: 'group', id: g.id });
+        return;
+      }
       const c = await session.chat.connect(link, { resolved: preview?.resolved, message, incognito });
       onOpen({ kind: 'contact', id: c.id });
     } catch (e) {
@@ -142,7 +153,7 @@ function Connect({ session, onOpen }: { session: Session; onOpen: (s: Selection)
   return (
     <div class="connect">
       <label>
-        Paste a SimpleX link (1-time link or contact address)
+        Paste a SimpleX link (1-time link, contact address or group link)
         <textarea
           rows={3}
           value={link}
@@ -161,7 +172,13 @@ function Connect({ session, onOpen }: { session: Session; onOpen: (s: Selection)
       )}
       {preview && (
         <div class="preview">
-          {preview.profile ? (
+          {preview.kind === 'group' ? (
+            <div class="profile-card small">
+              <Avatar profile={(preview.groupProfile as Profile | undefined) ?? { displayName: 'group', fullName: '' }} size={64} />
+              <h3>{preview.groupProfile?.displayName ?? 'A group'}</h3>
+              {preview.groupProfile?.description && <p class="muted">{preview.groupProfile.description}</p>}
+            </div>
+          ) : preview.profile ? (
             <div class="profile-card small">
               <Avatar profile={preview.profile as Profile} size={64} />
               <h3>{profileName(preview.profile)}</h3>
@@ -174,9 +191,11 @@ function Connect({ session, onOpen }: { session: Session; onOpen: (s: Selection)
           <p class="hint">
             {preview.kind === 'invitation'
               ? 'You will share your profile with this contact. The connection is established once both of you are online.'
-              : 'A contact request with your profile will be sent. The address owner can accept or reject it.'}
+              : preview.kind === 'group'
+                ? 'You will join this group with your profile: its members see it. The group admin accepts you, then introduces you to the members.'
+                : 'A contact request with your profile will be sent. The address owner can accept or reject it.'}
           </p>
-          <Toggle checked={incognito} onChange={setIncognito} label="Connect incognito" hint="Share a new random profile with this contact instead of yours" />
+          <Toggle checked={incognito} onChange={setIncognito} label={preview.kind === 'group' ? 'Join incognito' : 'Connect incognito'} hint={preview.kind === 'group' ? 'Members see a new random profile instead of yours' : 'Share a new random profile with this contact instead of yours'} />
           {preview.kind === 'contact' && (
             <label>
               Message (optional)
@@ -186,7 +205,7 @@ function Connect({ session, onOpen }: { session: Session; onOpen: (s: Selection)
           <div class="row">
             <button onClick={() => setPreview(undefined)}>Back</button>
             <button class="primary" disabled={busy} onClick={connect}>
-              {busy ? <Spinner label="Connecting…" /> : preview.kind === 'invitation' ? 'Connect' : 'Send request'}
+              {busy ? <Spinner label="Connecting…" /> : preview.kind === 'invitation' ? 'Connect' : preview.kind === 'group' ? 'Join group' : 'Send request'}
             </button>
           </div>
         </div>

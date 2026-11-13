@@ -1,8 +1,13 @@
-// A conversation: messages, composer, message actions and the contact info panel.
+// A conversation with a contact or a group: messages, composer, message actions, and the contact
+// and group info panels.
 import type { JSX } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { Session } from '../app/session';
 import { contentText, itemText, profileName, TTL_CHOICES, ttlText, type ChatItem, type Contact } from '../app/chat';
+import { groupName, memberName, type Group } from '../app/groups';
+import { groupPrefOn } from '../core/chat/groups';
+import type { Profile } from '../core/chat/protocol';
+import { GroupInfo } from './groups';
 import { hasContent } from '../app/files';
 import { AttachmentStrip, FileContent, fmtDuration, saveFile, useAttachments } from './files';
 import { canRecord, MAX_VOICE_SECONDS, VoiceRecorder, type Recording } from './recorder';
@@ -14,9 +19,11 @@ import { useChatUpdates } from './layout';
 
 const PAGE = 100;
 
-export function ChatView({ session, contact, onBack, onDeleted }: { session: Session; contact: Contact; onBack: () => void; onDeleted: () => void }): JSX.Element {
+export function ChatView({ session, chatId, onBack, onDeleted, onOpen }: { session: Session; chatId: string; onBack: () => void; onDeleted: () => void; onOpen?: (chatId: string) => void }): JSX.Element {
   const chat = session.chat;
   useChatUpdates(session);
+  const contact = chat.contact(chatId);
+  const group = chat.group(chatId);
   const [items, setItems] = useState<ChatItem[]>([]);
   const [limit, setLimit] = useState(PAGE);
   const [text, setText] = useState('');
@@ -70,24 +77,24 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
     setRecorder(undefined);
   };
 
-  const reload = async () => setItems([...(await chat.chatItems(contact.id))]);
+  const reload = async () => setItems([...(await chat.chatItems(chatId))]);
 
   useEffect(() => {
     reload();
-    chat.markRead(contact.id);
+    chat.markRead(chatId);
     const off = chat.on((e) => {
-      if ((e.type === 'newItem' || e.type === 'items') && e.contactId === contact.id) {
+      if ((e.type === 'newItem' || e.type === 'items') && e.contactId === chatId) {
         reload();
-        if (!document.hidden) chat.markRead(contact.id);
+        if (!document.hidden) chat.markRead(chatId);
       }
     });
-    const vis = () => !document.hidden && chat.markRead(contact.id);
+    const vis = () => !document.hidden && chat.markRead(chatId);
     document.addEventListener('visibilitychange', vis);
     return () => {
       off();
       document.removeEventListener('visibilitychange', vis);
     };
-  }, [contact.id]);
+  }, [chatId]);
 
   useLayoutEffect(() => {
     const el = listRef.current;
@@ -107,7 +114,7 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
       setVoice(undefined);
       stick.current = true;
       try {
-        await chat.sendFile(contact.id, { blob: v.rec.blob, name: v.rec.name, kind: 'voice', duration: v.rec.duration }, '', reply?.id);
+        await chat.sendFile(chatId, { blob: v.rec.blob, name: v.rec.name, kind: 'voice', duration: v.rec.duration }, '', reply?.id);
         setReply(undefined);
       } catch (e) {
         toast(errorText(e), 'error');
@@ -125,7 +132,7 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
       // the caption goes with the last file, as in the apps
       for (let i = 0; i < list.length; i++) {
         try {
-          await chat.sendFile(contact.id, list[i].prepared!, i === list.length - 1 ? t : '', i === 0 ? quoteId : undefined);
+          await chat.sendFile(chatId, list[i].prepared!, i === list.length - 1 ? t : '', i === 0 ? quoteId : undefined);
         } catch (e) {
           toast(`${list[i].file.name}: ${errorText(e)}`, 'error');
         }
@@ -136,11 +143,11 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
     if (!t) return;
     try {
       if (editing) {
-        await chat.editItem(contact.id, editing.id, t);
+        await chat.editItem(chatId, editing.id, t);
         setEditing(undefined);
       } else {
         stick.current = true;
-        await chat.sendText(contact.id, t, reply?.id);
+        await chat.sendText(chatId, t, reply?.id);
         setReply(undefined);
       }
       setText('');
@@ -163,18 +170,43 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
     }
   };
 
+  if (!contact && !group) return <div class="placeholder" />;
   const shownItems = items.filter((i) => !i.deleteAt || i.deleteAt > Date.now()).slice(-limit);
-  const canSend = contact.status === 'active';
-  const canAttach = canSend && !editing && chat.peerAllowsFiles(contact);
+  const groupBlock = group ? chat.groups.canSend(group) : undefined;
+  const canSend = contact ? contact.status === 'active' : !groupBlock;
+  const allowsFiles = contact ? chat.peerAllowsFiles(contact) : groupPrefOn(group!.profile, 'files');
+  const allowsVoice = contact ? chat.peerAllowsVoice(contact) : groupPrefOn(group!.profile, 'voice');
+  const noFiles = contact ? 'The contact does not allow files and media' : 'Files and media are not allowed in this group';
+  const canAttach = canSend && !editing && allowsFiles;
   const dropFiles = (files: FileList | null | undefined) => {
     if (!files?.length) return;
-    if (!canAttach) return toast(canSend ? 'The contact does not allow files and media' : 'The contact is not connected', 'error');
+    if (!canAttach) return toast(canSend ? noFiles : contact ? 'The contact is not connected' : groupBlock!, 'error');
     addFiles(files);
   };
-  const name = contact.localAlias || profileName(contact.profile);
-  const ttl = chat.disappearingTtl(contact);
-  const verified = chat.isVerified(contact);
+  const name = contact ? contact.localAlias || profileName(contact.profile) : groupName(group);
+  const ttl = contact ? chat.disappearingTtl(contact) : chat.groupTtl(group!);
+  const verified = contact ? chat.isVerified(contact) : false;
+  const members = group ? chat.groups.currentMembers(group).filter((m) => m.status === 'connected').length : 0;
+  const sub = contact
+    ? contact.status === 'active'
+      ? [contact.incognito ? `incognito as ${contact.incognito.displayName}` : contact.profile.fullName || 'end-to-end encrypted', ttl ? `disappearing after ${ttlText(ttl)}` : ''].filter(Boolean).join(' · ')
+      : contact.status === 'deleted'
+        ? 'deleted the connection'
+        : contact.status === 'requested'
+          ? 'waiting for the contact to accept'
+          : 'connecting…'
+    : groupStatusText(group!, members, ttl);
+  const placeholder = canSend
+    ? ttl
+      ? `Message (disappears after ${ttlText(ttl)})`
+      : 'Message'
+    : contact
+      ? contact.status === 'deleted'
+        ? 'The contact deleted the connection'
+        : 'Waiting for the connection…'
+      : groupBlock!;
   let lastDay = '';
+  let lastSender: string | undefined;
 
   return (
     <div
@@ -198,24 +230,16 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
           <Icon name="back" />
         </button>
         <button class="chat-title" onClick={() => setInfo(true)}>
-          <Avatar profile={contact.profile} size={36} />
+          <Avatar profile={contact ? contact.profile : (group!.profile as Profile)} size={36} />
           <span>
             <span class="chat-name">
               {name}
               {verified && <Icon name="shieldCheck" size={15} class="verified" title="security code verified" />}
             </span>
-            <span class="chat-sub">
-              {contact.status === 'active'
-                ? [contact.incognito ? `incognito as ${contact.incognito.displayName}` : contact.profile.fullName || 'end-to-end encrypted', ttl ? `disappearing after ${ttlText(ttl)}` : ''].filter(Boolean).join(' · ')
-                : contact.status === 'deleted'
-                  ? 'deleted the connection'
-                  : contact.status === 'requested'
-                    ? 'waiting for the contact to accept'
-                    : 'connecting…'}
-            </span>
+            <span class="chat-sub">{sub}</span>
           </span>
         </button>
-        <button class="icon-btn" onClick={() => setInfo(true)} aria-label="Contact info" title="Contact info">
+        <button class="icon-btn" onClick={() => setInfo(true)} aria-label={contact ? 'Contact info' : 'Group info'} title={contact ? 'Contact info' : 'Group info'}>
           <Icon name="info" />
         </button>
       </header>
@@ -228,11 +252,17 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
         {shownItems.map((it) => {
           const day = fmtDay(it.brokerTs ?? it.ts);
           const sep = day !== lastDay ? <div class="day">{day}</div> : null;
+          // in groups, the sender is shown above the first of its consecutive messages
+          const sender = group && it.dir === 'rcv' ? it.memberId : undefined;
+          const showSender = !!sender && (sender !== lastSender || !!sep);
+          lastSender = it.dir === 'rcv' ? sender : undefined;
           lastDay = day;
           return (
             <>
               {sep}
-              {it.dir === 'event' ? (
+              {it.groupInv ? (
+                <GroupInvitationItem key={it.id} session={session} it={it} onOpen={onOpen} />
+              ) : it.dir === 'event' ? (
                 <div class="event" key={it.id}>
                   {contentText(it.content)}
                 </div>
@@ -240,11 +270,13 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
                 <Bubble
                   key={it.id}
                   session={session}
-                  contactId={contact.id}
+                  contactId={chatId}
                   it={it}
+                  group={group}
+                  showSender={showSender}
                   onMenu={(x, y) => setMenu({ item: it, x, y })}
                   onLink={(u) => (isSimplexLink(u) ? setOpenLink(u) : window.open(u, '_blank', 'noopener,noreferrer'))}
-                  onReact={(emoji, add) => chat.react(contact.id, it.id, emoji, add).catch((e) => toast(errorText(e), 'error'))}
+                  onReact={(emoji, add) => chat.react(chatId, it.id, emoji, add).catch((e) => toast(errorText(e), 'error'))}
                 />
               )}
             </>
@@ -314,7 +346,7 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
             onClick={() => fileRef.current?.click()}
             disabled={!canAttach}
             aria-label="Attach files"
-            title={canSend && !chat.peerAllowsFiles(contact) ? 'The contact does not allow files and media' : 'Attach files or images'}
+            title={canSend && !allowsFiles ? noFiles : 'Attach files or images'}
           >
             <Icon name="paperclip" />
           </button>
@@ -323,7 +355,7 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
             rows={1}
             value={text}
             disabled={!canSend}
-            placeholder={canSend ? (ttl ? `Message (disappears after ${ttlText(ttl)})` : 'Message') : contact.status === 'deleted' ? 'The contact deleted the connection' : 'Waiting for the connection…'}
+            placeholder={placeholder}
             onInput={(e) => {
               const ta = e.target as HTMLTextAreaElement;
               setText(ta.value);
@@ -340,7 +372,7 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
             }}
             aria-label="Message"
           />
-          {canAttach && chat.peerAllowsVoice(contact) && canRecord() && !text.trim() && !atts.length && !voice && !recorder ? (
+          {canAttach && allowsVoice && canRecord() && !text.trim() && !atts.length && !voice && !recorder ? (
             <button class="send" onClick={startRecording} aria-label="Record a voice message" title="Record a voice message">
               <Icon name="mic" />
             </button>
@@ -356,6 +388,7 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
           {...menu}
           onClose={() => setMenu(undefined)}
           canAct={canSend}
+          canDeleteForEveryone={!menu.item.deleted && !!menu.item.sharedMsgId && canSend && (menu.item.dir === 'snd' || (!!group && menu.item.dir === 'rcv' && chat.canModerate(group, menu.item)))}
           onReply={() => {
             setReply(menu.item);
             setEditing(undefined);
@@ -367,22 +400,100 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
             setText(contentText(menu.item.content));
             inputRef.current?.focus();
           }}
-          onDelete={(everyone) => chat.deleteItem(contact.id, menu.item.id, everyone).catch((e) => toast(errorText(e), 'error'))}
-          onReact={(emoji) => chat.react(contact.id, menu.item.id, emoji, !menu.item.reactions?.[emoji]?.me).catch((e) => toast(errorText(e), 'error'))}
+          onDelete={(everyone) => chat.deleteItem(chatId, menu.item.id, everyone).catch((e) => toast(errorText(e), 'error'))}
+          onReact={(emoji) => chat.react(chatId, menu.item.id, emoji, !menu.item.reactions?.[emoji]?.me).catch((e) => toast(errorText(e), 'error'))}
           onSave={menu.item.file && hasContent(menu.item.file) ? () => saveFile(session, menu.item.file!).catch((e) => toast(errorText(e), 'error')) : undefined}
           onRevoke={
             menu.item.dir === 'snd' && menu.item.file && !['sndCancelled', 'sndError'].includes(menu.item.file.status)
               ? () =>
                   chat
-                    .revokeFile(contact.id, menu.item.id)
+                    .revokeFile(chatId, menu.item.id)
                     .then(() => toast('The file was deleted from the server'))
                     .catch((e) => toast(errorText(e), 'error'))
               : undefined
           }
         />
       )}
-      {info && <ContactInfo session={session} contact={contact} onClose={() => setInfo(false)} onDeleted={onDeleted} />}
-      {openLink && <OpenLink session={session} link={openLink} onClose={() => setOpenLink(undefined)} />}
+      {info && contact && <ContactInfo session={session} contact={contact} onClose={() => setInfo(false)} onDeleted={onDeleted} />}
+      {info && group && <GroupInfo session={session} group={group} onClose={() => setInfo(false)} onDeleted={onDeleted} />}
+      {openLink && <OpenLink session={session} link={openLink} onClose={() => setOpenLink(undefined)} onOpen={onOpen} />}
+    </div>
+  );
+}
+
+function groupStatusText(g: Group, connected: number, ttl?: number): string {
+  switch (g.status) {
+    case 'invited':
+      return 'you are invited';
+    case 'joining':
+    case 'connecting':
+      return 'connecting…';
+    case 'pending':
+      return 'waiting for the admins to accept you';
+    case 'left':
+      return 'you left';
+    case 'removed':
+      return 'you were removed';
+    case 'deleted':
+      return 'the group was deleted';
+    case 'rejected':
+      return 'your request to join was rejected';
+    default:
+      return [`${connected + 1} member${connected ? 's' : ''}`, g.incognito ? `incognito as ${g.incognito.displayName}` : '', ttl ? `disappearing after ${ttlText(ttl)}` : ''].filter(Boolean).join(' · ');
+  }
+}
+
+/** an invitation to a group, in the chat with the contact who sent it */
+function GroupInvitationItem({ session, it, onOpen }: { session: Session; it: ChatItem; onOpen?: (chatId: string) => void }): JSX.Element {
+  const [busy, setBusy] = useState(false);
+  const inv = it.groupInv!;
+  const g = session.chat.group(inv.groupId);
+  const pending = inv.status === 'pending' && g?.status === 'invited';
+  const run = async (f: () => Promise<void>) => {
+    setBusy(true);
+    try {
+      await f();
+    } catch (e) {
+      toast(errorText(e), 'error');
+    }
+    setBusy(false);
+  };
+  return (
+    <div class="msg rcv">
+      <div class="bubble group-inv">
+        <div class="group-inv-head">
+          <Avatar profile={(g?.profile as Profile) ?? { displayName: inv.name, fullName: '' }} size={40} />
+          <span>
+            <b>{inv.name}</b>
+            <span class="muted small">invitation to join as {inv.role}</span>
+          </span>
+        </div>
+        {g?.profile.description && <p class="small">{g.profile.description}</p>}
+        {pending ? (
+          <div class="row">
+            <button disabled={busy} onClick={() => run(() => session.chat.groups.reject(inv.groupId))}>
+              Reject
+            </button>
+            <button
+              class="primary"
+              disabled={busy}
+              onClick={() =>
+                run(async () => {
+                  await session.chat.groups.accept(inv.groupId);
+                  onOpen?.(inv.groupId);
+                })
+              }
+            >
+              Join group
+            </button>
+          </div>
+        ) : (
+          <p class="muted small">{inv.status === 'accepted' ? 'you joined' : inv.status === 'rejected' ? 'you rejected the invitation' : 'the invitation is no longer valid'}</p>
+        )}
+        <span class="meta">
+          <span>{fmtClock(it.brokerTs ?? it.ts)}</span>
+        </span>
+      </div>
     </div>
   );
 }
@@ -407,6 +518,8 @@ function Bubble({
   session,
   contactId,
   it,
+  group,
+  showSender,
   onMenu,
   onLink,
   onReact,
@@ -414,10 +527,14 @@ function Bubble({
   session: Session;
   contactId: string;
   it: ChatItem;
+  group?: Group;
+  showSender?: boolean;
   onMenu: (x: number, y: number) => void;
   onLink: (u: string) => void;
   onReact: (emoji: string, add: boolean) => void;
 }): JSX.Element {
+  const sender = group && it.memberId ? group.members[it.memberId] : undefined;
+  const quoteWho = it.quote ? (it.quote.sent ? 'you' : group ? (it.quote.memberId && group.members[it.quote.memberId] ? memberName(group.members[it.quote.memberId]) : 'member') : 'contact') : '';
   const c = it.content;
   // images and videos with files are shown by FileContent
   const img = !it.file && (c.type === 'image' || c.type === 'video') ? safeImage((c as { image?: string }).image) : undefined;
@@ -428,17 +545,24 @@ function Bubble({
     onMenu(e.clientX, e.clientY);
   };
   return (
-    <div class={`msg ${it.dir}`}>
+    <div class={`msg ${it.dir} ${group && it.dir === 'rcv' ? 'in-group' : ''}`}>
+      {group && it.dir === 'rcv' && (showSender ? <Avatar profile={sender?.profile} size={28} /> : <span class="avatar-gap" />)}
       <div class={`bubble ${it.deleted ? 'deleted' : ''} ${it.file && (c.type === 'image' || c.type === 'video') ? 'has-media' : ''}`} onContextMenu={open}>
+        {showSender && (
+          <div class="sender">
+            {sender ? memberName(sender) : 'member'}
+            {sender && sender.role !== 'member' && <span class="role">{sender.role}</span>}
+          </div>
+        )}
         {it.forwarded && <div class="fwd">forwarded</div>}
         {it.quote && (
           <div class="quote">
-            <span class="quote-who">{it.quote.sent ? 'you' : 'contact'}</span>
+            <span class="quote-who">{quoteWho}</span>
             <span class="quote-text">{plainText(it.quote.text) || '…'}</span>
           </div>
         )}
         {it.deleted ? (
-          <i>message deleted</i>
+          <i>{it.moderated ? 'removed by a moderator' : 'message deleted'}</i>
         ) : (
           <>
             {img && <img class="msg-img" src={img} alt={text || 'image'} />}
@@ -475,8 +599,12 @@ function Bubble({
       {it.reactions && Object.keys(it.reactions).length > 0 && (
         <div class="reactions">
           {Object.entries(it.reactions).map(([emoji, r]) => (
-            <button class={`reaction ${r.me ? 'mine' : ''}`} onClick={() => onReact(emoji, !r.me)} title={[r.me && 'you', r.peer && 'contact'].filter(Boolean).join(', ')}>
-              {emoji} {(r.me ? 1 : 0) + (r.peer ? 1 : 0)}
+            <button
+              class={`reaction ${r.me ? 'mine' : ''}`}
+              onClick={() => onReact(emoji, !r.me)}
+              title={[r.me && 'you', r.peer && 'contact', ...(r.members ?? []).map((id) => memberName(group?.members[id]))].filter(Boolean).join(', ')}
+            >
+              {emoji} {(r.me ? 1 : 0) + (r.peer ? 1 : 0) + (r.members?.length ?? 0)}
             </button>
           ))}
         </div>
@@ -490,6 +618,7 @@ function ItemMenu({
   x,
   y,
   canAct,
+  canDeleteForEveryone,
   onClose,
   onReply,
   onEdit,
@@ -502,6 +631,7 @@ function ItemMenu({
   x: number;
   y: number;
   canAct: boolean;
+  canDeleteForEveryone: boolean;
   onClose: () => void;
   onReply: () => void;
   onEdit: () => void;
@@ -553,9 +683,9 @@ function ItemMenu({
             <Icon name="close" size={16} /> Delete file from server
           </button>
         )}
-        {canAct && item.dir === 'snd' && !item.deleted && item.sharedMsgId && (
+        {canDeleteForEveryone && (
           <button onClick={act(() => onDelete(true))} role="menuitem" class="danger">
-            <Icon name="trash" size={16} /> Delete for everyone
+            <Icon name="trash" size={16} /> {item.dir === 'snd' ? 'Delete for everyone' : 'Delete for everyone (moderate)'}
           </button>
         )}
         <button onClick={act(() => onDelete(false))} role="menuitem" class="danger">
@@ -762,11 +892,11 @@ function SecurityCode({ session, contact }: { session: Session; contact: Contact
   );
 }
 
-function OpenLink({ session, link, onClose }: { session: Session; link: string; onClose: () => void }): JSX.Element {
+function OpenLink({ session, link, onClose, onOpen }: { session: Session; link: string; onClose: () => void; onOpen?: (chatId: string) => void }): JSX.Element {
   const [busy, setBusy] = useState(false);
   return (
     <Modal title="SimpleX link" onClose={onClose}>
-      <p>Connect via this link? The link owner will see your profile.</p>
+      <p>Connect via this link? The link owner (or the group admin) will see your profile.</p>
       <p class="mono small">{link}</p>
       <div class="row">
         <button onClick={onClose}>Cancel</button>
@@ -776,9 +906,12 @@ function OpenLink({ session, link, onClose }: { session: Session; link: string; 
           onClick={async () => {
             setBusy(true);
             try {
-              await session.chat.connect(link);
-              toast('Connecting…');
+              const p = await session.chat.previewLink(link);
+              if (p.kind === 'channel') throw new Error('channels are not supported yet');
+              const id = p.kind === 'group' ? (await session.chat.joinGroup(link, { resolved: p.resolved })).id : (await session.chat.connect(link, { resolved: p.resolved })).id;
+              toast(p.kind === 'group' ? 'Joining the group…' : 'Connecting…');
               onClose();
+              onOpen?.(id);
             } catch (e) {
               toast(errorText(e), 'error');
               setBusy(false);

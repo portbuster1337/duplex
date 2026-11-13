@@ -3,6 +3,8 @@ import type { JSX } from 'preact';
 import { useEffect, useMemo, useReducer, useState } from 'preact/hooks';
 import type { Session } from '../app/session';
 import { contentText, profileName, type ChatItem, type Contact, type ContactRequest, type PendingInvitation } from '../app/chat';
+import { groupName, memberName, type Group } from '../app/groups';
+import type { Profile } from '../core/chat/protocol';
 import { Avatar, fmtTime, plainText } from './util';
 import { Icon } from './icons';
 import { ChatView } from './chatview';
@@ -11,7 +13,7 @@ import { Settings } from './settings';
 import { RequestView, InvitationView } from './requests';
 import { toast } from './components';
 
-export type Selection = { kind: 'contact'; id: string } | { kind: 'request'; id: string } | { kind: 'invitation'; id: string } | undefined;
+export type Selection = { kind: 'contact'; id: string } | { kind: 'group'; id: string } | { kind: 'request'; id: string } | { kind: 'invitation'; id: string } | undefined;
 
 export function useChatUpdates(session: Session): number {
   const [n, bump] = useReducer((x: number) => x + 1, 0);
@@ -31,16 +33,20 @@ function mediaLabel(it: ChatItem): string {
   return it.file ? `📎 ${it.file.name}` : it.content.type;
 }
 
-function lastItemPreview(items: ChatItem[] | undefined): { text: string; ts?: number } {
+function lastItemPreview(items: ChatItem[] | undefined, g?: Group): { text: string; ts?: number } {
   if (!items?.length) return { text: '' };
   for (let i = items.length - 1; i >= 0; i--) {
     const it = items[i];
     if (it.dir === 'event') return { text: contentText(it.content), ts: it.ts };
     const t = it.deleted ? 'message deleted' : plainText(contentText(it.content)) || mediaLabel(it);
-    return { text: (it.dir === 'snd' ? 'you: ' : '') + t, ts: it.brokerTs ?? it.ts };
+    const who = it.dir === 'snd' ? 'you: ' : g && it.memberId ? `${memberName(g.members[it.memberId])}: ` : '';
+    return { text: who + t, ts: it.brokerTs ?? it.ts };
   }
   return { text: '' };
 }
+
+/** a contact or a group, in the order of the chat list */
+type ChatEntry = { kind: 'contact'; c: Contact; at: number } | { kind: 'group'; g: Group; at: number };
 
 export function Main({ session, onLock, onWiped }: { session: Session; onLock: () => void; onWiped: () => void }): JSX.Element {
   const chat = session.chat;
@@ -53,17 +59,22 @@ export function Main({ session, onLock, onWiped }: { session: Session; onLock: (
 
   // load the last items of each chat for the list previews
   const contacts = chat.contacts();
+  const groups = chat.groups.list();
+  const entries: ChatEntry[] = [...contacts.map((c) => ({ kind: 'contact' as const, c, at: c.lastActivity })), ...groups.map((g) => ({ kind: 'group' as const, g, at: g.lastActivity }))].sort((a, b) => b.at - a.at);
   useEffect(() => {
     let cancelled = false;
     (async () => {
       const p: Record<string, ChatItem[]> = {};
-      for (const c of contacts) p[c.id] = await chat.chatItems(c.id);
+      for (const e of entries) {
+        const id = e.kind === 'contact' ? e.c.id : e.g.id;
+        p[id] = await chat.chatItems(id);
+      }
       if (!cancelled) setPreviews(p);
     })();
     return () => {
       cancelled = true;
     };
-  }, [contacts.map((c) => c.id + c.lastActivity + c.unread).join()]);
+  }, [entries.map((e) => (e.kind === 'contact' ? e.c.id + e.c.lastActivity + e.c.unread : e.g.id + e.g.lastActivity + e.g.unread + e.g.status)).join()]);
 
   useEffect(() => {
     const off = chat.on((e) => {
@@ -100,15 +111,18 @@ export function Main({ session, onLock, onWiped }: { session: Session; onLock: (
   const requests = Object.values(chat.state.requests).sort((a, b) => b.receivedAt - a.receivedAt);
   const invitations = Object.values(chat.state.invitations).sort((a, b) => b.createdAt - a.createdAt);
   const f = filter.trim().toLowerCase();
+  const matches = (...names: Array<string | undefined>) => !f || names.some((n) => (n ?? '').toLowerCase().includes(f));
   const shown = useMemo(
-    () => contacts.filter((c) => !f || profileName(c.profile).toLowerCase().includes(f) || (c.localAlias ?? '').toLowerCase().includes(f) || (c.profile.fullName ?? '').toLowerCase().includes(f)),
-    [contacts, f],
+    () => entries.filter((e) => (e.kind === 'contact' ? matches(profileName(e.c.profile), e.c.localAlias, e.c.profile.fullName) : matches(e.g.profile.displayName, e.g.localAlias, e.g.profile.fullName))),
+    [entries.map((e) => e.at).join(), f],
   );
   const up = chat.connectedServers().length;
   const selContact = sel?.kind === 'contact' ? chat.contact(sel.id) : undefined;
+  const selGroup = sel?.kind === 'group' ? chat.group(sel.id) : undefined;
   const selRequest = sel?.kind === 'request' ? chat.state.requests[sel.id] : undefined;
   const selInvitation = sel?.kind === 'invitation' ? chat.state.invitations[sel.id] : undefined;
-  const hasSel = !!(selContact || selRequest || selInvitation);
+  const hasSel = !!(selContact || selGroup || selRequest || selInvitation);
+  const openChat = (id: string) => setSel(chat.isGroup(id) ? { kind: 'group', id } : { kind: 'contact', id });
 
   return (
     <div class={`layout ${hasSel ? 'has-sel' : ''}`}>
@@ -139,10 +153,14 @@ export function Main({ session, onLock, onWiped }: { session: Session; onLock: (
           {invitations.map((i) => (
             <InvitationRow key={i.id} i={i} active={sel?.kind === 'invitation' && sel.id === i.id} onClick={() => setSel({ kind: 'invitation', id: i.id })} />
           ))}
-          {shown.map((c) => (
-            <ContactRow key={c.id} c={c} items={previews[c.id]} active={sel?.kind === 'contact' && sel.id === c.id} onClick={() => setSel({ kind: 'contact', id: c.id })} />
-          ))}
-          {!contacts.length && !requests.length && !invitations.length && (
+          {shown.map((e) =>
+            e.kind === 'contact' ? (
+              <ContactRow key={e.c.id} c={e.c} items={previews[e.c.id]} active={sel?.kind === 'contact' && sel.id === e.c.id} onClick={() => setSel({ kind: 'contact', id: e.c.id })} />
+            ) : (
+              <GroupRow key={e.g.id} g={e.g} items={previews[e.g.id]} active={sel?.kind === 'group' && sel.id === e.g.id} onClick={() => setSel({ kind: 'group', id: e.g.id })} />
+            ),
+          )}
+          {!contacts.length && !groups.length && !requests.length && !invitations.length && (
             <div class="empty-list">
               <p>No chats yet.</p>
               <button class="primary" onClick={() => setModal('new')}>
@@ -153,8 +171,8 @@ export function Main({ session, onLock, onWiped }: { session: Session; onLock: (
         </div>
       </aside>
       <main class="main">
-        {selContact ? (
-          <ChatView key={selContact.id} session={session} contact={selContact} onBack={() => setSel(undefined)} onDeleted={() => setSel(undefined)} />
+        {selContact || selGroup ? (
+          <ChatView key={(selContact ?? selGroup)!.id} session={session} chatId={(selContact ?? selGroup)!.id} onBack={() => setSel(undefined)} onDeleted={() => setSel(undefined)} onOpen={openChat} />
         ) : selRequest ? (
           <RequestView session={session} request={selRequest} onDone={(c) => setSel(c ? { kind: 'contact', id: c.id } : undefined)} onBack={() => setSel(undefined)} />
         ) : selInvitation ? (
@@ -209,6 +227,31 @@ function ContactRow({ c, items, active, onClick }: { c: Contact; items?: ChatIte
   );
 }
 
+function GroupRow({ g, items, active, onClick }: { g: Group; items?: ChatItem[]; active: boolean; onClick: () => void }): JSX.Element {
+  const p = lastItemPreview(items, g);
+  const status = g.status === 'invited' ? 'invitation to join' : g.status === 'joining' || g.status === 'connecting' ? 'connecting…' : g.status === 'pending' ? 'waiting to be accepted' : '';
+  return (
+    <button class={`row ${active ? 'active' : ''}`} onClick={onClick} role="listitem">
+      <Avatar profile={g.profile as Profile} size={44} />
+      <span class="row-main">
+        <span class="row-top">
+          <span class="row-name">
+            <Icon name="users" size={13} class="kind" title="group" />
+            {groupName(g)}
+            {g.incognito && <Icon name="incognito" size={13} class="incog" title={`incognito as ${g.incognito.displayName}`} />}
+            {g.favorite && <Icon name="star" size={12} class="fav" />}
+          </span>
+          <span class="row-time">{p.ts ? fmtTime(p.ts) : ''}</span>
+        </span>
+        <span class="row-bottom">
+          <span class={`row-preview ${status ? 'italic accent' : ''}`}>{status || p.text}</span>
+          {g.unread > 0 && !g.muted && <span class="badge">{g.unread}</span>}
+        </span>
+      </span>
+    </button>
+  );
+}
+
 function RequestRow({ r, active, onClick }: { r: ContactRequest; active: boolean; onClick: () => void }): JSX.Element {
   return (
     <button class={`row ${active ? 'active' : ''}`} onClick={onClick} role="listitem">
@@ -249,8 +292,9 @@ function notify(session: Session, contactId: string, item: ChatItem): void {
   const mode = session.settings.notifications;
   if (mode === 'off' || !document.hidden || !('Notification' in window) || Notification.permission !== 'granted') return;
   const c = session.chat.contact(contactId);
-  if (c?.muted) return;
-  const title = mode === 'full' && c ? c.localAlias || profileName(c.profile) : 'Duplex';
+  const g = session.chat.group(contactId);
+  if (c?.muted || g?.muted) return;
+  const title = mode === 'full' && c ? c.localAlias || profileName(c.profile) : mode === 'full' && g ? `${item.memberId ? memberName(g.members[item.memberId]) + ' @ ' : ''}${groupName(g)}` : 'Duplex';
   const body = mode === 'full' ? plainText(contentText(item.content)) || (item.file ? mediaLabel(item) : 'new message') : 'New message';
   try {
     new Notification(title, { body, silent: false, tag: mode === 'full' ? contactId : 'duplex' });

@@ -274,7 +274,7 @@ function limit(ms: ParsedChatMsg[]): ParsedChatMsg[] {
 
 // ---- event constructors
 
-export const xInfo = (profile: Profile): ChatMessage => ({ event: 'x.info', params: { profile } });
+export const xInfo = (profile: Profile, msgId?: string): ChatMessage => ({ ...(msgId ? { msgId } : {}), event: 'x.info', params: { profile } });
 
 export const xContact = (profile: Profile, contactReqId?: string, msg?: { msgId: string; content: MsgContent }): ChatMessage => ({
   event: 'x.contact',

@@ -635,6 +635,10 @@ export class GroupManager {
         if (g.status === 'connecting') g.status = 'active';
         await this.save(g);
         await this.event(g, g.status === 'pending' ? `connected to ${memberName(m)} — waiting to be accepted` : 'you joined the group');
+        // the welcome message, from the admin who added us (as the apps show it)
+        if (g.profile.description?.trim()) {
+          await this.chat.addItem(g.id, { id: localId(), dir: 'rcv', memberId: m.memberId, content: { type: 'text', text: g.profile.description }, ts: Date.now(), status: 'received' });
+        }
         return;
       case 'invitee':
         await this.event(g, `${memberName(m)} joined`, m.memberId);
@@ -955,6 +959,20 @@ export class GroupManager {
     await this.chat.saveState();
     await this.chat.deleteChatItems(g.id);
     void this.dropConnections(g, 10000);
+  }
+
+  /** our profile changed: the groups where we are not incognito are told */
+  async profileUpdated(): Promise<void> {
+    for (const g of this.list()) {
+      if (g.status === 'active' && !g.incognito) await this.send(g, xInfo(this.ourProfile(g), newSharedMsgId())).catch(() => 0);
+    }
+  }
+
+  /** settings that only we see */
+  async updateLocal(groupId: string, patch: Partial<Pick<Group, 'localAlias' | 'favorite' | 'muted'>>): Promise<void> {
+    const g = this.must(groupId);
+    Object.assign(g, patch);
+    await this.chat.saveState();
   }
 
   private must(id: string): Group {
