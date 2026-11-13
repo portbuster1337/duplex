@@ -70,7 +70,7 @@
           </div>
           <div class="feature">
             <h3>Channels</h3>
-            <p>Create channels served by chat relays, or subscribe to them. Subscribers connect to the relays, not to the owner; changes to a channel count only when signed by its owners, so a relay cannot make them up.</p>
+            <p>Create channels served by chat relays, or subscribe to them. Subscribers connect to the relays, not to the owner; changes to a channel count only when signed by its owners, so a relay cannot make them up. Owners make subscribers members, moderators or admins in a roster they sign, and can add other owners.</p>
           </div>
           <div class="feature">
             <h3>Files, images and videos</h3>
@@ -188,7 +188,7 @@
       <section id="limits">
         <h2>Limitations</h2>
         <ul>
-          <li>Channels: Duplex does not run as a chat relay, and only the owners of a channel are recognised (not its admins or moderators).</li>
+          <li>Channels: Duplex does not run as a chat relay, and only the owner who made a channel changes its profile, roles and owners. The apps do not add owners yet, and their subscribers who joined before an owner was added do not accept the changes that owner signs.</li>
           <li>Calls: no group calls (SimpleX has none), and they ring only while the page is open. Tor Browser disables WebRTC, so calls do not work there.</li>
           <li>Files are kept in the encrypted storage of this browser, which browsers limit in size: save large files to disk.</li>
           <li>No per-connection transport isolation: one connection per server.</li>
