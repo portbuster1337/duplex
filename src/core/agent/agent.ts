@@ -67,7 +67,8 @@ import {
   type FixedLinkData,
   type ShortLink,
 } from './shortlink';
-import { Network } from './network';
+import { DEFAULT_ROUTING, Network, type ProxyFallback, type ProxyMode } from './network';
+import { PRESET_SMP_SERVERS } from './presets';
 import { Encoder } from '../util/encoding';
 
 export interface RcvQueue {
@@ -209,6 +210,8 @@ export interface AgentConfig {
   servers: ProtocolServer[];
   /** create short links (default true) */
   shortLinks?: boolean;
+  /** private message routing; by default for routers the user does not use, as in the apps */
+  routing?: { mode: ProxyMode; fallback: ProxyFallback };
 }
 
 export class AgentError extends Error {
@@ -282,6 +285,17 @@ export class Agent {
       onConnected: (srv, client) => this.onConnected(srv, client),
       onDisconnected: (srv, err) => void this.emit({ type: 'DOWN', server: srv, err: err?.message }),
     });
+    const cfg = () => this.config;
+    this.network.routing = {
+      get mode() {
+        return cfg().routing?.mode ?? DEFAULT_ROUTING.mode;
+      },
+      get fallback() {
+        return cfg().routing?.fallback ?? DEFAULT_ROUTING.fallback;
+      },
+      known: () => [...cfg().servers, ...PRESET_SMP_SERVERS],
+      proxies: () => cfg().servers,
+    };
   }
 
   private async emit(e: AgentEvent): Promise<MsgResult | void> {
@@ -538,11 +552,11 @@ export class Agent {
     if (sl.mode === 'invitation') {
       sndKey = generateKeyPair('ed25519');
       key = invShortLinkKdf(sl.linkKey);
-      r = await this.network.send(sl.server, sl.linkId, { tag: 'LKEY', sndKey: sndKey.pub }, sndKey.priv);
+      r = await this.network.sendToQueue(sl.server, sl.linkId, { tag: 'LKEY', sndKey: sndKey.pub }, sndKey.priv);
     } else {
       const k = contactShortLinkKdf(sl.linkKey);
       key = k.key;
-      r = await this.network.send(sl.server, k.linkId, { tag: 'LGET' });
+      r = await this.network.sendToQueue(sl.server, k.linkId, { tag: 'LGET' });
     }
     if (r.tag !== 'LNK') throw new AgentError(`unexpected response: ${r.tag}`);
     const ld = decryptLinkData(sl.linkKey, key, r.data);
@@ -580,7 +594,7 @@ export class Agent {
     await this.withLock(c.id, async () => {
       await this.save(c);
       if (sndSecure && c.snd!.status === 'new') {
-        await this.network.send(c.snd!.server, c.snd!.sndId, { tag: 'SKEY', sndKey: c.snd!.sndPubKey }, c.snd!.sndPrivKey);
+        await this.network.sendToQueue(c.snd!.server, c.snd!.sndId, { tag: 'SKEY', sndKey: c.snd!.sndPubKey }, c.snd!.sndPrivKey);
         c.snd!.status = 'secured';
         await this.save(c);
       }
@@ -627,7 +641,7 @@ export class Agent {
     const nonce = randomBytes(24);
     const encBody = cbEncrypt(dh(q.addr.dhPublicKey, k.priv), nonce, encodeClientMessage({ tag: '_' }, env), E2E_ENC_CONFIRMATION_LENGTH);
     const body = encodeClientMsgEnvelope({ version: smpV, e2ePubKey: k.pub, nonce, encBody });
-    await this.network.send(q.addr.server, q.addr.senderId, { tag: 'SEND', notification: true, body });
+    await this.network.sendToQueue(q.addr.server, q.addr.senderId, { tag: 'SEND', notification: true, body });
     return c.id;
   }
 
@@ -763,9 +777,9 @@ export class Agent {
       const sq = c.snd;
       try {
         if (p.kind === 'skey') {
-          await this.network.send(sq.server, sq.sndId, { tag: 'SKEY', sndKey: sq.sndPubKey }, sq.sndPrivKey);
+          await this.network.sendToQueue(sq.server, sq.sndId, { tag: 'SKEY', sndKey: sq.sndPubKey }, sq.sndPrivKey);
         } else {
-          await this.network.send(sq.server, sq.sndId, { tag: 'SEND', notification: p.notification, body: p.body! }, p.signed ? sq.sndPrivKey : undefined);
+          await this.network.sendToQueue(sq.server, sq.sndId, { tag: 'SEND', notification: p.notification, body: p.body! }, p.signed ? sq.sndPrivKey : undefined);
         }
       } catch (e) {
         if (e instanceof SMPError) {

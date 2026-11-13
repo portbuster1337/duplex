@@ -5,6 +5,7 @@ import { Decoder, Encoder, ParseError, pad, unPad } from '../util/encoding';
 import {
   cbAuthenticate,
   cbDecrypt,
+  cbEncrypt,
   cryptoBox,
   dh,
   encPubKey,
@@ -21,9 +22,10 @@ import { TlsConnection } from '../net/tls13';
 import { BufferedReader, StreamClosedError, timeout, type Stream } from '../net/stream';
 import { parseCertificate, parseSignedObject, signedBy, signedObjectPubKey, signKeyOf, verifySignedObject } from '../net/x509';
 import { compatibleVRange, decVR, type VersionRange } from '../util/version';
-import { isOnion, serverString, type ProtocolServer } from './server';
+import { isOnion, serverKey as srvKey, serverString, type ProtocolServer } from './server';
 import {
   encodeCommand,
+  FWD_NONCES_SMP_VERSION,
   parseBrokerMsg,
   SERVER_INFO_SMP_VERSION,
   SERVICE_CERTS_SMP_VERSION,
@@ -75,6 +77,75 @@ export function verifyServerChain(chain: Bytes[], keyHash: Bytes): PublicKey<Sig
   }
   if (certs.length === 2 && !signedBy(certs[1], certs[1])) throw new TransportError('invalid identity certificate');
   return signKeyOf(certs[0]);
+}
+
+/** a session with a destination router through a proxy router (private message routing) */
+export interface ProxiedRelay {
+  /** the session ID of the proxy's connection to the destination */
+  sessionId: Bytes;
+  version: number;
+  /** the destination's session key, signed with its TLS key */
+  serverKey: PublicKey<'x25519'>;
+}
+
+/** an error of the proxy itself, or of its connection to the destination router (not an error of the destination) */
+export class ProxyError extends Error {
+  constructor(
+    readonly code: string,
+    readonly proxy: string,
+  ) {
+    super(`private routing via ${proxy} failed: ${code}`);
+    this.name = 'ProxyError';
+  }
+
+  /** the proxy no longer has the session: a new one can be made */
+  get noSession(): boolean {
+    return this.code === 'PROXY NO_SESSION';
+  }
+}
+
+/** the size of padded proxied transmissions (paddedProxiedTLength) */
+const PADDED_PROXIED_LENGTH = 16226;
+
+/**
+ * encodes and authorizes one transmission: corrId, entityId and the command, signed together with
+ * the session ID (which is not sent), or authorized with a box for X25519 keys
+ */
+function encodeTransmission(version: number, sessionId: Bytes, serverKey: PublicKey<'x25519'>, entityId: Bytes, cmd: Command, key: AuthKey | undefined, corrId: Bytes): Bytes {
+  const body = new Encoder().bytes(corrId).bytes(entityId).raw(encodeCommand(version, cmd)).finish();
+  let auth: Bytes = new Uint8Array(0);
+  if (key) {
+    const signed = concat(new Encoder().bytes(sessionId).finish(), body);
+    auth = key.alg === 'x25519' ? cbAuthenticate(serverKey, key as PrivateKey<'x25519'>, corrId, signed) : sign(key as PrivateKey<SignAlg>, signed);
+  }
+  const e = new Encoder().bytes(auth);
+  if (version >= SERVICE_CERTS_SMP_VERSION && auth.length) e.char('0');
+  return e.raw(body).finish();
+}
+
+/** a received transmission: [corrId, entityId, message] */
+function decodeTransmission(version: number, t: Bytes): [Bytes, Bytes, BrokerMsg] {
+  const d = new Decoder(t);
+  const auth = d.bytes();
+  if (version >= SERVICE_CERTS_SMP_VERSION && auth.length) d.maybe((d) => d.bytes());
+  const corrId = d.bytes();
+  const entityId = d.bytes().slice();
+  let msg: BrokerMsg;
+  try {
+    msg = parseBrokerMsg(version, d.rest());
+  } catch (e) {
+    msg = { tag: 'ERR', err: new SMPError('PARSE', (e as Error).message) };
+  }
+  return [corrId, entityId, msg];
+}
+
+/** encTransmissionNonce: from v23 the version is mixed into the nonce of proxied transmissions */
+function fwdNonce(version: number, nonce: Bytes): Bytes {
+  if (version < FWD_NONCES_SMP_VERSION) return nonce;
+  const n = nonce.slice();
+  n[0] ^= (version >> 8) & 0xff;
+  n[1] ^= version & 0xff;
+  return n;
 }
 
 interface Pending {
@@ -239,17 +310,7 @@ export class SMPClient {
   }
 
   private processTransmission(t: Bytes): void {
-    const d = new Decoder(t);
-    const auth = d.bytes();
-    if (this.version >= SERVICE_CERTS_SMP_VERSION && auth.length) d.maybe((d) => d.bytes());
-    const corrId = d.bytes();
-    const entityId = d.bytes().slice();
-    let msg: BrokerMsg;
-    try {
-      msg = parseBrokerMsg(this.version, d.rest());
-    } catch (e) {
-      msg = { tag: 'ERR', err: new SMPError('PARSE', (e as Error).message) };
-    }
+    const [corrId, entityId, msg] = decodeTransmission(this.version, t);
     if (msg.tag === 'MSG' || corrId.length === 0) {
       this.opts.onEvent?.(entityId, msg, this);
     }
@@ -286,17 +347,72 @@ export class SMPClient {
     this.shutdown(new TransportError('closed'));
   }
 
-  /** encodes and authorizes one transmission, returning [corrId, bytes] */
   private transmission(entityId: Bytes, cmd: Command, key?: AuthKey, corrId: Bytes = randomBytes(24)): Bytes {
-    const body = new Encoder().bytes(corrId).bytes(entityId).raw(encodeCommand(this.version, cmd)).finish();
-    let auth: Bytes = new Uint8Array(0);
-    if (key) {
-      const signed = concat(new Encoder().bytes(this.sessionId).finish(), body);
-      auth = key.alg === 'x25519' ? cbAuthenticate(this.serverKey, key as PrivateKey<'x25519'>, corrId, signed) : sign(key as PrivateKey<SignAlg>, signed);
+    return encodeTransmission(this.version, this.sessionId, this.serverKey, entityId, cmd, key, corrId);
+  }
+
+  // ---- private message routing: this router forwards commands to other routers
+
+  private relays = new Map<string, Promise<ProxiedRelay>>();
+
+  /** PRXY: a session with the destination router, whose identity is checked against its address */
+  proxiedRelay(dest: ProtocolServer, basicAuth?: string): Promise<ProxiedRelay> {
+    const k = `${srvKey(dest)}:${b64url(dest.keyHash)}`;
+    let p = this.relays.get(k);
+    if (!p) {
+      p = (async () => {
+        let r: BrokerMsg;
+        try {
+          r = await this.sendCommand(new Uint8Array(0), { tag: 'PRXY', hosts: dest.hosts, port: dest.port, keyHash: dest.keyHash, basicAuth });
+        } catch (e) {
+          throw e instanceof SMPError ? new ProxyError(e.detail ? `${e.code} ${e.detail}` : e.code, this.label) : e;
+        }
+        if (r.tag !== 'PKEY') throw new ProxyError(`unexpected response ${r.tag}`, this.label);
+        const vr = compatibleVRange(r.versions, SMP_VERSIONS);
+        if (!vr) throw new ProxyError('incompatible destination version', this.label);
+        const tlsKey = verifyServerChain(r.certChain, dest.keyHash);
+        const so = parseSignedObject(r.signedKey);
+        if (!verifySignedObject(so, tlsKey)) throw new TransportError('bad session key signature of the destination router');
+        const sk = signedObjectPubKey(so.object);
+        if (sk.alg !== 'x25519') throw new TransportError('bad session key of the destination router');
+        return { sessionId: r.sessionId, version: vr.max, serverKey: sk as PublicKey<'x25519'> };
+      })();
+      this.relays.set(k, p);
+      p.catch(() => this.relays.get(k) === p && this.relays.delete(k));
     }
-    const e = new Encoder().bytes(auth);
-    if (this.version >= SERVICE_CERTS_SMP_VERSION && auth.length) e.char('0');
-    return e.raw(body).finish();
+    return p;
+  }
+
+  forgetRelay(dest: ProtocolServer): void {
+    this.relays.delete(`${srvKey(dest)}:${b64url(dest.keyHash)}`);
+  }
+
+  /**
+   * PFWD: sends a command to the destination router through this one. The command is encrypted for the
+   * destination (with a key agreed for this transmission), so this router sees neither the command nor
+   * the queue; the destination sees this router's address and session, not ours. Errors of the
+   * destination (e.g. AUTH) are thrown as SMPError, errors of the proxy as ProxyError.
+   */
+  async proxyCommand(relay: ProxiedRelay, entityId: Bytes, cmd: Command, key?: AuthKey): Promise<BrokerMsg> {
+    const k = generateKeyPair('x25519');
+    const secret = dh(relay.serverKey, k.priv);
+    const nonce = randomBytes(24);
+    const t = encodeTransmission(relay.version, relay.sessionId, relay.serverKey, entityId, cmd, key, nonce);
+    const batch = new Encoder().byte(1).large(t).finish();
+    const encTransmission = cbEncrypt(secret, fwdNonce(relay.version, nonce), batch, PADDED_PROXIED_LENGTH);
+    let r: BrokerMsg;
+    try {
+      r = await this.sendCommand(relay.sessionId, { tag: 'PFWD', version: relay.version, pubKey: k.pub, encTransmission }, undefined, nonce);
+    } catch (e) {
+      throw e instanceof SMPError ? new ProxyError(e.detail ? `${e.code} ${e.detail}` : e.code, this.label) : e;
+    }
+    if (r.tag !== 'PRES') throw new ProxyError(`unexpected response ${r.tag}`, this.label);
+    const inner = cbDecrypt(secret, r.nonce ?? nonce.slice().reverse(), r.body);
+    const d = new Decoder(inner);
+    if (d.byte() !== 1) throw new TransportError('bad proxied response');
+    const [, , msg] = decodeTransmission(relay.version, d.large());
+    if (msg.tag === 'ERR') throw msg.err;
+    return msg;
   }
 
   /** sends commands in as few blocks as possible; resolves with the responses in order */

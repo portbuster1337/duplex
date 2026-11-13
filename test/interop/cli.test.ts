@@ -14,6 +14,8 @@ import { tcpConnector } from '../helpers/tcp';
 import { Cli, itemTexts } from '../helpers/cli';
 
 const SERVER = process.env.SMP_SERVER;
+// with another router for the CLI, Duplex sends to its queues with private message routing
+const CLI_SERVER = process.env.SMP_SERVER2 ?? SERVER;
 const XFTP = process.env.XFTP_SERVER;
 let cli: Cli;
 let chat: ChatClient;
@@ -30,7 +32,7 @@ async function until<T>(f: () => T | undefined | false, ms = 30000, label = 'con
 
 before(async () => {
   if (!SERVER) return;
-  cli = await Cli.start('carol', 5310, SERVER, XFTP ? ['--xftp-server', XFTP] : []);
+  cli = await Cli.start('carol', 5310, CLI_SERVER, XFTP ? ['--xftp-server', XFTP] : []);
   const vault = await Vault.create(new MemoryBackend(), 'test', { t: 1, m: 256, p: 1 });
   chat = new ChatClient(
     vault,
@@ -43,6 +45,12 @@ before(async () => {
 });
 
 after(() => {
+  // all commands to the queues of the CLI went through Duplex's own router
+  if (SERVER && CLI_SERVER !== SERVER) {
+    const st = chat.agent.network.stats;
+    assert.equal(st.direct + st.fallback, 0, `sent directly: ${JSON.stringify(st)}`);
+    assert.ok(st.proxied > 10, `sent via private routing: ${JSON.stringify(st)}`);
+  }
   chat?.stop();
   cli?.stop();
 });

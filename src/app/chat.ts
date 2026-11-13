@@ -1,6 +1,7 @@
 // Chat client: contacts, contact requests and chat items on top of the SMP agent, speaking the
 // SimpleX Chat protocol with the official apps.
 import { Agent, type AgentEvent, type MsgResult } from '../core/agent/agent';
+import type { ProxyFallback, ProxyMode } from '../core/agent/network';
 import type { Connector } from '../core/smp/client';
 import { parseServer, type ProtocolServer, type ServerWithAuth } from '../core/smp/server';
 import { fromUtf8Lossy, type Bytes } from '../core/util/bytes';
@@ -145,6 +146,8 @@ export interface ChatSettings {
   autoReceiveImages?: boolean;
   /** the version of our preferences that the contacts were told about */
   prefsVersion?: number;
+  /** private message routing (the defaults of the apps when not set) */
+  routing?: { mode: ProxyMode; fallback: ProxyFallback };
 }
 
 interface ChatState {
@@ -286,7 +289,7 @@ export class ChatClient {
     connector: Connector,
     servers: ProtocolServer[],
   ) {
-    this.agent = new Agent(new VaultAgentStore(vault), connector, { servers, shortLinks: settings.shortLinks });
+    this.agent = new Agent(new VaultAgentStore(vault), connector, { servers, shortLinks: settings.shortLinks, routing: settings.routing });
     this.agent.onEvent = (e) => this.onAgentEvent(e);
     this.itemStore = new ItemStore<ChatItem>(vault);
     this.files = new FileManager(vault, () => this.agent.network.connector);

@@ -5,6 +5,7 @@ import { defaultRelays, effectiveRelays, relayName, testRelay, type AppSettings,
 import { parseServer } from '../core/smp/server';
 import { DEFAULT_SMP_SERVERS, DEFAULT_XFTP_SERVERS } from '../core/agent/presets';
 import { XFTP_VERSIONS } from '../core/xftp/protocol';
+import { DEFAULT_ROUTING, type ProxyFallback, type ProxyMode } from '../core/agent/network';
 import { serverString } from '../core/smp/server';
 import { CHAT_VERSIONS } from '../core/chat/protocol';
 import { AGENT_VERSIONS } from '../core/agent/protocol';
@@ -153,6 +154,9 @@ function NetworkTab({ session }: { session: Session }): JSX.Element {
   const [servers, setServers] = useState(st.servers.join('\n'));
   const [xftp, setXftp] = useState((st.xftpServers?.length ? st.xftpServers : DEFAULT_XFTP_SERVERS.map((s) => serverString(s))).join('\n'));
   const [onion, setOnion] = useState(st.network.onion);
+  const [mode, setMode] = useState<ProxyMode>(st.routing?.mode ?? DEFAULT_ROUTING.mode);
+  const [fallback, setFallback] = useState<ProxyFallback>(st.routing?.fallback ?? DEFAULT_ROUTING.fallback);
+  const stats = session.chat.agent.network.stats;
   const [tests, setTests] = useState<Record<string, string>>({});
   const status = session.chat.agent.network.status();
   const connectedRelays = session.connector.connected();
@@ -180,7 +184,7 @@ function NetworkTab({ session }: { session: Session }): JSX.Element {
     // the default relays and file servers are not stored, so that new versions can update them
     const isDefault = rl.join('\n') === defaultRelays().join('\n');
     const xftpDefault = !xs.length || xs.join('\n') === DEFAULT_XFTP_SERVERS.map((s) => serverString(s)).join('\n');
-    await session.saveSettings({ network: { relays: isDefault ? [] : rl, onion }, servers: sv, xftpServers: xftpDefault ? [] : xs });
+    await session.saveSettings({ network: { relays: isDefault ? [] : rl, onion }, servers: sv, xftpServers: xftpDefault ? [] : xs, routing: { mode, fallback } });
     toast('Network settings saved');
   };
   const test = async () => {
@@ -224,6 +228,26 @@ function NetworkTab({ session }: { session: Session }): JSX.Element {
       )}
       <Toggle checked={onion} onChange={setOnion} label="Use .onion addresses" hint="Only works with a relay that connects through Tor." />
       <label>
+        Private message routing
+        <select value={mode} onChange={(e) => setMode((e.target as HTMLSelectElement).value as ProxyMode)}>
+          <option value="always">Always</option>
+          <option value="unknown">For servers you do not use</option>
+          <option value="unprotected">For servers you do not use, when your IP address is not hidden</option>
+          <option value="never">Never</option>
+        </select>
+        <span class="hint">
+          Messages to a contact's server are sent through one of your servers, which forwards them encrypted: the contact's server does not see your relay's address or session, and your server does not see where they go to or what they contain.
+        </span>
+      </label>
+      <label>
+        When private routing fails, send directly
+        <select value={fallback} onChange={(e) => setFallback((e.target as HTMLSelectElement).value as ProxyFallback)}>
+          <option value="allow">Yes</option>
+          <option value="allowProtected">Only when your IP address is hidden (public relay or Tor)</option>
+          <option value="prohibit">No</option>
+        </select>
+      </label>
+      <label>
         SMP servers for new connections
         <textarea rows={5} value={servers} spellcheck={false} onInput={(e) => setServers((e.target as HTMLTextAreaElement).value)} />
       </label>
@@ -245,6 +269,10 @@ function NetworkTab({ session }: { session: Session }): JSX.Element {
       <div class="kv">
         <span>Relay</span>
         <span class={connectedRelays.length ? 'ok' : ''}>{connectedRelays.length ? connectedRelays.map(relayName).join(', ') : 'not connected'}</span>
+        <span>Sent to other servers</span>
+        <span>
+          {stats.proxied} via private routing, {stats.direct + stats.fallback} directly{stats.fallback ? ` (${stats.fallback} after private routing failed)` : ''}
+        </span>
         {status.map((s) => (
           <>
             <span>{s.server.hosts[0]}</span>

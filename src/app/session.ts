@@ -257,6 +257,7 @@ export class Session {
       this.chat.agent.retryAll();
     }
     if (patch.servers) this.chat.agent.config.servers = parseServers(patch.servers);
+    if (patch.routing) this.chat.agent.config.routing = patch.routing;
   }
 
   /** disconnects, lets the running writes finish (for up to 3 seconds) and wipes the key from memory */
