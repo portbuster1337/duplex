@@ -1,5 +1,6 @@
 // Adding contacts and groups: 1-time links, connecting via a link (or joining a group), the contact
-// address, and new groups.
+// address, and new groups. The options stay listed in the window; the one chosen opens under its
+// title, and keeps what was entered (and the link that was made) when another one is opened.
 import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import type { Session } from '../app/session';
@@ -7,66 +8,113 @@ import { profileName, type PendingInvitation } from '../app/chat';
 import type { Profile } from '../core/chat/protocol';
 import { Avatar, copyText, QRCode } from './util';
 import { errorText, Modal, Spinner, toast, Toggle } from './components';
-import { Icon } from './icons';
+import { Icon, type IconName } from './icons';
 import type { Selection } from './layout';
 import { NewGroup } from './groups';
 
-type Tab = 'invite' | 'connect' | 'address' | 'group';
+type Option = 'invite' | 'connect' | 'address' | 'group';
+
+const OPTIONS: ReadonlyArray<{ id: Option; icon: IconName; title: string; hint: string }> = [
+  { id: 'invite', icon: 'qr', title: 'Create a 1-time link', hint: 'A link or QR code for one person to connect with you' },
+  { id: 'connect', icon: 'link', title: 'Connect via a link', hint: 'Paste a 1-time link, a contact address or a group link' },
+  { id: 'address', icon: 'mail', title: 'Your contact address', hint: 'A long-term link that people can send contact requests to' },
+  { id: 'group', icon: 'users', title: 'Create a group', hint: 'Add your contacts, or share a link to the group' },
+];
 
 export function NewChat({ session, onClose, onOpen }: { session: Session; onClose: () => void; onOpen: (s: Selection) => void }): JSX.Element {
-  const [tab, setTab] = useState<Tab>('invite');
+  const [open, setOpen] = useState<Option>();
+  // the options opened once stay mounted (hidden when closed), so that nothing is lost
+  const [seen, setSeen] = useState<Option[]>([]);
+  const [inv, setInv] = useState<PendingInvitation>();
+  const toggle = (o: Option) => {
+    setOpen(open === o ? undefined : o);
+    if (!seen.includes(o)) setSeen([...seen, o]);
+  };
+  const body = (o: Option): JSX.Element => {
+    switch (o) {
+      case 'invite':
+        return <Invite session={session} inv={inv} setInv={setInv} onOpen={onOpen} />;
+      case 'connect':
+        return <Connect session={session} onOpen={onOpen} />;
+      case 'address':
+        return <AddressTab session={session} />;
+      case 'group':
+        return <NewGroup session={session} onCreated={(g) => onOpen({ kind: 'group', id: g.id })} />;
+    }
+  };
   return (
     <Modal title="New chat" onClose={onClose} wide>
-      <div class="tabs" role="tablist">
-        <button role="tab" aria-selected={tab === 'invite'} class={tab === 'invite' ? 'on' : ''} onClick={() => setTab('invite')}>
-          <Icon name="qr" size={16} /> 1-time link
-        </button>
-        <button role="tab" aria-selected={tab === 'connect'} class={tab === 'connect' ? 'on' : ''} onClick={() => setTab('connect')}>
-          <Icon name="link" size={16} /> Connect via link
-        </button>
-        <button role="tab" aria-selected={tab === 'address'} class={tab === 'address' ? 'on' : ''} onClick={() => setTab('address')}>
-          <Icon name="mail" size={16} /> Your address
-        </button>
-        <button role="tab" aria-selected={tab === 'group'} class={tab === 'group' ? 'on' : ''} onClick={() => setTab('group')}>
-          <Icon name="users" size={16} /> New group
-        </button>
+      <div class="new-options">
+        {OPTIONS.map((o) => (
+          <section class={`new-option ${open === o.id ? 'open' : ''}`}>
+            <button class="new-option-head" aria-expanded={open === o.id} aria-controls={`new-${o.id}`} onClick={() => toggle(o.id)}>
+              <span class="new-option-icon">
+                <Icon name={o.icon} size={20} />
+              </span>
+              <span class="new-option-text">
+                <b>{o.title}</b>
+                <span class="hint">{o.hint}</span>
+              </span>
+              <Icon name="back" size={18} class="new-option-chev" />
+            </button>
+            {seen.includes(o.id) && (
+              <div class="new-option-body" id={`new-${o.id}`} hidden={open !== o.id}>
+                {body(o.id)}
+              </div>
+            )}
+          </section>
+        ))}
       </div>
-      {tab === 'invite' && <Invite session={session} onOpen={onOpen} />}
-      {tab === 'connect' && <Connect session={session} onOpen={onOpen} />}
-      {tab === 'address' && <AddressTab session={session} />}
-      {tab === 'group' && <NewGroup session={session} onCreated={(g) => onOpen({ kind: 'group', id: g.id })} />}
     </Modal>
   );
 }
 
-export function LinkShare({ link, note }: { link: string; note?: string }): JSX.Element {
+/** a link with its QR code; compact: the QR code beside the link, so that what is around stays in view */
+export function LinkShare({ link, note, compact }: { link: string; note?: string; compact?: boolean }): JSX.Element {
+  const actions = (
+    <div class="row">
+      <button onClick={() => copyText(link).then(() => toast('Link copied'))}>
+        <Icon name="copy" size={16} /> Copy link
+      </button>
+      {'share' in navigator && (
+        <button onClick={() => navigator.share({ text: link }).catch(() => {})}>
+          <Icon name="send" size={16} /> Share
+        </button>
+      )}
+    </div>
+  );
+  if (compact)
+    return (
+      <div class="share compact">
+        <QRCode text={link} size={168} />
+        <div class="share-side">
+          <div class="link-box">
+            <span class="mono small">{link}</span>
+          </div>
+          {actions}
+          {note && <p class="hint">{note}</p>}
+        </div>
+      </div>
+    );
   return (
     <div class="share">
       <QRCode text={link} size={232} />
       <div class="link-box">
         <span class="mono small">{link}</span>
       </div>
-      <div class="row">
-        <button onClick={() => copyText(link).then(() => toast('Link copied'))}>
-          <Icon name="copy" size={16} /> Copy link
-        </button>
-        {'share' in navigator && (
-          <button onClick={() => navigator.share({ text: link }).catch(() => {})}>
-            <Icon name="send" size={16} /> Share
-          </button>
-        )}
-      </div>
+      {actions}
       {note && <p class="hint">{note}</p>}
     </div>
   );
 }
 
-function Invite({ session, onOpen }: { session: Session; onOpen: (s: Selection) => void }): JSX.Element {
-  const [inv, setInv] = useState<PendingInvitation>();
+function Invite({ session, inv, setInv, onOpen }: { session: Session; inv?: PendingInvitation; setInv: (i: PendingInvitation) => void; onOpen: (s: Selection) => void }): JSX.Element {
   const [err, setErr] = useState('');
   // the incognito switch moves at once; the link data is updated on the router in the background
   const [wantIncognito, setWantIncognito] = useState<boolean>();
+  // made once, when this option is first opened
   useEffect(() => {
+    if (inv) return;
     let cancelled = false;
     session.chat
       .createInvitation()
@@ -86,7 +134,7 @@ function Invite({ session, onOpen }: { session: Session; onOpen: (s: Selection) 
   const updating = wantIncognito !== undefined;
   return (
     <>
-      <LinkShare link={inv.link} note="Show this QR code or send the link to your contact, ideally in person or via another trusted channel. The link can be used only once — the person who uses it first will connect with you." />
+      <LinkShare compact link={inv.link} note="Show the QR code or send the link, ideally in person or through another trusted channel. It works once: the first person who uses it connects with you." />
       <Toggle
         checked={wantIncognito ?? !!inv.incognito}
         disabled={updating}
@@ -248,7 +296,7 @@ function AddressTab({ session }: { session: Session }): JSX.Element {
     );
   return (
     <div class="address">
-      <LinkShare link={a.link} note="People who use this address send you a contact request with their profile." />
+      <LinkShare compact link={a.link} note="People who use this address send you a contact request with their profile." />
       <Toggle
         checked={a.autoAccept}
         onChange={async (v) => {

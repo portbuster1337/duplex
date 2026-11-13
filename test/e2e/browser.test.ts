@@ -116,8 +116,12 @@ test('create a profile', async () => {
 
 test('the official CLI connects via a 1-time link from the browser', async () => {
   await page.getByLabel('New chat').first().click();
+  await shot('3-new-chat');
+  await page.getByRole('button', { name: /^Create a 1-time link/ }).click();
   const linkEl = page.locator('.link-box .mono');
   await linkEl.waitFor({ timeout: NET });
+  // the other options stay in the window
+  for (const o of [/^Connect via a link/, /^Your contact address/, /^Create a group/]) assert.ok(await page.getByRole('button', { name: o }).isVisible());
   const link = (await linkEl.textContent())!.trim();
   assert.match(link, /^https:\/\/smp\d+\.simplex\.im\/i#/);
   await shot('3-invitation');
@@ -195,6 +199,7 @@ test('the security code is the same as in the official client, and disappearing 
 
 test('an incognito 1-time link shares a random profile', async () => {
   await page.getByLabel('New chat').first().click();
+  await page.getByRole('button', { name: /^Create a 1-time link/ }).click();
   await page.locator('.link-box .mono').waitFor({ timeout: NET });
   await page.locator('.modal .toggle-row', { hasText: 'Incognito' }).locator('input').check();
   const hint = page.locator('.modal .toggle-row', { hasText: 'Incognito' }).locator('.hint');
@@ -349,7 +354,7 @@ test('the official CLI invites the browser to a group, which it joins', async ()
 
 test('the browser creates a group, adds the CLI user and makes a group link', async () => {
   await page.getByLabel('New chat').first().click();
-  await page.getByRole('tab', { name: 'New group' }).click();
+  await page.getByRole('button', { name: /^Create a group/ }).click();
   await page.getByLabel('Group name').fill('browser group');
   await page.getByLabel('Welcome message (optional)').fill('Welcome to the group of the browser');
   await page.getByRole('button', { name: 'Create group' }).click();

@@ -1858,6 +1858,82 @@ code {
   gap: 14px;
 }
 
+/* new chat: the options, the chosen one open under its title */
+
+.new-options {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.new-option {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+}
+
+.new-option.open {
+  border-color: var(--accent);
+}
+
+.new-option-head {
+  width: 100%;
+  justify-content: flex-start;
+  gap: 12px;
+  padding: 11px 12px;
+  border: none;
+  border-radius: 12px;
+  background: none;
+  text-align: left;
+}
+
+.new-option-head:hover:not(:disabled) {
+  background: var(--bg2);
+}
+
+.new-option-icon {
+  display: grid;
+  place-items: center;
+  width: 38px;
+  height: 38px;
+  flex-shrink: 0;
+  border-radius: 50%;
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.new-option-text {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.new-option-text .hint {
+  font-size: 12.5px;
+}
+
+.new-option-chev {
+  color: var(--muted);
+  transform: rotate(-90deg);
+  transition: transform 0.15s;
+}
+
+.new-option.open .new-option-chev {
+  transform: rotate(90deg);
+}
+
+.new-option-body {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 6px 14px 16px;
+}
+
+.new-option-body[hidden] {
+  display: none;
+}
+
 .tabs {
   display: flex;
   gap: 4px;
@@ -1885,6 +1961,36 @@ code {
   flex-direction: column;
   align-items: center;
   gap: 12px;
+}
+
+.share.compact {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 16px;
+}
+
+.share-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+  flex: 1;
+  min-width: 0;
+}
+
+.share-side .row {
+  justify-content: flex-start;
+}
+
+.share-side .hint {
+  margin: 0;
+}
+
+@media (max-width: 520px) {
+  .share.compact {
+    flex-direction: column;
+    align-items: center;
+  }
 }
 
 .qr {
