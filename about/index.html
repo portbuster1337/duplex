@@ -54,15 +54,19 @@
           </div>
           <div class="feature">
             <h3>End-to-end encrypted</h3>
-            <p>Messages are encrypted with the double ratchet (X448, AES-256-GCM), then again for each message queue, and sent over TLS 1.3 to servers that are identified by their key fingerprint.</p>
+            <p>Messages are encrypted with the double ratchet (X448, AES-256-GCM) with the post-quantum sntrup761 key encapsulation that the apps use, then again for each message queue, and sent over TLS 1.3 to servers that are identified by their key fingerprint.</p>
           </div>
           <div class="feature">
             <h3>Works with the SimpleX Chat apps</h3>
-            <p>Text with formatting, replies, edits, deletion, reactions, delivery receipts, disappearing messages, profile pictures, contact addresses and requests, and the same security codes to verify a contact.</p>
+            <p>Text with formatting, replies, edits, deletion, reactions, delivery receipts, disappearing messages, voice messages, profile pictures, contact addresses and requests, address changes, and the same security codes to verify a contact.</p>
           </div>
           <div class="feature">
             <h3>Files, images and videos</h3>
             <p>Up to 1 GB, encrypted in the page and sent through SimpleX file servers, which only ever see encrypted chunks. Photos lose their location and camera metadata before they are sent.</p>
+          </div>
+          <div class="feature">
+            <h3>Private message routing</h3>
+            <p>Messages to your contacts' servers go through one of your servers, which forwards them encrypted: a contact's server does not see where they come from, and yours does not see where they go.</p>
           </div>
           <div class="feature">
             <h3>Encrypted at rest</h3>
@@ -79,6 +83,10 @@
           <div class="feature">
             <h3>Your choice of network path</h3>
             <p>Use the public relays, or run your own relay on your computer — optionally through Tor, with the .onion addresses of the servers.</p>
+          </div>
+          <div class="feature">
+            <h3>Change addresses</h3>
+            <p>Move the queue a contact sends to you to a new one, on another server, whenever you like. Duplex follows your contacts' changes too.</p>
           </div>
         </div>
       </section>
@@ -115,9 +123,14 @@
               <td>Your messages, contacts, profile and queue IDs — they are inside TLS</td>
             </tr>
             <tr>
-              <th scope="row">SimpleX servers</th>
-              <td>The relay's IP address, the queues you use on that server and when messages pass through them, as encrypted fixed-size blocks</td>
-              <td>Your IP address, your messages and profile — there are no accounts or user IDs</td>
+              <th scope="row">Your SimpleX servers</th>
+              <td>The relay's IP address, the queues you use on that server and when messages pass through them, as encrypted fixed-size blocks; for the messages they forward, which server they go to</td>
+              <td>Your IP address, your messages and profile — there are no accounts or user IDs — and the queues on other servers that your messages go to</td>
+            </tr>
+            <tr>
+              <th scope="row">Your contacts' servers</th>
+              <td>With private routing, only the address of the server that forwards your messages</td>
+              <td>Your IP address, the relay's address, your messages and profile</td>
             </tr>
             <tr>
               <th scope="row">SimpleX file servers</th>
@@ -149,10 +162,9 @@
       <section id="limits">
         <h2>Limitations</h2>
         <ul>
-          <li>Groups and channels and calls are not supported yet. Voice messages can be played but not recorded.</li>
+          <li>Groups and channels and calls are not supported yet.</li>
           <li>Files are kept in the encrypted storage of this browser, which browsers limit in size: save large files to disk.</li>
-          <li>Connections use the double ratchet without the post-quantum key exchange that the apps can add.</li>
-          <li>No private message routing through other servers, no per-connection transport isolation, and no queue rotation.</li>
+          <li>No per-connection transport isolation: one connection per server.</li>
           <li>No push notifications: messages arrive while the page is open (notifications can be shown while it is in a background tab).</li>
           <li>One browser tab at a time, and no syncing between devices.</li>
           <li>The data lives in this browser only. If you clear the site data or forget the passphrase, the profile and chats are gone.</li>
