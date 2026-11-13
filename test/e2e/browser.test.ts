@@ -503,7 +503,7 @@ test('themes and icon packs, kept after a reload and on the lock screen', async 
   await openPeer();
   assert.equal(await iconBox(), '0 0 24 24');
   await page.getByTitle('Settings').first().click();
-  await page.getByRole('tab', { name: 'Appearance' }).click();
+  await page.getByRole('button', { name: /^Appearance/ }).click();
   await page.locator('.theme-card', { hasText: /^SimpleX/ }).click();
   assert.equal(await theme(), 'simplex');
   await page.getByRole('radio', { name: 'Purple' }).click();
@@ -522,7 +522,7 @@ test('themes and icon packs, kept after a reload and on the lock screen', async 
   assert.equal(await iconBox(), '0 0 256 256');
   // back to the defaults
   await page.getByTitle('Settings').first().click();
-  await page.getByRole('tab', { name: 'Appearance' }).click();
+  await page.getByRole('button', { name: /^Appearance/ }).click();
   await page.locator('.theme-card', { hasText: /^System/ }).click();
   await page.getByRole('radio', { name: 'Theme colour' }).click();
   await page.locator('.pack-card', { hasText: /^LucideISC/ }).click();

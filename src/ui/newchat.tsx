@@ -1,70 +1,29 @@
 // Adding contacts and groups: 1-time links, connecting via a link (or joining a group), the contact
-// address, and new groups. The options stay listed in the window; the one chosen opens under its
-// title, and keeps what was entered (and the link that was made) when another one is opened.
+// address, and new groups, as options listed in the window (the chosen one opens under its title).
 import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import type { Session } from '../app/session';
 import { profileName, type PendingInvitation } from '../app/chat';
 import type { Profile } from '../core/chat/protocol';
 import { Avatar, copyText, QRCode } from './util';
-import { errorText, Modal, Spinner, toast, Toggle } from './components';
-import { Icon, type IconName } from './icons';
+import { errorText, Modal, OptionSections, Spinner, toast, Toggle } from './components';
+import { Icon } from './icons';
 import type { Selection } from './layout';
 import { NewGroup } from './groups';
 
-type Option = 'invite' | 'connect' | 'address' | 'group';
-
-const OPTIONS: ReadonlyArray<{ id: Option; icon: IconName; title: string; hint: string }> = [
-  { id: 'invite', icon: 'qr', title: 'Create a 1-time link', hint: 'A link or QR code for one person to connect with you' },
-  { id: 'connect', icon: 'link', title: 'Connect via a link', hint: 'Paste a 1-time link, a contact address or a group link' },
-  { id: 'address', icon: 'mail', title: 'Your contact address', hint: 'A long-term link that people can send contact requests to' },
-  { id: 'group', icon: 'users', title: 'Create a group', hint: 'Add your contacts, or share a link to the group' },
-];
-
 export function NewChat({ session, onClose, onOpen }: { session: Session; onClose: () => void; onOpen: (s: Selection) => void }): JSX.Element {
-  const [open, setOpen] = useState<Option>();
-  // the options opened once stay mounted (hidden when closed), so that nothing is lost
-  const [seen, setSeen] = useState<Option[]>([]);
+  // the 1-time link is made when that option is first opened, and kept while others are opened
   const [inv, setInv] = useState<PendingInvitation>();
-  const toggle = (o: Option) => {
-    setOpen(open === o ? undefined : o);
-    if (!seen.includes(o)) setSeen([...seen, o]);
-  };
-  const body = (o: Option): JSX.Element => {
-    switch (o) {
-      case 'invite':
-        return <Invite session={session} inv={inv} setInv={setInv} onOpen={onOpen} />;
-      case 'connect':
-        return <Connect session={session} onOpen={onOpen} />;
-      case 'address':
-        return <AddressTab session={session} />;
-      case 'group':
-        return <NewGroup session={session} onCreated={(g) => onOpen({ kind: 'group', id: g.id })} />;
-    }
-  };
   return (
     <Modal title="New chat" onClose={onClose} wide>
-      <div class="new-options">
-        {OPTIONS.map((o) => (
-          <section class={`new-option ${open === o.id ? 'open' : ''}`}>
-            <button class="new-option-head" aria-expanded={open === o.id} aria-controls={`new-${o.id}`} onClick={() => toggle(o.id)}>
-              <span class="new-option-icon">
-                <Icon name={o.icon} size={20} />
-              </span>
-              <span class="new-option-text">
-                <b>{o.title}</b>
-                <span class="hint">{o.hint}</span>
-              </span>
-              <Icon name="back" size={18} class="new-option-chev" />
-            </button>
-            {seen.includes(o.id) && (
-              <div class="new-option-body" id={`new-${o.id}`} hidden={open !== o.id}>
-                {body(o.id)}
-              </div>
-            )}
-          </section>
-        ))}
-      </div>
+      <OptionSections
+        sections={[
+          { id: 'invite', icon: 'qr', title: 'Create a 1-time link', hint: 'A link or QR code for one person to connect with you', body: () => <Invite session={session} inv={inv} setInv={setInv} onOpen={onOpen} /> },
+          { id: 'connect', icon: 'link', title: 'Connect via a link', hint: 'Paste a 1-time link, a contact address or a group link', body: () => <Connect session={session} onOpen={onOpen} /> },
+          { id: 'address', icon: 'mail', title: 'Your contact address', hint: 'A long-term link that people can send contact requests to', body: () => <AddressTab session={session} /> },
+          { id: 'group', icon: 'users', title: 'Create a group', hint: 'Add your contacts, or share a link to the group', body: () => <NewGroup session={session} onCreated={(g) => onOpen({ kind: 'group', id: g.id })} /> },
+        ]}
+      />
     </Modal>
   );
 }

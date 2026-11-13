@@ -1,4 +1,4 @@
-// Settings: profile, privacy, network, security, about.
+// Settings: profile, appearance, privacy, network, security, about, as options listed in the window.
 import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import { defaultRelays, effectiveRelays, relayName, testRelay, type AppSettings, type Session } from '../app/session';
@@ -11,40 +11,27 @@ import { CHAT_VERSIONS } from '../core/chat/protocol';
 import { AGENT_VERSIONS } from '../core/agent/protocol';
 import { SMP_VERSIONS } from '../core/smp/protocol';
 import { Avatar, resizeImage } from './util';
-import { errorText, Modal, Spinner, toast, Toggle } from './components';
+import { errorText, Modal, OptionSections, Spinner, toast, Toggle } from './components';
 import { DEFAULT_ICE_SERVERS, iceServerString, parseIceServer } from './webrtc';
 import { ACCENTS, appearance, ICON_PACKS, loadedIconPacks, loadIconPack, onAppearance, setAppearance, shownTheme, THEMES, type Appearance, type DarkThemeId, type ThemeId } from './appearance';
 import { Icon, PackIcon, type IconName } from './icons';
 
-type Tab = 'profile' | 'appearance' | 'privacy' | 'network' | 'security' | 'about';
 
 declare const __APP_VERSION__: string;
 
 export function Settings({ session, onClose, onLock, onWiped }: { session: Session; onClose: () => void; onLock: () => void; onWiped: () => void }): JSX.Element {
-  const [tab, setTab] = useState<Tab>('profile');
-  const tabs: Array<[Tab, string]> = [
-    ['profile', 'Profile'],
-    ['appearance', 'Appearance'],
-    ['privacy', 'Privacy'],
-    ['network', 'Network'],
-    ['security', 'Security'],
-    ['about', 'About'],
-  ];
   return (
     <Modal title="Settings" onClose={onClose} wide>
-      <div class="tabs" role="tablist">
-        {tabs.map(([t, l]) => (
-          <button role="tab" aria-selected={tab === t} class={tab === t ? 'on' : ''} onClick={() => setTab(t)}>
-            {l}
-          </button>
-        ))}
-      </div>
-      {tab === 'profile' && <ProfileTab session={session} />}
-      {tab === 'appearance' && <AppearanceTab />}
-      {tab === 'privacy' && <PrivacyTab session={session} />}
-      {tab === 'network' && <NetworkTab session={session} />}
-      {tab === 'security' && <SecurityTab session={session} onLock={onLock} onWiped={onWiped} />}
-      {tab === 'about' && <About />}
+      <OptionSections
+        sections={[
+          { id: 'profile', icon: 'user', title: 'Profile', hint: 'Your name and picture, as your contacts see them', body: () => <ProfileTab session={session} /> },
+          { id: 'appearance', icon: 'palette', title: 'Appearance', hint: 'Theme, accent colour and icons', body: () => <AppearanceTab /> },
+          { id: 'privacy', icon: 'shield', title: 'Privacy', hint: 'Receipts, downloads, notifications and calls', body: () => <PrivacyTab session={session} /> },
+          { id: 'network', icon: 'globe', title: 'Network', hint: 'Relays, servers, private routing and call servers', body: () => <NetworkTab session={session} /> },
+          { id: 'security', icon: 'lock', title: 'Security', hint: 'Locking, the passphrase, and deleting your data', body: () => <SecurityTab session={session} onLock={onLock} onWiped={onWiped} /> },
+          { id: 'about', icon: 'info', title: 'About', hint: 'Version, protocols and source code', body: () => <About /> },
+        ]}
+      />
     </Modal>
   );
 }

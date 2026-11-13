@@ -1,7 +1,56 @@
 // Small shared UI components.
 import type { ComponentChildren, JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
-import { Icon } from './icons';
+import { Icon, type IconName } from './icons';
+
+export interface OptionSection {
+  id: string;
+  icon: IconName;
+  title: string;
+  hint: string;
+  body: () => JSX.Element;
+}
+
+/**
+ * options listed in a window (new chat, settings): the one chosen opens under its title while the
+ * others stay listed, and keeps what was entered when another one is opened
+ */
+export function OptionSections({ sections }: { sections: OptionSection[] }): JSX.Element {
+  const [open, setOpen] = useState<string>();
+  // opened once: kept mounted, hidden when closed
+  const [seen, setSeen] = useState<string[]>([]);
+  const toggle = (id: string) => {
+    setOpen(open === id ? undefined : id);
+    if (!seen.includes(id)) setSeen([...seen, id]);
+  };
+  // the option just opened is scrolled to its title, also when the one closed above it was long
+  useEffect(() => {
+    if (open) document.getElementById(`option-${open}`)?.parentElement?.scrollIntoView({ block: 'start', behavior: 'smooth' });
+  }, [open]);
+  return (
+    <div class="options">
+      {sections.map((o) => (
+        <section class={`option ${open === o.id ? 'open' : ''}`} key={o.id}>
+          <button class="option-head" aria-expanded={open === o.id} aria-controls={`option-${o.id}`} onClick={() => toggle(o.id)}>
+            <span class="option-icon">
+              <Icon name={o.icon} size={20} />
+            </span>
+            <span class="option-text">
+              <b>{o.title}</b>
+              <span class="hint">{o.hint}</span>
+            </span>
+            <Icon name="back" size={18} class="option-chev" />
+          </button>
+          {seen.includes(o.id) && (
+            <div class="option-body" id={`option-${o.id}`} hidden={open !== o.id}>
+              {o.body()}
+            </div>
+          )}
+        </section>
+      ))}
+    </div>
+  );
+}
 
 export function Modal({ title, onClose, children, wide }: { title: string; onClose: () => void; children: ComponentChildren; wide?: boolean }): JSX.Element {
   useEffect(() => {
