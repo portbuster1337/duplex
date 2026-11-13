@@ -51,6 +51,10 @@ export interface AppSettings extends ChatSettings {
   /** lock after this many minutes without activity (0 - never) */
   autoLockMinutes: number;
   notifications: 'off' | 'hidden' | 'full';
+  /** calls only through a TURN server, so that contacts do not see the IP address (default on, as in the apps) */
+  callsRelay?: boolean;
+  /** STUN and TURN servers for calls, in the format of the apps (empty: those of SimpleX Chat) */
+  iceServers?: string[];
 }
 
 /**

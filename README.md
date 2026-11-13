@@ -28,6 +28,9 @@ Chat are trademarks of SimpleX Chat Ltd.
   peer-to-peer: each member has an end-to-end encrypted connection with each other member; the
   admin who adds a member introduces it to the others and forwards messages until they are
   connected.
+- **Audio and video calls** with the apps, over WebRTC: the call page of the apps is followed
+  closely (the media frames are encrypted end to end with the key agreed in the chat), and calls go
+  through the TURN server of SimpleX Chat by default, so contacts do not see your IP address.
 - **Voice messages**, recorded in the page: AAC in M4A like the apps where the browser can encode
   it, otherwise 8 kHz μ-law WAV, which the apps play too.
 - **Post-quantum encryption**: the double ratchet with the sntrup761 key encapsulation that the apps
@@ -86,6 +89,7 @@ it works without installing anything.
 | your contacts' servers | with private routing, only the address of the server that forwards your messages | your IP address, the relay's address, messages and profile |
 | file servers (XFTP) | the relay's IP address, encrypted chunks of 64 KB to 4 MB and when they are uploaded and downloaded | the file, its name and real size, who sent it and to whom |
 | your contacts | the profile you share and your messages | your IP address and your other contacts |
+| the TURN server of calls | your IP address (calls do not go through the Wisp relay) and that of the contact, and when and how long you talk | what you say or show: frames are encrypted end to end |
 | group members | the profile you use in the group (it can be incognito), your messages there, and the other members | your IP address, your contacts and your other groups |
 | Codeberg Pages | that the page was loaded, from which IP address | everything after that |
 | someone with this browser | that Duplex was used, the number and rough size of stored records | anything else, without the passphrase |
@@ -96,8 +100,10 @@ use on it belong to the same client.
 
 ### Limitations
 
-- No channels (groups with relays) and no calls (they are shown as unsupported). In groups, members
-  cannot be accepted after review, and the history is not sent to new members.
+- No channels (groups with relays) yet. In groups, members cannot be accepted after review, and the
+  history is not sent to new members.
+- Calls: no screen sharing and no group calls; calls ring only while the page is open. Tor Browser
+  disables WebRTC, so calls do not work there.
 - Files are kept in the encrypted storage of this browser, which browsers limit in size; large files
   should be saved to disk.
 - No per-connection transport isolation (one connection per server, see above).
@@ -137,7 +143,7 @@ Tests:
 | `npm test` | unit tests: crypto against libsodium and OpenSSL vectors, sntrup761 against the C code of simplexmq, the post-quantum ratchet, links of the official client, certificate pinning, zstd compression, the encrypted storage, HTTP/2 header compression (RFC 7541 examples), file descriptions against the fixture of simplexmq, voice formats (with `FFMPEG_DIR`, against ffmpeg) |
 | `SMP_SERVER=smp://…@localhost:7001 SMP_SERVER2=smp://…@localhost:7003 npm run test:local` | two agents connecting through local `smp-server`s: invitations, short links, addresses, receipts, private message routing and address changes between the two |
 | `SMP_SERVER=… SMP_SERVER2=… XFTP_SERVER=xftp://…@localhost:7002 SIMPLEX_CHAT_BIN=… npm run test:interop` | the chat client against the official SimpleX Chat CLI (on the second router, so that Duplex sends to it with private routing): post-quantum encryption, address changes both ways, files through a local `xftp-server`; groups with two CLI users: invitations, introductions in both directions, Duplex as the admin, group links both ways, leaving and removing |
-| `CHROME_PATH=… SIMPLEX_CHAT_BIN=… npm run e2e` | the production build in headless Chrome on the real SimpleX network, chatting with the official CLI (run `npm run build` and `npm run relay` first, or set `APP_URL` to the published page; without `CHROME_PATH`, it uses a browser installed with `npx playwright install chromium`) |
+| `CHROME_PATH=… SIMPLEX_CHAT_BIN=… npm run e2e` | the production build in headless Chrome on the real SimpleX network, chatting with the official CLI, and a video call through the TURN server of SimpleX Chat with the call page of the apps (`test/e2e/fixtures/official-call`) on the other side (run `npm run build` and `npm run relay` first, or set `APP_URL` to the published page; without `CHROME_PATH`, it uses a browser installed with `npx playwright install chromium`) |
 
 `npm run check-server -- smp://… [wss://relay/]` connects to a server (directly or through a relay)
 and makes a queue.
@@ -151,7 +157,7 @@ and makes a queue.
 | `src/core/agent` | SMP agent: connections, short links, addresses, delivery, private routing, queue rotation |
 | `src/core/chat` | chat protocol messages, groups |
 | `src/app` | chat client, groups, file transfers, encrypted vault, session and relays |
-| `src/ui` | the Preact interface |
+| `src/ui` | the Preact interface, voice recording, WebRTC calls |
 | `relay` | the optional Wisp relay |
 | `site` | the about page, `404.html`, and `_headers` (Content Security Policy) for Codeberg Pages |
 

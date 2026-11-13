@@ -12,6 +12,7 @@ import { AGENT_VERSIONS } from '../core/agent/protocol';
 import { SMP_VERSIONS } from '../core/smp/protocol';
 import { Avatar, resizeImage } from './util';
 import { errorText, Modal, Spinner, toast, Toggle } from './components';
+import { DEFAULT_ICE_SERVERS, iceServerString, parseIceServer } from './webrtc';
 
 type Tab = 'profile' | 'privacy' | 'network' | 'security' | 'about';
 
@@ -136,6 +137,22 @@ function PrivacyTab({ session }: { session: Session }): JSX.Element {
         </select>
         <span class="hint">Shown only while Duplex is open in a background tab. There are no push notifications: no server knows how to reach you.</span>
       </label>
+      <Toggle
+        checked={s.calls !== false}
+        onChange={async (v) => {
+          await upd({ calls: v });
+          // the contacts learn it from the profile
+          await session.chat.updateProfile(session.settings.profile).catch(() => {});
+        }}
+        label="Audio and video calls"
+        hint="Contacts can call you while Duplex is open, and you can call them."
+      />
+      <Toggle
+        checked={s.callsRelay !== false}
+        onChange={(v) => upd({ callsRelay: v })}
+        label="Calls only through a relay server"
+        hint="The contact does not see your IP address: calls go through the TURN server of SimpleX Chat, as in the apps. Calls do not use the Wisp relay: the TURN server sees your IP address (or, with this off, the contact does)."
+      />
       <div class="note">
         <b>What Duplex does not do</b>
         <ul>
@@ -154,6 +171,7 @@ function NetworkTab({ session }: { session: Session }): JSX.Element {
   const [servers, setServers] = useState(st.servers.join('\n'));
   const [xftp, setXftp] = useState((st.xftpServers?.length ? st.xftpServers : DEFAULT_XFTP_SERVERS.map((s) => serverString(s))).join('\n'));
   const [onion, setOnion] = useState(st.network.onion);
+  const [ice, setIce] = useState((st.iceServers?.length ? st.iceServers : DEFAULT_ICE_SERVERS.map(iceServerString)).join('\n'));
   const [mode, setMode] = useState<ProxyMode>(st.routing?.mode ?? DEFAULT_ROUTING.mode);
   const [fallback, setFallback] = useState<ProxyFallback>(st.routing?.fallback ?? DEFAULT_ROUTING.fallback);
   const stats = session.chat.agent.network.stats;
@@ -181,10 +199,14 @@ function NetworkTab({ session }: { session: Session }): JSX.Element {
         return toast(`Invalid file server address: ${s}`, 'error');
       }
     }
-    // the default relays and file servers are not stored, so that new versions can update them
+    const is = ice.split(/\s+/).filter(Boolean);
+    const badIce = is.find((s) => !parseIceServer(s));
+    if (badIce) return toast(`Invalid call server: ${badIce}`, 'error');
+    // the default relays and servers are not stored, so that new versions can update them
     const isDefault = rl.join('\n') === defaultRelays().join('\n');
     const xftpDefault = !xs.length || xs.join('\n') === DEFAULT_XFTP_SERVERS.map((s) => serverString(s)).join('\n');
-    await session.saveSettings({ network: { relays: isDefault ? [] : rl, onion }, servers: sv, xftpServers: xftpDefault ? [] : xs, routing: { mode, fallback } });
+    const iceDefault = !is.length || is.join('\n') === DEFAULT_ICE_SERVERS.map(iceServerString).join('\n');
+    await session.saveSettings({ network: { relays: isDefault ? [] : rl, onion }, servers: sv, xftpServers: xftpDefault ? [] : xs, routing: { mode, fallback }, iceServers: iceDefault ? [] : is });
     toast('Network settings saved');
   };
   const test = async () => {
@@ -261,6 +283,14 @@ function NetworkTab({ session }: { session: Session }): JSX.Element {
       </label>
       <div class="row wrap">
         <button onClick={() => setXftp(DEFAULT_XFTP_SERVERS.map((s) => serverString(s)).join('\n'))}>Preset file servers</button>
+      </div>
+      <label>
+        Call servers (STUN and TURN)
+        <textarea rows={3} value={ice} spellcheck={false} onInput={(e) => setIce((e.target as HTMLTextAreaElement).value)} />
+        <span class="hint">Calls connect from this browser to these servers directly, not through the Wisp relay. Format as in the apps: stun:host:port, turns:user:password@host:port?transport=tcp.</span>
+      </label>
+      <div class="row wrap">
+        <button onClick={() => setIce(DEFAULT_ICE_SERVERS.map(iceServerString).join('\n'))}>Preset call servers</button>
       </div>
       <button class="primary" onClick={save}>
         Save
@@ -384,9 +414,9 @@ function About(): JSX.Element {
           XFTP v{XFTP_VERSIONS.min}–{XFTP_VERSIONS.max} over HTTP/2
         </span>
         <span>Encryption</span>
-        <span>double ratchet with X448 and sntrup761 (post-quantum), AES-256-GCM; NaCl boxes per queue; files with XSalsa20-Poly1305; TLS 1.3 with server fingerprint pinning</span>
+        <span>double ratchet with X448 and sntrup761 (post-quantum), AES-256-GCM; NaCl boxes per queue; files with XSalsa20-Poly1305; call media with AES-256-GCM over WebRTC; TLS 1.3 with server fingerprint pinning</span>
       </div>
-      <p class="hint">Not supported yet: channels, calls.</p>
+      <p class="hint">Not supported yet: channels, screen sharing in calls.</p>
       <p>
         Browsers cannot open TCP connections, so Duplex tunnels its own TLS connections to the SimpleX servers through a Wisp relay — by default a public one. To use your own, run <code>npm run relay</code> in the source code (Node.js, no dependencies; add <code>-- --tor</code> to connect through Tor) and choose “Relay on this computer” in the network settings.
       </p>

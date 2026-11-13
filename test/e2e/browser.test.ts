@@ -7,6 +7,7 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import http from 'node:http';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { chromium, type Browser, type Page } from 'playwright-core';
@@ -374,6 +375,69 @@ test('the browser creates a group, adds the CLI user and makes a group link', as
   await cli.cmd(`#${gname} and a second message`);
   await page.locator('.msg.rcv.in-group', { hasText: 'and a second message' }).waitFor({ timeout: NET });
   await shot('14-group-chat');
+});
+
+/** serves a directory on 127.0.0.1 (a secure context for getUserMedia) */
+function serveDir(dir: string): Promise<{ url: string; close: () => void }> {
+  const types: Record<string, string> = { '.html': 'text/html', '.js': 'text/javascript' };
+  const server = http.createServer((req, res) => {
+    const f = path.join(dir, path.normalize(decodeURIComponent((req.url ?? '/').split('?')[0])).replace(/^(\.\.[/\\])+/, ''));
+    if (!f.startsWith(dir) || !fs.existsSync(f) || fs.statSync(f).isDirectory()) return res.writeHead(404).end();
+    res.writeHead(200, { 'content-type': types[path.extname(f)] ?? 'application/octet-stream' }).end(fs.readFileSync(f));
+  });
+  return new Promise((resolve) => server.listen(0, '127.0.0.1', () => resolve({ url: `http://127.0.0.1:${(server.address() as { port: number }).port}/`, close: () => server.close() })));
+}
+
+test('a video call with the official CLI, whose media run in the call page of the apps', async () => {
+  // the call page of the apps does WebRTC for the CLI user, which does the signalling
+  const site = await serveDir(path.join(path.dirname(new URL(import.meta.url).pathname), 'fixtures/official-call'));
+  const peer = await browser.newPage();
+  try {
+    await peer.goto(site.url + 'index.html');
+    // processCommand is a top-level const of call.js, reached by name
+    const official = (command: object) => peer.evaluate((c) => (0, eval)('processCommand')({ command: c }).then((r: any) => r.resp), command);
+    const caps = await official({ type: 'capabilities', media: 'video' });
+    assert.equal(caps.capabilities?.encryption, true, JSON.stringify(caps));
+    const tail = await cli.cmd(`/tail @${ME} 1`);
+    const contactId = tail.chatItems[0].chatInfo.contact.contactId;
+    await cli.cmd(`/_call invite @${contactId} ${JSON.stringify({ media: 'video', capabilities: { encryption: true } })}`);
+    // the browser rings, and its user accepts with video
+    await page.getByLabel('Accept with video').click({ timeout: NET });
+    const offer = await cli.waitType('callOffer', NET);
+    assert.ok(offer.sharedKey, 'both sides encrypt the media');
+    const ans = await official({ type: 'offer', offer: offer.offer.rtcSession, iceCandidates: offer.offer.rtcIceCandidates, media: 'video', aesKey: offer.sharedKey, relay: true });
+    assert.equal(ans.type, 'answer', JSON.stringify(ans).slice(0, 300));
+    await cli.cmd(`/_call answer @${contactId} ${JSON.stringify({ rtcSession: ans.answer, rtcIceCandidates: ans.iceCandidates })}`);
+    // the later ICE candidates, in both directions
+    let relaying = true;
+    const relay = (async () => {
+      while (relaying) {
+        for (const m of await peer.evaluate(() => (window as any).messages.splice(0))) {
+          if (m.resp?.type === 'ice') await cli.cmd(`/_call extra @${contactId} ${JSON.stringify({ rtcIceCandidates: m.resp.iceCandidates })}`);
+        }
+        const i = cli.events.findIndex((e) => e?.type === 'callExtraInfo');
+        if (i >= 0) await official({ type: 'ice', iceCandidates: cli.events.splice(i, 1)[0].extraInfo.rtcIceCandidates });
+        else await new Promise((r) => setTimeout(r, 300));
+      }
+    })();
+    // connected through the TURN server of SimpleX Chat: both sides decrypt and show the video of the other
+    await page.locator('.call-status', { hasText: /^\d+:\d\d$/ }).waitFor({ timeout: NET });
+    await page.waitForFunction(() => ((document.querySelector('.remote-video') as HTMLVideoElement | null)?.videoWidth ?? 0) > 0, null, { timeout: NET });
+    await peer.waitForFunction(() => ((document.getElementById('remote-video-stream') as HTMLVideoElement | null)?.videoWidth ?? 0) > 0, null, { timeout: NET });
+    assert.match((await page.locator('.call-enc').textContent()) ?? '', /end-to-end encrypted/);
+    await shot('15-call');
+    await page.getByLabel('End call').click();
+    await cli.waitType('callEnded', NET);
+    relaying = false;
+    await relay;
+    // the call in the chat with the contact
+    await page.locator('.call-screen').waitFor({ state: 'detached', timeout: 30000 });
+    await openPeer();
+    await page.locator('.messages .event', { hasText: /^incoming video call: \d+:\d\d$/ }).waitFor({ timeout: NET });
+  } finally {
+    await peer.close();
+    site.close();
+  }
 });
 
 test('another tab can take over, and this one disconnects', async () => {

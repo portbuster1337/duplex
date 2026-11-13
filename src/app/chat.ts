@@ -61,6 +61,7 @@ import {
 import { ItemStore, VaultAgentStore } from './store';
 import { ChatError, FileApprovalError, localId, profileName, randomIndex } from './common';
 import { GroupManager, type Group, type GroupMember } from './groups';
+import { CallManager } from './calls';
 import { contentAllowedInGroup, groupLinkIdOf, groupPrefOn, normMemberId, roleRank, type GroupProfile } from '../core/chat/groups';
 import type { Vault } from './vault';
 
@@ -138,6 +139,8 @@ export interface ChatItem {
   memberId?: string;
   /** an invitation to a group, received from a contact */
   groupInv?: { groupId: string; status: 'pending' | 'accepted' | 'rejected'; name: string; role: string };
+  /** a call with the contact (the text says how it went) */
+  call?: { media: string; dir: 'snd' | 'rcv' };
   /** disappearing message: deletion time */
   deleteAt?: number;
   /** a received disappearing message: its TTL in seconds, counted from when it is read */
@@ -167,6 +170,8 @@ export interface ChatSettings {
   prefsVersion?: number;
   /** private message routing (the defaults of the apps when not set) */
   routing?: { mode: ProxyMode; fallback: ProxyFallback };
+  /** audio and video calls with contacts (default on) */
+  calls?: boolean;
 }
 
 interface ChatState {
@@ -194,6 +199,8 @@ export type ChatEvent =
   | { type: 'connected'; contactId: string }
   | { type: 'network' }
   | { type: 'fileProgress'; fileId: string }
+  /** the current call changed (chat.calls.active) */
+  | { type: 'call' }
   | { type: 'error'; message: string };
 
 const DEFAULT_PREFERENCES = {
@@ -202,15 +209,15 @@ const DEFAULT_PREFERENCES = {
   reactions: { allow: 'yes' as const },
   voice: { allow: 'yes' as const },
   files: { allow: 'always' as const },
-  calls: { allow: 'no' as const },
+  calls: { allow: 'yes' as const },
 };
 
-/** 1: files and voice messages not allowed; 2: allowed */
-export const PREFS_VERSION = 2;
+/** 1: files and voice messages not allowed; 2: allowed; 3: calls allowed */
+export const PREFS_VERSION = 3;
 
-export function withDefaultPreferences(p: Profile): Profile {
-  // calls are not supported
-  return { ...p, preferences: { ...DEFAULT_PREFERENCES, ...(p.preferences ?? {}), calls: { allow: 'no' } } };
+/** calls: allowed unless the user turned them off */
+export function withDefaultPreferences(p: Profile, calls = true): Profile {
+  return { ...p, preferences: { ...DEFAULT_PREFERENCES, ...(p.preferences ?? {}), calls: { allow: calls ? 'yes' : 'no' } } };
 }
 
 /** a random profile for an incognito connection, named like those of the official apps */
@@ -283,6 +290,9 @@ export class ChatClient {
   /** file transfers and the local copies of files */
   readonly files: FileManager;
   readonly groups: GroupManager;
+  readonly calls: CallManager;
+  /** whether the page can encrypt call media (set by the interface) */
+  callEncryption: () => boolean = () => false;
 
   constructor(
     private vault: Vault,
@@ -295,6 +305,7 @@ export class ChatClient {
     this.itemStore = new ItemStore<ChatItem>(vault);
     this.files = new FileManager(vault, () => this.agent.network.connector);
     this.groups = new GroupManager(this);
+    this.calls = new CallManager(this);
   }
 
   on(f: (e: ChatEvent) => void): () => void {
@@ -308,6 +319,19 @@ export class ChatClient {
   emitError(message: string): void {
     this.emit({ type: 'error', message });
   }
+
+  /** @internal */
+  emitCall(): void {
+    this.emit({ type: 'call' });
+  }
+
+  /** @internal an incoming call while the page is in the background */
+  notifyCall(text: string): void {
+    this.callNotifier(text);
+  }
+
+  /** shows notifications of incoming calls (set by the interface) */
+  callNotifier: (text: string) => void = () => {};
 
   private emit(e: ChatEvent): void {
     for (const f of this.listeners) {
@@ -406,7 +430,7 @@ export class ChatClient {
 
   /** the profile sent to a contact: incognito or ours, with the disappearing messages TTL for this contact */
   private ourProfile(c?: { incognito?: Profile; ttl?: number }): Profile {
-    const p = withDefaultPreferences(c?.incognito ?? this.settings.profile);
+    const p = withDefaultPreferences(c?.incognito ?? this.settings.profile, this.settings.calls !== false);
     if (c?.ttl) p.preferences = { ...p.preferences, timedMessages: { allow: 'yes', ttl: c.ttl } };
     return p;
   }
@@ -1609,12 +1633,13 @@ export class ChatClient {
         await this.groups.onInvitation(c, m);
         return true;
       case 'x.call.inv':
-        await this.addEvent(c.id, `${profileName(c.profile)} is calling — calls are not supported in Duplex`);
+        await this.calls.onMessage(c, m);
         return true;
       case 'x.call.offer':
       case 'x.call.answer':
       case 'x.call.extra':
       case 'x.call.end':
+        await this.calls.onMessage(c, m);
         return false;
       case 'x.file.acpt.inv':
         // files sent over SMP connections (not used by the apps anymore)

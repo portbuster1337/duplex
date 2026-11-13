@@ -211,6 +211,55 @@ test('address changes: Duplex and the CLI change their receiving addresses', { s
   await until(() => itemsOf(contact.id).some((i) => i.content.text === 'it works'), 30000, 'reply');
 });
 
+test('calls: the signalling and the media key are the same as in the official client', { skip: !SERVER }, async () => {
+  const { contact, cliName } = await newPair();
+  chat.callEncryption = () => true;
+  const signals: any[] = [];
+  chat.calls.onSignal = (sig) => signals.push(sig);
+  // Duplex calls the CLI
+  const call = await chat.calls.start(contact.id, 'video', true);
+  const inv = await cli.waitType('callInvitation', 30000);
+  assert.equal(inv.callInvitation.callType.media, 'video');
+  assert.ok(inv.callInvitation.sharedKey, 'the CLI agreed a key');
+  const cliContactId = inv.callInvitation.contact.contactId;
+  const offer = { callType: { media: 'video', capabilities: { encryption: true } }, rtcSession: { rtcSession: 'offer-sdp', rtcIceCandidates: 'offer-ice' } };
+  assert.equal((await cli.cmd(`/_call offer @${cliContactId} ${JSON.stringify(offer)}`)).type, 'cmdOk');
+  await until(() => signals.find((x) => x.type === 'offer'), 30000, 'offer');
+  assert.equal(call.status, 'connecting');
+  // both sides derive the same key of the media frames (HKDF of the DH secret, call version 2)
+  assert.equal(call.aesKey, inv.callInvitation.sharedKey);
+  assert.deepEqual(signals.find((x) => x.type === 'offer').offer, offer.rtcSession);
+  await chat.calls.sendAnswer({ rtcSession: 'answer-sdp', rtcIceCandidates: 'answer-ice' });
+  const ans = await cli.waitType('callAnswer', 30000);
+  assert.deepEqual(ans.answer, { rtcSession: 'answer-sdp', rtcIceCandidates: 'answer-ice' });
+  await chat.calls.sendExtra('more-ice');
+  assert.equal((await cli.waitType('callExtraInfo', 30000)).extraInfo.rtcIceCandidates, 'more-ice');
+  await cli.cmd(`/_call extra @${cliContactId} ${JSON.stringify({ rtcIceCandidates: 'cli-ice' })}`);
+  await until(() => signals.find((x) => x.type === 'extra' && x.iceCandidates === 'cli-ice'), 30000, 'extra');
+  await chat.calls.connected();
+  await chat.calls.end();
+  await cli.waitType('callEnded', 30000);
+  chat.calls.dismiss();
+  // the CLI calls Duplex
+  await cli.cmd(`/_call invite @${cliContactId} ${JSON.stringify({ media: 'audio', capabilities: { encryption: true } })}`);
+  const rcv = await until(() => chat.calls.active?.status === 'ringing' && chat.calls.active, 30000, 'incoming call');
+  assert.equal(rcv.media, 'audio');
+  chat.calls.accept();
+  await chat.calls.sendOffer({ rtcSession: 'duplex-offer', rtcIceCandidates: 'duplex-ice' }, true);
+  const off = await cli.waitType('callOffer', 30000);
+  assert.deepEqual(off.offer, { rtcSession: 'duplex-offer', rtcIceCandidates: 'duplex-ice' });
+  assert.equal(off.sharedKey, rcv.aesKey);
+  assert.equal(off.askConfirmation, false);
+  await cli.cmd(`/_call answer @${cliContactId} ${JSON.stringify({ rtcSession: 'cli-answer', rtcIceCandidates: 'cli-ice2' })}`);
+  await until(() => signals.find((x) => x.type === 'answer' && x.answer.rtcSession === 'cli-answer'), 30000, 'answer');
+  await cli.cmd(`/_call end @${cliContactId}`);
+  await until(() => chat.calls.active?.status === 'ended', 30000, 'ended by the CLI');
+  chat.calls.dismiss();
+  const events = itemsOf(contact.id).filter((i) => i.call).map((i) => i.content.text);
+  assert.deepEqual(events, ['outgoing video call: 0:00', 'incoming audio call: ended by the contact']);
+  void cliName;
+});
+
 test('disappearing messages work both ways', { skip: !SERVER }, async () => {
   const { contact, cliName } = await newPair();
   // the CLI turns them on: Duplex uses the same time for its messages

@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<!-- A page for the call script of the SimpleX Chat apps (call.js and lz-string.min.js from
+     apps/multiplatform/common/src/commonMain/resources/assets/www of simplex-chat at 50a575e, AGPL-3.0),
+     set up as the mobile apps set it up (without a worker: with insertable streams), and driven by the
+     browser test through processCommand. -->
+<html>
+  <head>
+    <meta charset="utf-8" />
+    <script src="./lz-string.min.js"></script>
+  </head>
+  <body>
+    <video id="remote-video-stream" autoplay playsinline></video>
+    <video id="remote-screen-video-stream" autoplay playsinline></video>
+    <video id="local-video-stream" muted autoplay playsinline></video>
+    <video id="local-screen-video-stream" muted autoplay playsinline></video>
+    <script src="./call.js"></script>
+    <script>
+      useWorker = false;
+      isDesktop = true;
+      window.messages = [];
+      sendMessageToNative = (msg) => window.messages.push(msg);
+    </script>
+  </body>
+</html>

@@ -8,6 +8,8 @@ import { groupName, memberName, type Group } from '../app/groups';
 import { groupPrefOn } from '../core/chat/groups';
 import type { Profile } from '../core/chat/protocol';
 import { GroupInfo } from './groups';
+import { startCall } from './callview';
+import { supportsCalls } from './webrtc';
 import { hasContent } from '../app/files';
 import { AttachmentStrip, FileContent, fmtDuration, saveFile, useAttachments } from './files';
 import { canRecord, MAX_VOICE_SECONDS, VoiceRecorder, type Recording } from './recorder';
@@ -239,6 +241,16 @@ export function ChatView({ session, chatId, onBack, onDeleted, onOpen }: { sessi
             <span class="chat-sub">{sub}</span>
           </span>
         </button>
+        {contact && session.settings.calls !== false && chat.calls.allowed(contact) && supportsCalls() && (
+          <>
+            <button class="icon-btn" disabled={!!chat.calls.active} onClick={() => startCall(session, contact.id, 'audio')} aria-label="Audio call" title="Audio call">
+              <Icon name="phone" />
+            </button>
+            <button class="icon-btn" disabled={!!chat.calls.active} onClick={() => startCall(session, contact.id, 'video')} aria-label="Video call" title="Video call">
+              <Icon name="video" />
+            </button>
+          </>
+        )}
         <button class="icon-btn" onClick={() => setInfo(true)} aria-label={contact ? 'Contact info' : 'Group info'} title={contact ? 'Contact info' : 'Group info'}>
           <Icon name="info" />
         </button>

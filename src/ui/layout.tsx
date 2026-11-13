@@ -12,6 +12,7 @@ import { NewChat } from './newchat';
 import { Settings } from './settings';
 import { RequestView, InvitationView } from './requests';
 import { toast } from './components';
+import { CallScreen, callEngine } from './callview';
 
 export type Selection = { kind: 'contact'; id: string } | { kind: 'group'; id: string } | { kind: 'request'; id: string } | { kind: 'invitation'; id: string } | undefined;
 
@@ -77,6 +78,16 @@ export function Main({ session, onLock, onWiped }: { session: Session; onLock: (
   }, [entries.map((e) => (e.kind === 'contact' ? e.c.id + e.c.lastActivity + e.c.unread : e.g.id + e.g.lastActivity + e.g.unread + e.g.status)).join()]);
 
   useEffect(() => {
+    callEngine(session);
+    // incoming calls while the page is in the background
+    chat.callNotifier = (text) => {
+      if (session.settings.notifications === 'off' || !document.hidden || !('Notification' in window) || Notification.permission !== 'granted') return;
+      try {
+        new Notification(session.settings.notifications === 'full' ? text : 'Incoming call', { tag: 'duplex-call', requireInteraction: true });
+      } catch {
+        // notifications may be unavailable
+      }
+    };
     const off = chat.on((e) => {
       if (e.type === 'network') forceNet(0);
       if (e.type === 'error') toast(e.message, 'error');
@@ -199,6 +210,7 @@ export function Main({ session, onLock, onWiped }: { session: Session; onLock: (
         />
       )}
       {modal === 'settings' && <Settings session={session} onClose={() => setModal(undefined)} onLock={onLock} onWiped={onWiped} />}
+      <CallScreen session={session} />
     </div>
   );
 }
