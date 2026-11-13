@@ -39,6 +39,8 @@ export interface Connector {
   connect(host: string, port: number): Promise<Stream>;
   /** whether .onion hosts can be reached */
   onion?: boolean;
+  /** whether servers see another IP address than the user's: a relay elsewhere, or Tor */
+  ipProtected?: boolean;
 }
 
 export type AuthKey = PrivateKey<SignAlg> | PrivateKey<'x25519'>;

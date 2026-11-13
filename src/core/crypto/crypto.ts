@@ -168,7 +168,8 @@ function u8le(w: Uint32Array): Bytes {
   return out;
 }
 
-function boxKey(secret: Bytes): Bytes {
+/** the XSalsa20 key of the boxes: SimpleX passes both DH secrets and symmetric keys through HSalsa20 */
+export function secretBoxKey(secret: Bytes): Bytes {
   if (secret.length !== 32) throw new Error('box key must be 32 bytes');
   const out = new Uint32Array(8);
   hsalsa(SIGMA, u32le(secret), new Uint32Array(4), out);
@@ -177,13 +178,13 @@ function boxKey(secret: Bytes): Bytes {
 
 /** tag || ciphertext */
 export function cryptoBox(secret: Bytes, nonce: Bytes, msg: Bytes): Bytes {
-  return xsalsa20poly1305(boxKey(secret), nonce).encrypt(msg);
+  return xsalsa20poly1305(secretBoxKey(secret), nonce).encrypt(msg);
 }
 
 export function cryptoBoxOpen(secret: Bytes, nonce: Bytes, packet: Bytes): Bytes {
   if (packet.length < 16) throw new CryptoError('box: packet too short');
   try {
-    return xsalsa20poly1305(boxKey(secret), nonce).decrypt(packet);
+    return xsalsa20poly1305(secretBoxKey(secret), nonce).decrypt(packet);
   } catch {
     throw new CryptoError('box: decryption failed');
   }
