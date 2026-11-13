@@ -7,19 +7,27 @@ import {
   channelShortLinkData,
   DEFAULT_GROUP_PREFERENCES,
   fwdMemberName,
+  encodeRoster,
   GROUP_KNOCKING_VERSION,
   groupLinkClientData,
   groupPrefOn,
   groupShortLinkData,
   isForwardedGroupMsg,
+  isRosterRole,
+  MAX_ROSTER_BYTES,
+  MAX_SENT_ROSTER_BYTES,
   memberInfo,
   memberScope,
   newGroupLinkId,
   newMemberId,
   normMemberId,
+  parseRoster,
   PENDING_REVIEW_MESSAGE,
   roleRank,
+  roleToChange,
+  ROSTER_CHUNK_SIZE,
   scopeMemberId,
+  validRoster,
   xGrpAcpt,
   xGrpDel,
   xGrpInfo,
@@ -35,19 +43,25 @@ import {
   xGrpMemIntro,
   xGrpMemInv,
   xGrpMemNew,
+  xGrpMemRestrict,
   xGrpMemRole,
   xGrpMsgForward,
+  xGrpRoster,
+  xGrpRosterRequest,
   type GroupInvitation,
   type GroupLinkInvitation,
   type GroupMemberRole,
   type GroupProfile,
   type MemberInfo,
+  type RosterEntry,
 } from '../core/chat/groups';
 import {
-  channelBinding,
+  CHANNEL_CHAT_VERSIONS,
   COMPRESSION_CHAT_VERSION,
   compressToLimit,
   encodeChatMessage,
+  fileChunkElement,
+  GROUP_ROSTER_VERSION,
   groupBinding,
   jsonBatches,
   MAX_CONN_INFO_LENGTH,
@@ -67,7 +81,7 @@ import {
   type ParsedChatMsg,
   type Profile,
 } from '../core/chat/protocol';
-import { encodePubKey, generateKeyPair, sha256, sign, type PublicKey } from '../core/crypto/crypto';
+import { decodePubKeyOf, encodePubKey, generateKeyPair, sha256, sha512, sign, type PublicKey } from '../core/crypto/crypto';
 import { parseShortLink, strShortLink } from '../core/agent/shortlink';
 import { b64, b64url, concat, fromB64, type Bytes } from '../core/util/bytes';
 import { parseVR, type VersionRange } from '../core/util/version';
@@ -123,6 +137,8 @@ export interface GroupMember {
   relayLink?: string;
   /** channels, as the owner: the address of a chat relay we invited */
   relayAddress?: string;
+  /** channels, as the owner: the roster version a relay confirms before the channel link lists it */
+  rosterPending?: number;
   blocked?: boolean;
   /** messages kept until the connection is ready (base64) */
   pending?: string[];
@@ -139,8 +155,30 @@ export interface ChannelInfo {
   memberKey: { pub: string; priv: string };
   /** the number of subscribers, as the link data or a relay says */
   subscribers?: number;
-  /** as the owner: the connection of the channel link, whose data lists the relays that serve it */
+  /** as the owner who made the channel: the connection of its link, whose data lists the owners and relays */
   linkConnId?: string;
+  /**
+   * the version of the roster (the members, moderators and admins, signed by an owner): as the owner
+   * who made the channel, the current one; otherwise the newest seen, in a roster or a change
+   */
+  rosterVersion?: number;
+  /** the newest roster version up to which no change was missed */
+  rosterComplete?: number;
+  /** the rosters that relays are sending, until all of each arrived (by relay) */
+  rosterTransfers?: Record<string, RosterTransfer>;
+}
+
+/** a roster on its way from a relay: what the owner signed about it, and its chunks so far */
+export interface RosterTransfer {
+  /** the ID of the message that announced it, which its chunks name */
+  ref: string;
+  version: number;
+  size: number;
+  digest: string;
+  owner: string;
+  chunks: number;
+  /** base64 */
+  data: string;
 }
 
 export interface Group {
@@ -179,8 +217,23 @@ const DEBUG = typeof process !== 'undefined' && !!process.env?.DEBUG_GROUPS;
 const HOST_PLACEHOLDER = '?host';
 /** the number of recent messages sent to new members, unless chosen: as in the apps */
 export const HISTORY_ITEMS = 100;
-/** in channels, the events that an owner signs (requiresSignature of the apps) */
+/** in channels, the events that are signed (requiresSignature of the apps) */
 const CHANNEL_SIGNED = new Set(['x.grp.del', 'x.grp.info', 'x.grp.prefs', 'x.grp.mem.del', 'x.grp.mem.role', 'x.grp.mem.restrict', 'x.grp.leave', 'x.grp.relay.new', 'x.grp.roster', 'x.info', 'x.grp.link.mem', 'x.grp.relay.inv']);
+/** the posts of channels, and what changes them */
+const CHANNEL_CONTENT = new Set(['x.msg.new', 'x.msg.update', 'x.msg.del', 'x.msg.react', 'x.msg.file.descr', 'x.file.cancel']);
+/** in channels, the roles that owners give: in the roster, or the link */
+const privileged = (r: GroupMemberRole | undefined): boolean => isRosterRole(r) || r === 'owner';
+/** a member key as the apps send it (the X.509 key, base64url), raw */
+function rawMemberKey(k: unknown): string | undefined {
+  try {
+    return typeof k === 'string' ? b64url(decodePubKeyOf(fromB64(k), 'ed25519').key) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+const x509Key = (raw: string): string => b64url(encodePubKey({ alg: 'ed25519', key: fromB64(raw) }));
+/** the name of a member known only by its ID (nameFromMemberId of the apps) */
+const nameFromMemberId = (id: string): string => b64(fromB64(id)).slice(0, 7);
 const pairKey = (a: string, b: string) => (a < b ? `${a}|${b}` : `${b}|${a}`);
 export const memberGone = (m: GroupMember): boolean => m.status === 'left' || m.status === 'removed';
 export const memberName = (m?: GroupMember): string => profileName(m?.profile);
@@ -288,7 +341,7 @@ export class GroupManager {
   }
 
   canSend(g: Group): string | undefined {
-    if (g.channel && groupActive(g) && roleRank(g.role) < roleRank('author')) return 'only the owners post in this channel';
+    if (g.channel && groupActive(g) && roleRank(g.role) < roleRank('author')) return 'only its owners and members post in this channel';
     if (g.status === 'pending') return 'the group admins have not accepted you yet';
     if (g.status !== 'active' && g.status !== 'connecting') return g.status === 'invited' ? 'join the group first' : 'you are not a member of this group';
     if (roleRank(g.role) < roleRank('author')) return 'observers cannot send messages';
@@ -575,7 +628,8 @@ export class GroupManager {
     return g;
   }
 
-  // ---- channels (as a subscriber): the posts of the owners come through chat relays
+  // ---- channels: posts reach the subscribers through chat relays, which forward them. The owners are in the
+  // channel link; the members, moderators and admins in its roster, which an owner signs and the relays serve
 
   /**
    * joins a channel via its link (connectPreparedGroup of the apps): the owners and their keys come from
@@ -606,6 +660,7 @@ export class GroupManager {
       unread: 0,
       channel: { publicGroupId, link: resolved.link, memberKey: { pub: b64url(kp.pub.key), priv: b64url(kp.priv.key) }, subscribers: sld.publicGroupData?.publicMemberCount },
     };
+    // all owners, each authorised by the root key of the link or by an owner before it (the agent checked it)
     for (const o of ld.user.data.owners) {
       const id = b64url(o.ownerId);
       g.members[id] = { memberId: id, role: 'owner', profile: { displayName: 'owner', fullName: '' }, category: 'post', status: 'announced', key: b64url(o.ownerKey.key), createdAt: now };
@@ -642,22 +697,37 @@ export class GroupManager {
 
   /** our member key, as the apps send it (MemberKey: the X.509 key, base64url) */
   private channelKey(g: Group): string {
-    return b64url(encodePubKey({ alg: 'ed25519', key: fromB64(g.channel!.memberKey.pub) }));
+    return x509Key(g.channel!.memberKey.pub);
   }
 
-  /** a message we send in a channel, signed with our member key (relays and owners verify x.info, x.grp.leave…) */
+  /**
+   * a message we send in a channel, signed with our member key (relays and owners verify x.info,
+   * x.grp.leave…), with the chat versions of channels: from 19, the relays serve us the roster
+   */
   private channelSigned(g: Group, msg: ChatMessage): Bytes {
     const binding = groupBinding(fromB64(g.channel!.publicGroupId), fromB64(g.memberId));
-    return signedElement(binding, { alg: 'ed25519', key: fromB64(g.channel!.memberKey.priv) }, encodeChatMessage(msg));
+    return signedElement(binding, { alg: 'ed25519', key: fromB64(g.channel!.memberKey.priv) }, encodeChatMessage({ ...msg, v: CHANNEL_CHAT_VERSIONS }));
   }
 
-  /** to the relays of a channel; what changes the channel is signed, posts are not (as in the apps) */
-  private async sendChannel(g: Group, msg: ChatMessage): Promise<number> {
-    const body = CHANNEL_SIGNED.has(msg.event) ? this.channelSigned(g, msg) : encodeChatMessage(msg);
+  /** what changes the channel is signed, and moderation; posts are not (as in the apps); compressed when large */
+  private channelBody(g: Group, msg: ChatMessage): Bytes {
+    const moderation = msg.event === 'x.msg.del' && !!msg.params.memberId;
+    const raw = CHANNEL_SIGNED.has(msg.event) || moderation ? this.channelSigned(g, msg) : encodeChatMessage({ ...msg, v: CHANNEL_CHAT_VERSIONS });
+    const body = raw.length <= MAX_ENCODED_MSG_LENGTH ? raw : compressToLimit(MAX_ENCODED_MSG_LENGTH, raw);
+    if (!body) throw new ChatError('message is too large');
+    return body;
+  }
+
+  /**
+   * to the relays of a channel, which forward it (or to these relays). In the handler of an agent event of
+   * a relay, the sends to it do not wait (wait = false)
+   */
+  private async sendChannel(g: Group, msg: ChatMessage, to?: GroupMember[], wait = true): Promise<number> {
+    const body = this.channelBody(g, msg);
     let n = 0;
-    for (const m of this.relays(g)) {
+    for (const m of to ?? this.relays(g)) {
       if (m.connId && m.status === 'connected') {
-        await this.deliver(m.connId, body, false, true).catch((e) => console.warn('a channel message was not sent', e));
+        await this.deliver(m.connId, body, false, wait).catch((e) => console.warn('a channel message was not sent', e));
         n++;
       }
     }
@@ -668,15 +738,23 @@ export class GroupManager {
     return this.currentMembers(g).filter((m) => m.role === 'relay');
   }
 
+  /** the owner who made the channel: the link, the roster and the owners are ours to change */
+  isChannelCreator(g: Group): boolean {
+    return !!g.channel?.linkConnId && g.role === 'owner';
+  }
+
   private async onChannelEvent(g: Group, m: GroupMember, e: AgentEvent): Promise<MsgResult | void> {
-    if (g.role === 'owner' && m.category === 'invitee') return this.onOwnedRelayEvent(g, m, e);
+    if (m.role !== 'relay') return;
+    if (e.type === 'MSG') return this.onChannelMsg(g, m, e.body);
+    if (e.type === 'END') return void this.chat.emitError(`${groupName(g)}: the connection is used by another client (is Duplex open in another tab?)`);
+    if (m.category === 'invitee') return this.onOwnedRelayEvent(g, m, e);
     switch (e.type) {
       case 'CONF': {
         // the relay accepts us: x.grp.link.inv, about this channel and our member ID
         const msg = this.chat.parseInfo(e.connInfo);
         const gli = msg?.event === 'x.grp.link.inv' ? (msg.params.groupLinkInvitation as GroupLinkInvitation | undefined) : undefined;
         const pg = normMemberId((gli?.groupProfile?.publicGroup as { publicGroupId?: unknown } | undefined)?.publicGroupId);
-        if (!gli || m.role !== 'relay' || pg !== g.channel!.publicGroupId || normMemberId(gli.invitedMember?.memberId) !== g.memberId || normMemberId(gli.fromMember?.memberId) !== m.memberId) {
+        if (!gli || pg !== g.channel!.publicGroupId || normMemberId(gli.invitedMember?.memberId) !== g.memberId || normMemberId(gli.fromMember?.memberId) !== m.memberId) {
           console.warn('a relay answered for another channel or member', msg?.event);
           return;
         }
@@ -688,8 +766,6 @@ export class GroupManager {
         await this.save(g);
         return { allow: this.channelSigned(g, { event: 'x.info', params: { profile: this.ourProfile(g), memberKey: this.channelKey(g) } }) };
       }
-      case 'INFO':
-        return;
       case 'CON':
         m.status = 'connected';
         this.sendPending(m);
@@ -699,134 +775,78 @@ export class GroupManager {
         }
         await this.save(g);
         return;
-      case 'MSG': {
-        for (const pm of parseChatMessages(e.body)) {
-          if (!pm.msg) {
-            console.warn('channel message error', pm.error);
-            continue;
-          }
-          if (DEBUG) console.log(`[channel ${groupName(g)}] from ${memberName(m)}: ${pm.forward ? 'forwarded ' : ''}${pm.msg.event}`, JSON.stringify(pm.msg.params).slice(0, 200));
-          try {
-            if (pm.forward) await this.onChannelForward(g, pm);
-            else await this.onRelayEvent(g, m, pm.msg);
-          } catch (err) {
-            console.warn('channel message processing error', pm.msg.event, err);
-          }
+      default:
+        return;
+    }
+  }
+
+  private async onChannelMsg(g: Group, relay: GroupMember, body: Bytes): Promise<MsgResult> {
+    for (const pm of parseChatMessages(body)) {
+      try {
+        // the chunks of a roster come from the relay itself, after the roster it forwards
+        if (pm.chunk) {
+          if (!pm.forward) await this.onRosterChunk(g, relay, pm.chunk);
+          continue;
         }
-        await this.save(g);
-        return {};
-      }
-      case 'END':
-        this.chat.emitError(`${groupName(g)}: the connection is used by another client (is Duplex open in another tab?)`);
-        return;
-      default:
-        return;
-    }
-  }
-
-  /** a message of the channel or of one of its members, forwarded by a relay */
-  private async onChannelForward(g: Group, pm: ParsedChatMsg): Promise<void> {
-    const msg = pm.msg!;
-    const authorId = normMemberId(pm.forward!.memberId);
-    if (authorId === g.memberId) return;
-    let author = authorId ? g.members[authorId] : undefined;
-    if (authorId && !author) {
-      author = { memberId: authorId, role: 'observer', profile: { displayName: pm.forward!.memberName || 'member', fullName: '' }, category: 'post', status: 'unknown', createdAt: Date.now() };
-      g.members[authorId] = author;
-    }
-    const ts = pm.forward!.brokerTs || Date.now();
-    // what changes the channel is signed by an owner: a relay cannot make it up
-    if (CHANNEL_SIGNED.has(msg.event)) {
-      if (!this.ownerSigned(g, pm, authorId)) return void console.warn('a channel message without a valid owner signature was ignored', msg.event);
-      return this.onOwnerEvent(g, author, msg);
-    }
-    switch (msg.event) {
-      case 'x.msg.new':
-      case 'x.msg.update':
-      case 'x.msg.del':
-      case 'x.msg.react':
-      case 'x.msg.file.descr':
-      case 'x.file.cancel':
-        // without an author: sent as the channel, by an owner
-        await this.chat.processContent({ chatId: g.id, group: g, sender: author }, msg, { brokerTs: ts, forwarded: true });
-        return;
-      default:
-        return;
-    }
-  }
-
-  /** signed by an owner of the channel (whose keys come from the channel link) */
-  private ownerSigned(g: Group, pm: ParsedChatMsg, authorId?: string): boolean {
-    if (!pm.sig) return false;
-    const pgId = fromB64(g.channel!.publicGroupId);
-    const key = (m: GroupMember): PublicKey<'ed25519'> => ({ alg: 'ed25519', key: fromB64(m.key!) });
-    if (authorId) {
-      const a = g.members[authorId];
-      return !!a?.key && a.role === 'owner' && verifySigned(pm.sig, groupBinding(pgId, fromB64(authorId)), [key(a)]);
-    }
-    const owners = this.members(g).filter((m) => m.role === 'owner' && m.key);
-    return verifySigned(pm.sig, channelBinding(pgId), owners.map(key));
-  }
-
-  private async onOwnerEvent(g: Group, author: GroupMember | undefined, msg: ChatMessage): Promise<void> {
-    const p = msg.params;
-    switch (msg.event) {
-      case 'x.grp.info': {
-        const gp = p.groupProfile as GroupProfile | undefined;
-        if (!gp?.displayName || normMemberId((gp.publicGroup as { publicGroupId?: unknown } | undefined)?.publicGroupId) !== g.channel!.publicGroupId) return;
-        g.profile = gp;
-        await this.event(g, 'the channel profile was updated');
-        return;
-      }
-      case 'x.grp.prefs':
-        if (p.groupPreferences && typeof p.groupPreferences === 'object') g.profile = { ...g.profile, groupPreferences: p.groupPreferences };
-        return;
-      case 'x.grp.del':
-        g.status = 'deleted';
-        await this.event(g, 'the owner deleted the channel');
-        this.later(() => this.dropConnections(g, 0));
-        return;
-      case 'x.grp.mem.del':
-        if (normMemberId(p.memberId) !== g.memberId) return;
-        g.status = 'removed';
-        await this.event(g, 'you were removed from the channel');
-        this.later(() => this.dropConnections(g, 0));
-        return;
-      case 'x.grp.mem.role':
-        if (normMemberId(p.memberId) === g.memberId && typeof p.role === 'string') {
-          g.role = p.role;
-          await this.event(g, `your role in the channel is now ${p.role}`);
+        if (!pm.msg) {
+          console.warn('channel message error', pm.error);
+          continue;
         }
-        return;
-      case 'x.info':
-        if (author && p.profile) author.profile = memberProfile(p.profile as Profile);
-        return;
-      default:
-        return;
+        if (DEBUG) console.log(`[channel ${groupName(g)}] from ${memberName(relay)}: ${pm.forward ? `forwarded (${pm.forward.memberName ?? 'as the channel'}) ` : ''}${pm.msg.event}`, JSON.stringify(pm.msg.params).slice(0, 200));
+        if (pm.forward) await this.onChannelForward(g, relay, pm);
+        else await this.onRelayEvent(g, relay, pm.msg);
+      } catch (err) {
+        console.warn('channel message processing error', pm.msg?.event, err);
+      }
     }
+    await this.save(g);
+    return {};
   }
 
-  /** a message of a relay itself: the profiles of the owners and moderators, its own profile, leaving */
+  /** a message of a relay itself: the members it introduces or announces, its profile, roster confirmations, leaving */
   private async onRelayEvent(g: Group, relay: GroupMember, msg: ChatMessage): Promise<void> {
     const p = msg.params;
     switch (msg.event) {
-      case 'x.grp.mem.intro': {
+      case 'x.grp.mem.intro':
+      case 'x.grp.mem.new': {
+        // x.grp.mem.intro: the owners, admins and moderators, to a new subscriber; x.grp.mem.new: a new subscriber,
+        // to them, or the author of a message that follows
         const mi = p.memberInfo as MemberInfo | undefined;
         const id = normMemberId(mi?.memberId);
-        if (!mi || !id || id === g.memberId || !mi.profile) return;
+        if (!mi?.profile || !id || id === g.memberId) return;
+        // the roles and keys of members, moderators, admins and owners are the owners' to give (in the link and the
+        // roster): a relay only tells their profiles; of the other subscribers, their role and key too
         const ex = g.members[id];
-        // roles and keys are the owners' to give (their signed roster): a relay only tells profiles
-        if (ex) ex.profile = memberProfile(mi.profile);
-        else g.members[id] = { memberId: id, role: roleRank(mi.memberRole) >= roleRank('member') ? 'member' : mi.memberRole, profile: memberProfile(mi.profile), category: 'post', status: 'announced', createdAt: Date.now() };
+        if (ex) {
+          if (ex.role === 'relay') return;
+          ex.profile = memberProfile(mi.profile);
+          if (ex.status === 'unknown') ex.status = 'announced';
+          if (!privileged(ex.role) && !privileged(mi.memberRole)) {
+            ex.role = mi.memberRole;
+            ex.key ??= rawMemberKey(mi.memberKey);
+          }
+          return;
+        }
+        if (privileged(mi.memberRole)) {
+          // not in the roster (yet): a subscriber until it is
+          if (msg.event === 'x.grp.mem.intro') g.members[id] = { memberId: id, role: 'observer', profile: memberProfile(mi.profile), category: 'post', status: 'announced', createdAt: Date.now() };
+          return;
+        }
+        g.members[id] = { memberId: id, role: mi.memberRole, profile: memberProfile(mi.profile), category: 'post', status: 'announced', invitedBy: relay.memberId, key: rawMemberKey(mi.memberKey), createdAt: Date.now() };
+        if (msg.event === 'x.grp.mem.new' && g.role === 'owner') g.channel!.subscribers = (g.channel!.subscribers ?? 0) + 1;
         return;
       }
+      case 'x.grp.roster.ack':
+        return this.onRosterAck(g, relay, p);
       case 'x.info':
       case 'x.grp.link.mem':
         if (p.profile) relay.profile = memberProfile(p.profile as Profile);
         return;
       case 'x.grp.leave':
         relay.status = 'left';
+        relay.rosterPending = undefined;
         await this.event(g, `the relay ${memberName(relay)} left the channel`);
+        if (this.isChannelCreator(g)) await this.publishRelays(g).catch((e) => console.warn('the channel link was not updated', e));
         this.later(() => this.dropMember(relay, 0));
         return;
       default:
@@ -834,12 +854,249 @@ export class GroupManager {
     }
   }
 
+  /** a message of the channel or of one of its members, forwarded by a relay */
+  private async onChannelForward(g: Group, relay: GroupMember, pm: ParsedChatMsg): Promise<void> {
+    const msg = pm.msg!;
+    const ts = pm.forward!.brokerTs || Date.now();
+    const authorId = normMemberId(pm.forward!.memberId);
+    if (!authorId) {
+      // sent as the channel, which only owners do (the relay checks it): posts and what changes them
+      if (CHANNEL_CONTENT.has(msg.event) && msg.event !== 'x.msg.react') await this.chat.processContent({ chatId: g.id, group: g }, msg, { brokerTs: ts, forwarded: true });
+      return;
+    }
+    if (authorId === g.memberId) return;
+    let author = g.members[authorId];
+    if (!author) {
+      if (msg.event === 'x.grp.leave') return;
+      author = g.members[authorId] = { memberId: authorId, role: 'observer', profile: { displayName: pm.forward!.memberName || nameFromMemberId(authorId), fullName: '' }, category: 'post', status: 'unknown', createdAt: Date.now() };
+    }
+    if (author.role === 'relay' || author.status === 'removed') return;
+    if (!this.channelVerified(g, pm, author)) return void console.warn(`a channel message without a valid signature was ignored: ${msg.event} from ${memberName(author)}`);
+    await this.onMemberEvent(g, relay, author, msg, ts);
+  }
+
+  /**
+   * the signature of a message of a member (withVerifiedMsg of the apps): what changes the channel is signed
+   * with the member's key (owners: from the link; members, moderators and admins: from the roster); from a
+   * member whose key we do not know, a signed message passes only when it needs no signature, or it is a
+   * profile or leaving between subscribers
+   */
+  private channelVerified(g: Group, pm: ParsedChatMsg, m: GroupMember): 'verified' | 'unsigned' | 'nokey' | undefined {
+    const event = pm.msg!.event;
+    const required = CHANNEL_SIGNED.has(event);
+    if (!pm.sig) return required ? undefined : 'unsigned';
+    if (m.key) {
+      if (pm.sig.binding !== 'G') return required ? undefined : 'nokey';
+      const binding = groupBinding(fromB64(g.channel!.publicGroupId), fromB64(m.memberId));
+      return verifySigned(pm.sig, binding, [{ alg: 'ed25519', key: fromB64(m.key) }]) ? 'verified' : undefined;
+    }
+    const betweenSubscribers = (event === 'x.grp.leave' || event === 'x.info') && !isModerator(g.role) && !isModerator(m.role);
+    return !required || betweenSubscribers ? 'nokey' : undefined;
+  }
+
+  private async onMemberEvent(g: Group, relay: GroupMember, author: GroupMember, msg: ChatMessage, ts: number): Promise<void> {
+    const p = msg.params;
+    switch (msg.event) {
+      case 'x.msg.new':
+      case 'x.msg.update':
+        // members post, subscribers do not (memberCanSend); the posts of a blocked member are not shown
+        if (roleRank(author.role) <= roleRank('observer') || p.scope || (author.blocked && msg.event === 'x.msg.new')) return;
+        await this.chat.processContent({ chatId: g.id, group: g, sender: author }, msg, { brokerTs: ts, forwarded: true });
+        return;
+      case 'x.msg.del':
+      case 'x.msg.react':
+      case 'x.msg.file.descr':
+      case 'x.file.cancel':
+        await this.chat.processContent({ chatId: g.id, group: g, sender: author }, msg, { brokerTs: ts, forwarded: true });
+        return;
+      case 'x.info':
+        if (p.profile) author.profile = memberProfile(p.profile as Profile);
+        return;
+      case 'x.grp.mem.role':
+        return this.onChannelRole(g, relay, author, p);
+      case 'x.grp.mem.del':
+        return this.onChannelRemoval(g, relay, author, p);
+      case 'x.grp.mem.restrict': {
+        const t = g.members[normMemberId(p.memberId) ?? ''];
+        if (!t || t.role === 'relay' || roleRank(author.role) < roleRank('moderator') || roleRank(author.role) < roleRank(t.role)) return;
+        t.blocked = p.memberRestrictions?.restriction === 'blocked';
+        if (isModerator(g.role)) await this.event(g, `${memberName(author)} ${t.blocked ? 'blocked' : 'unblocked'} ${memberName(t)}`, author.memberId);
+        return;
+      }
+      case 'x.grp.leave':
+        if (memberGone(author)) return;
+        author.status = 'left';
+        if (g.role === 'owner') g.channel!.subscribers = Math.max(0, (g.channel!.subscribers ?? 1) - 1);
+        // an owner who left is no longer one in the link
+        if (author.role === 'owner' && this.isChannelCreator(g)) await this.setLinkOwner(g, author, false).catch((e) => console.warn('the channel link was not updated', e));
+        if (privileged(author.role)) await this.event(g, `${memberName(author)} (${author.role}) left the channel`, author.memberId);
+        return;
+      case 'x.grp.del':
+        if (author.role !== 'owner') return;
+        g.status = 'deleted';
+        await this.event(g, 'the owner deleted the channel');
+        this.later(() => this.dropConnections(g, 0));
+        return;
+      case 'x.grp.info': {
+        const gp = p.groupProfile as GroupProfile | undefined;
+        if (author.role !== 'owner' || !gp?.displayName || normMemberId((gp.publicGroup as { publicGroupId?: unknown } | undefined)?.publicGroupId) !== g.channel!.publicGroupId) return;
+        g.profile = gp;
+        await this.event(g, 'the channel profile was updated');
+        return;
+      }
+      case 'x.grp.prefs':
+        if (author.role === 'owner' && p.groupPreferences && typeof p.groupPreferences === 'object') g.profile = { ...g.profile, groupPreferences: p.groupPreferences };
+        return;
+      case 'x.grp.roster':
+        return this.onRosterHeader(g, relay, author, msg);
+      default:
+        return;
+    }
+  }
+
+  /**
+   * a change that carries a roster version, from an owner (applyAtRosterVersion): ignored when older than
+   * one we have; when versions were missed, the relay that forwarded it serves us the whole roster
+   */
+  private async rosterGate(g: Group, relay: GroupMember, sender: GroupMember, v: unknown): Promise<boolean> {
+    const ch = g.channel!;
+    if (typeof v !== 'number' || sender.role !== 'owner') return true;
+    if (ch.rosterVersion !== undefined && v < ch.rosterVersion) return false;
+    ch.rosterVersion = v;
+    const next = (ch.rosterComplete ?? -1) + 1;
+    if (v === next) ch.rosterComplete = v;
+    else if (v > next && (relay.v?.max ?? 0) >= GROUP_ROSTER_VERSION) await this.sendChannel(g, xGrpRosterRequest(ch.rosterComplete), [relay], false);
+    return true;
+  }
+
+  /** members, moderators and admins are in the roster, which has one signer: only owners give or take these roles */
+  private mayChangeRole(sender: GroupMember, from: GroupMemberRole, to: GroupMemberRole): boolean {
+    if (roleRank(sender.role) < roleRank(roleToChange(from, to))) return false;
+    return !((isRosterRole(from) || isRosterRole(to)) && sender.role !== 'owner');
+  }
+
+  /** a role change (x.grp.mem.role, signed): with roster roles and owners, the owner sends the member's key */
+  private async onChannelRole(g: Group, relay: GroupMember, sender: GroupMember, p: Record<string, any>): Promise<void> {
+    const id = normMemberId(p.memberId);
+    const role = p.role as GroupMemberRole;
+    if (!id || typeof role !== 'string' || role === 'relay') return;
+    if (!(await this.rosterGate(g, relay, sender, p.rosterVersion))) return;
+    if (id === g.memberId) {
+      if (g.role === role || !this.mayChangeRole(sender, g.role, role)) return;
+      g.role = role;
+      await this.event(g, `${memberName(sender)} changed your role to ${role}`, sender.memberId);
+      return;
+    }
+    const key = typeof p.memberKey === 'string' ? rawMemberKey(p.memberKey) : undefined;
+    // a member named with its key by an owner is created, and its key pinned on first use (TOFU): an owner
+    // authorises new owners, as in the link
+    const named = sender.role === 'owner' && privileged(role) && !!key;
+    let m = g.members[id];
+    if (!m) {
+      if (!named) return;
+      m = g.members[id] = { memberId: id, role: 'observer', profile: { displayName: nameFromMemberId(id), fullName: '' }, category: 'post', status: 'unknown', createdAt: Date.now() };
+    }
+    if (m.role === 'relay' || !this.mayChangeRole(sender, m.role, role)) return;
+    if (key && m.key && m.key !== key) return void console.warn('x.grp.mem.role: a different key of a known member was ignored');
+    if (named) m.key ??= key;
+    m.role = role;
+  }
+
+  /** a removal (x.grp.mem.del, signed): by admins, of members whose role is not higher */
+  private async onChannelRemoval(g: Group, relay: GroupMember, sender: GroupMember, p: Record<string, any>): Promise<void> {
+    const id = normMemberId(p.memberId);
+    if (!id || !(await this.rosterGate(g, relay, sender, p.rosterVersion))) return;
+    if (id === g.memberId) {
+      if (roleRank(sender.role) < roleRank('admin') || roleRank(sender.role) < roleRank(g.role)) return;
+      g.status = 'removed';
+      await this.event(g, 'you were removed from the channel');
+      this.later(() => this.dropConnections(g, 0));
+      return;
+    }
+    const m = g.members[id];
+    if (!m || memberGone(m) || m.role === 'relay' || roleRank(sender.role) < roleRank('admin') || roleRank(sender.role) < roleRank(m.role)) return;
+    m.status = 'removed';
+    if (g.role === 'owner') g.channel!.subscribers = Math.max(0, (g.channel!.subscribers ?? 1) - 1);
+    if (isModerator(g.role)) await this.event(g, `${memberName(sender)} removed ${memberName(m)}`, sender.memberId);
+  }
+
+  /** the roster an owner signed, forwarded by a relay: its blob follows in chunks from the relay */
+  private async onRosterHeader(g: Group, relay: GroupMember, owner: GroupMember, msg: ChatMessage): Promise<void> {
+    const ch = g.channel!;
+    const { version, fileInv } = msg.params as { version?: unknown; fileInv?: { fileSize?: unknown; fileDigest?: unknown } };
+    if (owner.role !== 'owner' || this.isChannelCreator(g) || !msg.msgId) return;
+    if (typeof version !== 'number' || typeof fileInv?.fileSize !== 'number' || typeof fileInv.fileDigest !== 'string' || fileInv.fileSize > MAX_ROSTER_BYTES) return;
+    // not older than the roster we have, nor than the one this relay is sending (a newer one replaces it)
+    if (ch.rosterVersion !== undefined && version < ch.rosterVersion) return;
+    const cur = ch.rosterTransfers?.[relay.memberId];
+    if (cur && version < cur.version) return;
+    (ch.rosterTransfers ??= {})[relay.memberId] = { ref: b64url(fromB64(msg.msgId)), version, size: fileInv.fileSize, digest: b64url(fromB64(fileInv.fileDigest)), owner: owner.memberId, chunks: 0, data: '' };
+  }
+
+  private async onRosterChunk(g: Group, relay: GroupMember, chunk: NonNullable<ParsedChatMsg['chunk']>): Promise<void> {
+    const ch = g.channel!;
+    const t = ch.rosterTransfers?.[relay.memberId];
+    if (!t || t.ref !== chunk.ref) return;
+    // a roster served again starts from its first chunk
+    if (chunk.chunkNo === 1) {
+      t.chunks = 0;
+      t.data = '';
+    } else if (chunk.chunkNo !== t.chunks + 1) return;
+    const data = concat(fromB64(t.data), chunk.data);
+    if (data.length < t.size && chunk.data.length === ROSTER_CHUNK_SIZE) {
+      t.chunks++;
+      t.data = b64(data);
+      return;
+    }
+    delete ch.rosterTransfers![relay.memberId];
+    if (data.length !== t.size || b64url(sha512(data)) !== t.digest) return void console.warn('a roster that is not as its owner signed it was ignored');
+    let entries: RosterEntry[];
+    try {
+      entries = validRoster(parseRoster(data));
+    } catch (e) {
+      return void console.warn('a roster that cannot be read was ignored', e);
+    }
+    // a roster from another relay, or a change, may have brought a newer version meanwhile
+    if (ch.rosterVersion !== undefined && t.version < ch.rosterVersion) return;
+    await this.applyRoster(g, entries, t.version);
+  }
+
+  /**
+   * a complete roster (processRosterEntries): the members it names get their roles, and their keys if we
+   * had none (a different key is not taken); members it no longer names are subscribers again
+   */
+  private async applyRoster(g: Group, entries: RosterEntry[], version: number): Promise<void> {
+    const ch = g.channel!;
+    const named = new Set(entries.map((e) => e.memberId));
+    for (const e of entries) {
+      if (e.memberId === g.memberId) {
+        if (e.key === ch.memberKey.pub && g.role !== e.role && g.role !== 'owner') {
+          g.role = e.role;
+          await this.event(g, `your role in the channel is now ${e.role}`);
+        }
+        continue;
+      }
+      let m = g.members[e.memberId];
+      if (m && (m.role === 'relay' || m.role === 'owner')) continue;
+      m ??= g.members[e.memberId] = { memberId: e.memberId, role: 'observer', profile: { displayName: nameFromMemberId(e.memberId), fullName: '' }, category: 'post', status: 'unknown', createdAt: Date.now() };
+      if (m.key && m.key !== e.key) {
+        console.warn('roster: a different key of a known member was ignored');
+        continue;
+      }
+      m.key = e.key;
+      m.role = e.role;
+    }
+    for (const m of this.members(g)) if (isRosterRole(m.role) && !named.has(m.memberId)) m.role = 'observer';
+    ch.rosterVersion = version;
+    ch.rosterComplete = version;
+  }
+
   // ---- channels (as the owner)
 
   /**
    * creates a channel (APINewPublicGroup of the apps): its ID is the hash of a new root key, which
    * authorises our member key as the owner's in the link. The relays are invited; each serves the
-   * channel once it accepts and is in the link
+   * channel once it accepts, has the roster, and is in the link
    */
   async createChannel(p: { displayName: string; description?: string; image?: string }, relayAddresses: string[], incognito?: Profile): Promise<Group> {
     const displayName = p.displayName.trim();
@@ -913,15 +1170,16 @@ export class GroupManager {
     this.setConn(g, m, connId);
   }
 
-  /** the relays of our channel */
+  /** the relays we invited to our channel: their acceptance, and the roster they confirm before serving */
   private async onOwnedRelayEvent(g: Group, m: GroupMember, e: AgentEvent): Promise<MsgResult | void> {
+    const ok = () => ({ allow: this.chat.encodeInfo({ ...xOk(), v: CHANNEL_CHAT_VERSIONS }, false) });
     switch (e.type) {
       case 'CONF': {
         const msg = this.chat.parseInfo(e.connInfo);
         if (msg?.event === 'x.grp.relay.reject') {
           m.status = 'left';
           await this.event(g, `the relay ${memberName(m)} declined to serve the channel`);
-          return { allow: this.chat.encodeInfo(xOk(), false) };
+          return ok();
         }
         if (msg?.event !== 'x.grp.relay.acpt' || typeof msg.params.relayLink !== 'string') return void console.warn('unexpected confirmation of a relay', msg?.event);
         // the link the relay made for the channel: its entity is the member ID we gave the relay
@@ -934,54 +1192,141 @@ export class GroupManager {
         m.key = b64url(rl.linkData.fixed.rootKey.key);
         m.status = 'accepted';
         await this.save(g);
-        return { allow: this.chat.encodeInfo(xOk(), false) };
+        return ok();
       }
-      case 'CON':
+      case 'CON': {
         m.status = 'connected';
         this.sendPending(m);
+        // a relay that takes rosters serves the channel once it has ours (so that nobody joins it as a
+        // moderator meanwhile): the link lists it when it confirms
+        if ((m.v?.max ?? 0) >= GROUP_ROSTER_VERSION) {
+          const ch = g.channel!;
+          ch.rosterVersion ??= 0;
+          m.rosterPending = ch.rosterVersion;
+          await this.save(g);
+          await this.sendRoster(g, [m], ch.rosterVersion, false);
+          return;
+        }
         await this.save(g);
         await this.publishRelays(g);
         await this.event(g, `the relay ${memberName(m)} serves the channel`);
         return;
-      case 'MSG': {
-        for (const pm of parseChatMessages(e.body)) {
-          const msg = pm.msg;
-          if (!msg) continue;
-          if (DEBUG) console.log(`[channel ${groupName(g)}] from relay ${memberName(m)}: ${pm.forward ? 'forwarded ' : ''}${msg.event}`, JSON.stringify(msg.params).slice(0, 200));
-          // the relays tell the owners who subscribed, and who left
-          if (msg.event === 'x.grp.mem.new' && !pm.forward) {
-            const mi = msg.params.memberInfo as MemberInfo | undefined;
-            const id = normMemberId(mi?.memberId);
-            if (mi?.profile && id && id !== g.memberId && !g.members[id]) {
-              g.members[id] = { memberId: id, role: mi.memberRole, profile: memberProfile(mi.profile), category: 'post', status: 'announced', invitedBy: m.memberId, createdAt: Date.now() };
-              g.channel!.subscribers = (g.channel!.subscribers ?? 0) + 1;
-            }
-          } else if (msg.event === 'x.grp.leave' && pm.forward) {
-            const s = g.members[normMemberId(pm.forward.memberId) ?? ''];
-            if (s && !memberGone(s) && s.role !== 'relay') {
-              s.status = 'left';
-              g.channel!.subscribers = Math.max(0, (g.channel!.subscribers ?? 1) - 1);
-            }
-          } else if (msg.event === 'x.grp.leave' && !pm.forward) {
-            m.status = 'left';
-            await this.event(g, `the relay ${memberName(m)} left the channel`);
-            await this.publishRelays(g);
-          }
-        }
-        await this.save(g);
-        return {};
       }
       default:
         return;
     }
   }
 
+  /** a relay confirms the roster (x.grp.roster.ack): once it has the current one, the link lists it */
+  private async onRosterAck(g: Group, relay: GroupMember, p: Record<string, any>): Promise<void> {
+    if (relay.category !== 'invitee' || relay.rosterPending === undefined) return;
+    if (typeof p.error === 'string') {
+      relay.rosterPending = undefined;
+      relay.status = 'left';
+      await this.event(g, `the relay ${memberName(relay)} could not take the roster of the channel: ${p.error}`);
+      return;
+    }
+    // a newer roster is on its way to it
+    if (p.version !== g.channel!.rosterVersion) return;
+    relay.rosterPending = undefined;
+    await this.publishRelays(g);
+    await this.event(g, `the relay ${memberName(relay)} serves the channel`);
+  }
+
+  /** the user data of the channel link: its profile, and the number of subscribers */
+  private channelLinkData(g: Group): Bytes {
+    return channelShortLinkData(g.profile, Math.max(1, g.channel!.subscribers ?? 1));
+  }
+
   /** the link of our channel lists the relays that serve it: subscribers connect to them */
   private async publishRelays(g: Group): Promise<void> {
     const links = this.relays(g)
-      .filter((r) => r.relayLink && r.status === 'connected')
+      .filter((r) => r.relayLink && r.status === 'connected' && r.rosterPending === undefined)
       .map((r) => parseShortLink(r.relayLink!));
-    await this.chat.agent.updateLinkData(g.channel!.linkConnId!, channelShortLinkData(g.profile, Math.max(1, g.channel!.subscribers ?? 1)), links);
+    await this.chat.agent.updateLinkData(g.channel!.linkConnId!, this.channelLinkData(g), { relays: links });
+  }
+
+  /** the members, moderators and admins, with their keys (buildGroupRoster): the owners are in the link */
+  private rosterEntries(g: Group): RosterEntry[] {
+    return this.currentMembers(g)
+      .filter((m) => isRosterRole(m.role) && m.key)
+      .map((m) => ({ memberId: m.memberId, key: m.key!, role: m.role }));
+  }
+
+  /** the roster, signed, and its blob, to these relays (sendRoster of the apps); in one chunk */
+  private async sendRoster(g: Group, relays: GroupMember[], version: number, wait = true): Promise<void> {
+    const blob = encodeRoster(this.rosterEntries(g));
+    const msgId = newSharedMsgId();
+    await this.sendChannel(g, xGrpRoster(version, blob, msgId), relays, wait);
+    const chunk = fileChunkElement(msgId, 1, blob);
+    for (const r of relays) if (r.connId && r.status === 'connected') await this.deliver(r.connId, chunk, false, wait).catch((e) => console.warn('a roster was not sent', e));
+  }
+
+  /** the next roster version, for a change of the roster, which the relays get first (broadcastRoster) */
+  private async nextRoster(g: Group): Promise<number> {
+    const ch = g.channel!;
+    const v = (ch.rosterVersion ?? -1) + 1;
+    ch.rosterVersion = v;
+    await this.save(g);
+    await this.sendRoster(g, this.relays(g), v);
+    return v;
+  }
+
+  /**
+   * the owners are in the channel link, each authorised by an owner before it or by the root key of the
+   * link (validateLinkOwners): a new owner, by our key
+   */
+  private async setLinkOwner(g: Group, m: GroupMember, add: boolean): Promise<void> {
+    const ch = g.channel!;
+    const owners = this.chat.agent.linkOwners(ch.linkConnId!).filter((o) => b64url(o.ownerId) !== m.memberId);
+    if (add) {
+      const ownerId = fromB64(m.memberId);
+      const ownerKey: PublicKey<'ed25519'> = { alg: 'ed25519', key: fromB64(m.key!) };
+      owners.push({ ownerId, ownerKey, sig: sign({ alg: 'ed25519', key: fromB64(ch.memberKey.priv) }, concat(ownerId, encodePubKey(ownerKey))) });
+    }
+    await this.chat.agent.updateLinkData(ch.linkConnId!, this.channelLinkData(g), { owners });
+  }
+
+  /**
+   * a role in a channel (APIMembersRole): members, moderators and admins are in the roster, which the
+   * relays get at its next version before the change; owners are in the link too. These are for the
+   * owner who made the channel to give; moderators and admins change only the roles below them
+   */
+  private async setChannelRole(g: Group, m: GroupMember, role: GroupMemberRole): Promise<void> {
+    if (m.role === 'relay' || role === 'relay') throw new ChatError('the role of a relay cannot be changed');
+    if (m.role === role) return;
+    if ((privileged(role) || privileged(m.role)) && !this.isChannelCreator(g)) throw new ChatError('only the owner who made the channel gives the roles of members, moderators, admins and owners');
+    if (g.status !== 'active' || roleRank(g.role) < roleRank(roleToChange(m.role, role))) throw new ChatError(`you cannot change this role to ${role}`);
+    if (privileged(role) && !m.key) throw new ChatError('the key of this subscriber is not known yet: it comes from the relays when they announce the subscriber');
+    const from = m.role;
+    const rosterChange = isRosterRole(role) || isRosterRole(from);
+    m.role = role;
+    try {
+      if (rosterChange && encodeRoster(this.rosterEntries(g)).length > MAX_SENT_ROSTER_BYTES) throw new ChatError('a channel has at most about 200 members, moderators and admins');
+      if (role === 'owner' || from === 'owner') await this.setLinkOwner(g, m, role === 'owner');
+    } catch (e) {
+      m.role = from;
+      throw e;
+    }
+    const v = rosterChange ? await this.nextRoster(g) : undefined;
+    const memberKey = m.key && (v !== undefined || role === 'owner') ? x509Key(m.key) : undefined;
+    await this.sendChannel(g, xGrpMemRole(m.memberId, role, newSharedMsgId(), { memberKey, rosterVersion: v }));
+    await this.save(g);
+    await this.event(g, `you changed the role of ${memberName(m)} to ${role}`, m.memberId);
+  }
+
+  /** removing a subscriber (admins), or a member, moderator, admin or owner (the owner who made the channel) */
+  private async removeChannelMember(g: Group, m: GroupMember): Promise<void> {
+    if (m.role === 'relay') throw new ChatError('relays are not removed this way');
+    if (privileged(m.role) && !this.isChannelCreator(g)) throw new ChatError('only the owner who made the channel removes its members, moderators, admins and owners');
+    if (g.status !== 'active' || roleRank(g.role) < roleRank('admin') || roleRank(m.role) > roleRank(g.role)) throw new ChatError('you cannot remove this member');
+    if (m.role === 'owner') await this.setLinkOwner(g, m, false);
+    m.status = 'removed';
+    const v = isRosterRole(m.role) ? await this.nextRoster(g) : undefined;
+    await this.sendChannel(g, xGrpMemDel(m.memberId, newSharedMsgId(), false, v));
+    if (g.role === 'owner') g.channel!.subscribers = Math.max(0, (g.channel!.subscribers ?? 1) - 1);
+    await this.save(g);
+    await this.event(g, `you removed ${memberName(m)}`, m.memberId);
   }
 
   // ---- group links (as an admin)
@@ -1609,8 +1954,9 @@ export class GroupManager {
 
   async removeMember(groupId: string, memberId: string): Promise<void> {
     const g = this.must(groupId);
-    this.assertAdmin(g);
     const m = g.members[memberId];
+    if (g.channel && m && !memberGone(m)) return this.removeChannelMember(g, m);
+    this.assertAdmin(g);
     if (!m || memberGone(m)) return;
     if (roleRank(m.role) > roleRank(g.role)) throw new ChatError('you cannot remove a member with a higher role');
     // to all members, the removed one too
@@ -1660,9 +2006,10 @@ export class GroupManager {
 
   async setRole(groupId: string, memberId: string, role: GroupMemberRole): Promise<void> {
     const g = this.must(groupId);
-    this.assertAdmin(g);
     const m = g.members[memberId];
     if (!m || memberGone(m)) throw new ChatError('the member was not found');
+    if (g.channel) return this.setChannelRole(g, m, role);
+    this.assertAdmin(g);
     if (roleRank(role) < 0 || roleRank(role) > roleRank(g.role) || roleRank(m.role) > roleRank(g.role)) throw new ChatError(`you cannot change this role to ${role}`);
     await this.send(g, xGrpMemRole(memberId, role, newSharedMsgId()));
     m.role = role;
@@ -1670,9 +2017,23 @@ export class GroupManager {
     await this.event(g, `you changed the role of ${memberName(m)} to ${role}`, memberId);
   }
 
+  /** a moderator blocks the messages of a member for everyone (APIBlockMembersForAll), or unblocks them */
+  async blockMember(groupId: string, memberId: string, blocked: boolean): Promise<void> {
+    const g = this.must(groupId);
+    const m = g.members[memberId];
+    if (!m || memberGone(m) || m.role === 'relay') throw new ChatError('the member was not found');
+    if (g.status !== 'active' || !isModerator(g.role) || roleRank(m.role) > roleRank(g.role)) throw new ChatError(`you cannot ${blocked ? 'block' : 'unblock'} this member`);
+    await this.send(g, xGrpMemRestrict(memberId, blocked, newSharedMsgId()), memberId);
+    m.blocked = blocked;
+    await this.save(g);
+    await this.event(g, `you ${blocked ? 'blocked' : 'unblocked'} ${memberName(m)}`, memberId);
+  }
+
   async updateProfile(groupId: string, patch: Partial<Pick<GroupProfile, 'displayName' | 'fullName' | 'description' | 'image' | 'groupPreferences' | 'memberAdmission'>>): Promise<void> {
     const g = this.must(groupId);
     if (g.status !== 'active' || g.role !== 'owner') throw new ChatError('only group owners can change the group profile');
+    // the profile is in the channel link too, which only its maker updates (and the apps check the other owners' signatures only with keys from the link)
+    if (g.channel && !this.isChannelCreator(g)) throw new ChatError('only the owner who made the channel changes its profile');
     const profile: GroupProfile = { ...g.profile, ...patch };
     for (const k of Object.keys(patch) as Array<keyof typeof patch>) if (patch[k] === undefined || patch[k] === '') delete profile[k];
     if (!profile.displayName?.trim()) throw new ChatError('the group needs a name');
@@ -1687,7 +2048,7 @@ export class GroupManager {
   async delete(groupId: string, forEveryone = true): Promise<void> {
     const g = this.groups[groupId];
     if (!g) return;
-    if (forEveryone && g.status === 'active' && g.role === 'owner') await this.send(g, xGrpDel(newSharedMsgId())).catch(() => 0);
+    if (forEveryone && g.status === 'active' && g.role === 'owner' && (!g.channel || this.isChannelCreator(g))) await this.send(g, xGrpDel(newSharedMsgId())).catch(() => 0);
     else if (groupActive(g)) await this.send(g, xGrpLeave(newSharedMsgId())).catch(() => 0);
     await this.remove(g);
   }

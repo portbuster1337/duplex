@@ -466,11 +466,21 @@ test('the browser subscribes to a channel of the CLI, served by a CLI chat relay
     }
     assert.equal(joined?.type, 'startedConnectionToGroup', JSON.stringify(joined).slice(0, 300));
     const text = (e: any) => e?.chatItems?.[0]?.chatItem?.content?.msgContent?.text;
-    await cli.waitType('newChatItems', NET, (e) => text(e) === 'Hello from the browser channel');
+    const first = await cli.waitType('newChatItems', NET, (e) => text(e) === 'Hello from the browser channel');
     await page.locator('.composer textarea').fill('A second post');
     await page.keyboard.press('Enter');
     await cli.waitType('newChatItems', NET, (e) => text(e) === 'A second post');
     await shot('20-own-channel');
+    // the browser makes the CLI user a moderator, in the roster it signs; the moderator posts under its name
+    await page.getByLabel('Channel info').click();
+    await page.getByLabel(`Manage ${PEER}`).click({ timeout: NET });
+    await page.locator('.member-actions select').selectOption('moderator');
+    await cli.waitType('memberRole', NET, (e) => e.toRole === 'moderator');
+    await page.locator('.member', { hasText: PEER }).locator('.role', { hasText: 'moderator' }).waitFor();
+    await shot('21-channel-roles');
+    await page.getByLabel('Close').click();
+    await cli.cmd(`/_send #${first.chatItems[0].chatInfo.groupInfo.groupId} text A word from the moderator`);
+    await page.locator('.msg.rcv.in-group', { hasText: 'A word from the moderator' }).waitFor({ timeout: NET });
   } finally {
     relay.stop();
   }

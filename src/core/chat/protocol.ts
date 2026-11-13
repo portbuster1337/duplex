@@ -128,6 +128,8 @@ export interface ParsedChatMsg {
   sig?: { binding: string; sigs: Bytes[]; body: Bytes };
   /** forwarded by a group member or channel relay: the original sender, and when the router got it (ms) */
   forward?: { memberId?: string; memberName?: string; brokerTs: number };
+  /** a chunk of an inline file (BFileChunk): the ID of the file's message, and the chunk number */
+  chunk?: { ref: string; chunkNo: number; data: Bytes };
 }
 
 /** the binding of a message signed by a member of a channel (CBGroup): the channel ID and the member ID */
@@ -140,6 +142,19 @@ export const channelBinding = (publicGroupId: Bytes): Bytes => new Encoder().cha
 export function signedElement(binding: Bytes, priv: PrivateKey<'ed25519'>, body: Bytes): Bytes {
   const sig = sign(priv, new Encoder().raw(binding).raw(body).finish());
   return new Encoder().char('/').byte(binding[0]).byte(1).char('M').bytes(sig).raw(body).finish();
+}
+
+/**
+ * the chat versions Duplex uses with the relays of channels: up to the owner-signed roster
+ * (groupRosterVersion), which the relays serve only from this version
+ */
+export const CHANNEL_CHAT_VERSIONS: VersionRange = { min: 1, max: 19 };
+export const GROUP_ROSTER_VERSION = 19;
+
+/** a chunk of an inline file (BFileChunk), e.g. of a channel roster: 'F', no message ID of its own, the ID of the file's message, the chunk */
+export function fileChunkElement(ref: string, chunkNo: number, data: Bytes): Bytes {
+  if (chunkNo < 1 || chunkNo > 255) throw new Error('bad chunk number');
+  return new Encoder().char('F').bytes(new Uint8Array(0)).bytes(fromB64(ref)).byte(chunkNo).raw(data).finish();
 }
 
 /** all signatures of a signed element are by one of these keys, over this binding */
@@ -184,6 +199,18 @@ function parseElement(b: Bytes, fwd?: ParsedChatMsg['forward']): ParsedChatMsg {
       return parseElement(d.rest(), f);
     } catch (e) {
       return { error: `bad forward element: ${(e as Error).message}` };
+    }
+  }
+  if (c === 'F') {
+    // AppMessageBinary: 'F', the message ID, then BFileChunk: the file's message ID, the chunk number (a byte), the chunk
+    try {
+      const d = new Decoder(b.subarray(1));
+      d.bytes();
+      const ref = b64url(d.bytes());
+      const chunkNo = d.byte();
+      return { chunk: { ref, chunkNo, data: d.rest() }, forward: fwd };
+    } catch (e) {
+      return { error: `bad file chunk: ${(e as Error).message}` };
     }
   }
   return { error: `unsupported element prefix ${c}` };

@@ -824,6 +824,14 @@ export class ChatClient {
       await this.updateItem(contactId, item);
       return;
     }
+    // a post of a channel, sent as the channel by another owner: owners delete them too
+    if (forEveryone && g?.channel && g.role === 'owner' && g.status === 'active' && item.dir === 'rcv' && !item.memberId && item.sharedMsgId && !item.deleted) {
+      await this.sendToChat(contactId, xMsgDel(newSharedMsgId(), item.sharedMsgId));
+      await this.dropFile(item, false);
+      Object.assign(item, { deleted: true, content: { type: 'text', text: '' }, file: undefined });
+      await this.updateItem(contactId, item);
+      return;
+    }
     if (forEveryone && item.dir === 'snd' && item.sharedMsgId && !item.deleted) {
       // posts of a channel are the channel's
       await this.sendToChat(contactId, xMsgDel(newSharedMsgId(), item.sharedMsgId, g && !g.channel ? g.memberId : undefined));
@@ -845,8 +853,11 @@ export class ChatClient {
 
   /** whether we can delete this member's message for everyone */
   canModerate(g: Group, item: ChatItem): boolean {
+    if (g.status !== 'active' || roleRank(g.role) < roleRank('moderator')) return false;
+    // the posts sent as a channel: its owners delete them
+    if (g.channel && !item.memberId) return g.role === 'owner';
     const author = item.memberId ? g.members[item.memberId] : undefined;
-    return g.status === 'active' && roleRank(g.role) >= roleRank('moderator') && (!author || roleRank(author.role) <= roleRank(g.role));
+    return !author || roleRank(author.role) <= roleRank(g.role);
   }
 
   async react(contactId: string, itemId: string, emoji: string, add: boolean): Promise<void> {

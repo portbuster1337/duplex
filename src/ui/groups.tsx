@@ -5,7 +5,7 @@ import { useState } from 'preact/hooks';
 import type { Session } from '../app/session';
 import { profileName, type Contact } from '../app/chat';
 import { groupActive, groupName, HISTORY_ITEMS, isModerator, memberGone, memberName, reviewsMembers, supportChatId, type Group, type GroupMember } from '../app/groups';
-import { groupPrefOn, roleRank, type GroupMemberRole } from '../core/chat/groups';
+import { groupPrefOn, isRosterRole, roleRank, type GroupMemberRole } from '../core/chat/groups';
 import type { Profile } from '../core/chat/protocol';
 import { PRESET_CHAT_RELAYS } from '../core/agent/presets';
 import { Avatar, resizeImage } from './util';
@@ -15,6 +15,10 @@ import { LinkShare } from './newchat';
 import { useChatUpdates } from './layout';
 
 const MEMBER_ROLES: GroupMemberRole[] = ['observer', 'member', 'moderator', 'admin', 'owner'];
+/** in channels: subscribers (observers), and the roles the owners give */
+const CHANNEL_ROLES: GroupMemberRole[] = ['observer', 'member', 'moderator', 'admin', 'owner'];
+const channelRoleName = (r: GroupMemberRole): string => (r === 'observer' ? 'subscriber' : r);
+const privilegedRole = (r: GroupMemberRole): boolean => isRosterRole(r) || r === 'owner';
 
 const STATUS_TEXT: Record<string, string> = {
   invited: 'invited',
@@ -169,9 +173,16 @@ function ChannelInfo({ session, group, onClose, onDeleted }: { session: Session;
   const [busy, setBusy] = useState(false);
   const [editing, setEditing] = useState(false);
   const owner = g.role === 'owner' && g.status === 'active';
+  // the owner who made the channel: its link, profile, roster and owners are theirs to change
+  const creator = owner && chat.groups.isChannelCreator(g);
   const relays = chat.groups.members(g).filter((m) => m.role === 'relay');
-  const owners = [...(owner ? [chat.groups.ourProfile(g).displayName + ' (you)'] : []), ...chat.groups.members(g).filter((m) => m.role === 'owner').map((m) => memberName(m))];
-  const relayState = (m: GroupMember) => (memberGone(m) ? 'left' : m.status === 'connected' ? (owner ? 'serving' : 'connected') : m.status === 'invited' ? 'invited' : 'connecting…');
+  const relayState = (m: GroupMember) =>
+    memberGone(m) ? 'left' : m.status === 'connected' ? (m.rosterPending !== undefined ? 'confirming the roster…' : owner ? 'serving' : 'connected') : m.status === 'invited' ? 'invited' : 'connecting…';
+  // subscribers know the owners, admins, moderators and members; moderators know the subscribers too
+  const members = chat.groups
+    .members(g)
+    .filter((m) => m.role !== 'relay' && (privilegedRole(m.role) || isModerator(g.role)) && (!memberGone(m) || isModerator(g.role)))
+    .sort((a, b) => Number(memberGone(a)) - Number(memberGone(b)) || roleRank(b.role) - roleRank(a.role) || memberName(a).localeCompare(memberName(b)));
   const run = async (f: () => Promise<void>, done?: () => void) => {
     setBusy(true);
     try {
@@ -192,19 +203,37 @@ function ChannelInfo({ session, group, onClose, onDeleted }: { session: Session;
         {g.profile.fullName && <p class="muted">{g.profile.fullName}</p>}
         {g.profile.description && <p class="welcome">{g.profile.description}</p>}
       </div>
-      {owner && !editing && <button onClick={() => setEditing(true)}>Edit channel profile</button>}
+      {creator && !editing && <button onClick={() => setEditing(true)}>Edit channel profile</button>}
       {editing && <EditGroup session={session} g={g} onDone={() => setEditing(false)} />}
       <div class="kv">
         <span>Subscribers</span>
         <span>{g.channel!.subscribers ?? 'unknown'}</span>
         <span>Your role</span>
-        <span>{g.role}</span>
-        <span>Owners</span>
-        <span>{owners.join(', ') || 'unknown'}</span>
+        <span>{channelRoleName(g.role)}</span>
         <span>Relays</span>
         <span>{relays.map((m) => `${memberName(m)} (${relayState(m)})`).join(', ') || 'none'}</span>
       </div>
       <p class="hint">The posts come through the chat relays of the channel, which forward them to each subscriber; what changes the channel is signed by its owners, so a relay cannot change it. The relays and the owners see the profile you joined with, other subscribers do not.</p>
+      <h4 class="members-head">
+        Owners and members <span class="muted">{members.filter((m) => !memberGone(m)).length + 1}</span>
+      </h4>
+      <ul class="members">
+        <li class="member">
+          <Avatar profile={chat.groups.ourProfile(g)} size={32} />
+          <span class="member-name">
+            {profileName(chat.groups.ourProfile(g))} <span class="muted">(you)</span>
+          </span>
+          <span class="role">{channelRoleName(g.role)}</span>
+        </li>
+        {members.map((m) => (
+          <ChannelMemberRow key={m.memberId} session={session} g={g} m={m} />
+        ))}
+      </ul>
+      <p class="hint">
+        {creator
+          ? 'Members post under their own name, moderators delete their posts and block them, admins remove subscribers, and owners post as the channel. The roles are in a roster you sign, which the relays give to each subscriber; the owners are in the channel link.'
+          : 'The owners give these roles: members post under their own name, moderators delete their posts and block them, admins remove subscribers, and owners post as the channel.'}
+      </p>
       <h4 class="members-head">Channel link</h4>
       <LinkShare link={g.channel!.link} note="Anyone with this link can subscribe." />
       <label>
@@ -220,7 +249,7 @@ function ChannelInfo({ session, group, onClose, onDeleted }: { session: Session;
       )}
       <div class="row">
         <button onClick={() => chat.clearChat(g.id)}>Clear chat</button>
-        {groupActive(g) && !owner && !confirm && (
+        {groupActive(g) && !creator && !confirm && (
           <button class="danger" onClick={() => setConfirm('leave')}>
             Leave channel
           </button>
@@ -236,7 +265,7 @@ function ChannelInfo({ session, group, onClose, onDeleted }: { session: Session;
           <p>
             {confirm === 'leave'
               ? 'You will stop receiving the posts of this channel. They stay until you delete the chat.'
-              : owner
+              : creator
                 ? 'The channel is deleted for all subscribers, and its posts from this browser.'
                 : 'The channel and its posts are deleted from this browser.'}
           </p>
@@ -263,6 +292,68 @@ function ChannelInfo({ session, group, onClose, onDeleted }: { session: Session;
         </div>
       )}
     </Modal>
+  );
+}
+
+/** a member of a channel: its role, and what we may do (by our role) */
+function ChannelMemberRow({ session, g, m }: { session: Session; g: Group; m: GroupMember }): JSX.Element {
+  const groups = session.chat.groups;
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const active = g.status === 'active' && !memberGone(m);
+  const creator = groups.isChannelCreator(g);
+  const notAbove = roleRank(m.role) <= roleRank(g.role);
+  const canRole = active && creator;
+  const canBlock = active && isModerator(g.role) && notAbove;
+  const canRemove = active && roleRank(g.role) >= roleRank('admin') && notAbove && (creator || !privilegedRole(m.role));
+  const run = async (f: () => Promise<void>) => {
+    setBusy(true);
+    try {
+      await f();
+    } catch (e) {
+      toast(errorText(e), 'error');
+    }
+    setBusy(false);
+  };
+  return (
+    <li class={`member ${memberGone(m) ? 'gone' : ''}`}>
+      <Avatar profile={m.profile} size={32} />
+      <span class="member-name">
+        {memberName(m)}
+        {memberGone(m) && <span class="muted small"> · {m.status}</span>}
+        {m.blocked && <span class="muted small"> · blocked</span>}
+      </span>
+      <span class="role">{channelRoleName(m.role)}</span>
+      {(canRole || canBlock || canRemove) && (
+        <button class="icon-btn small" onClick={() => setOpen(!open)} aria-label={`Manage ${memberName(m)}`} title="Manage">
+          <Icon name="more" size={16} />
+        </button>
+      )}
+      {open && (
+        <div class="member-actions">
+          {canRole && (
+            <label>
+              Role
+              <select value={m.role} disabled={busy} onChange={(e) => run(() => groups.setRole(g.id, m.memberId, (e.target as HTMLSelectElement).value))}>
+                {CHANNEL_ROLES.map((r) => (
+                  <option value={r}>{channelRoleName(r)}</option>
+                ))}
+              </select>
+            </label>
+          )}
+          {canBlock && (
+            <button class="small" disabled={busy} onClick={() => run(() => groups.blockMember(g.id, m.memberId, !m.blocked))}>
+              {m.blocked ? 'Unblock' : 'Block for everyone'}
+            </button>
+          )}
+          {canRemove && (
+            <button class="danger small" disabled={busy} onClick={() => run(() => groups.removeMember(g.id, m.memberId))}>
+              Remove from channel
+            </button>
+          )}
+        </div>
+      )}
+    </li>
   );
 }
 

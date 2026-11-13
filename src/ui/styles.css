@@ -1483,9 +1483,14 @@ button.quote:hover:not(:disabled) {
 .member-actions {
   flex-basis: 100%;
   display: flex;
+  flex-wrap: wrap;
   align-items: flex-end;
   gap: 10px;
   padding: 4px 0 4px 42px;
+}
+
+.member-actions select {
+  min-width: 9.5em;
 }
 
 .members-head {

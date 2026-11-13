@@ -811,24 +811,32 @@ export class Agent {
   /**
    * updates the user data (e.g. the profile) stored with the short link of an address, or of a 1-time
    * invitation that was not used yet (the router refuses it once the joining party has the link);
-   * the relays of a channel too
+   * the relays and the owners of a channel too
    */
-  async updateLinkData(connId: string, userData: Bytes, relays?: ShortLink[]): Promise<void> {
+  async updateLinkData(connId: string, userData: Bytes, opts: { relays?: ShortLink[]; owners?: OwnerAuth[] } = {}): Promise<void> {
     await this.withLock(connId, async () => {
       const c = this.mustConn(connId);
       const sl = c.rcv?.shortLink;
       if (!c.rcv || !sl) throw new AgentError('the connection has no short link');
-      if (relays) sl.relays = relays;
       const ld: ConnLinkData =
         c.mode === 'contact'
-          ? { mode: 'contact', agentVersions: AGENT_VERSIONS, data: { direct: sl.direct ?? true, owners: sl.owners ?? [], relays: sl.relays ?? [], userData } }
+          ? { mode: 'contact', agentVersions: AGENT_VERSIONS, data: { direct: sl.direct ?? true, owners: opts.owners ?? sl.owners ?? [], relays: opts.relays ?? sl.relays ?? [], userData } }
           : { mode: 'invitation', agentVersions: AGENT_VERSIONS, userData };
       const lb = encodeLinkData(ld);
       const signed = new Encoder().bytes(sign(sl.rootPriv, lb)).raw(lb).finish();
       const key = c.mode === 'contact' ? contactShortLinkKdf(sl.linkKey).key : invShortLinkKdf(sl.linkKey);
       await this.network.send(c.rcv.server, c.rcv.rcvId, { tag: 'LSET', linkId: sl.linkId, data: { fixedData: sl.encFixedData, userData: encryptUserData(key, signed) } }, c.rcv.rcvPrivKey);
-      if (relays) await this.save(c);
+      if (opts.relays || opts.owners) {
+        if (opts.relays) sl.relays = opts.relays;
+        if (opts.owners) sl.owners = opts.owners;
+        await this.save(c);
+      }
     });
+  }
+
+  /** the owners in the link data of an address (of a channel) */
+  linkOwners(connId: string): OwnerAuth[] {
+    return [...(this.mustConn(connId).rcv?.shortLink?.owners ?? [])];
   }
 
   /** accepts a contact request received via an address: joins the requester's invitation */

@@ -2,8 +2,10 @@
 // via group links, member introductions, roles, leaving, and forwarding between members that are not
 // connected yet. Groups are peer-to-peer: each member has a connection with each other member.
 import { b64, b64url, fromB64, randomBytes, utf8 } from '../util/bytes';
+import { Decoder, Encoder, ParseError } from '../util/encoding';
 import { strVR, type VersionRange } from '../util/version';
 import { zstdCompress } from '../util/zstd';
+import { decodePubKeyOf, encodePubKey, sha512 } from '../crypto/crypto';
 import { CHAT_VERSIONS, type ChatMessage, type MsgContent, type Profile } from './protocol';
 
 /** in the order of the official clients: an unknown role is the lowest */
@@ -13,6 +15,72 @@ export type GroupMemberRole = (typeof ROLES)[number] | (string & {});
 export function roleRank(r: GroupMemberRole | undefined): number {
   return ROLES.indexOf(r as (typeof ROLES)[number]);
 }
+
+/**
+ * the lowest role that may change a role (roleRequiredToChange of the apps): moderators between
+ * observer, author and member; otherwise admins, and no lower than either role
+ */
+export function roleToChange(from: GroupMemberRole, to: GroupMemberRole): GroupMemberRole {
+  if (roleRank(from) <= roleRank('member') && roleRank(to) <= roleRank('member')) return 'moderator';
+  return [from, to].reduce((a, r) => (roleRank(r) > roleRank(a) ? r : a), 'admin' as GroupMemberRole);
+}
+
+// ---- the roster of a channel: the members, moderators and admins, signed by an owner (owners are in the channel link)
+
+/** the roles in a roster (isRosterRole) */
+export const isRosterRole = (r: GroupMemberRole | undefined): boolean => r === 'member' || r === 'moderator' || r === 'admin';
+/** at most this many members, and this many bytes (maxGroupRosterSize, maxGroupRosterBytes) */
+export const MAX_ROSTER_SIZE = 256;
+export const MAX_ROSTER_BYTES = MAX_ROSTER_SIZE * 128;
+/** a roster is sent in chunks of this size, the last one shorter (fileChunkSize of the apps) */
+export const ROSTER_CHUNK_SIZE = 15780;
+/**
+ * the largest roster that is sent: one chunk, in one message (a chunk of ROSTER_CHUNK_SIZE does not fit
+ * in a message of the agent with its header, so neither does a roster in several): about 200 members
+ */
+export const MAX_SENT_ROSTER_BYTES = 15775;
+
+export interface RosterEntry {
+  memberId: string;
+  /** the member key: Ed25519, raw, base64url */
+  key: string;
+  role: GroupMemberRole;
+}
+
+/** the roster blob (encodeRosterBlob): a 2-byte count, then the member ID, key, role and privileges (0) of each */
+export function encodeRoster(entries: RosterEntry[]): Bytes {
+  const e = new Encoder().word16(entries.length);
+  for (const r of entries) e.bytes(fromB64(r.memberId)).bytes(encodePubKey({ alg: 'ed25519', key: fromB64(r.key) })).text(r.role).word16(0);
+  return e.finish();
+}
+
+export function parseRoster(b: Bytes): RosterEntry[] {
+  const d = new Decoder(b);
+  const n = d.word16();
+  if (n > MAX_ROSTER_SIZE) throw new ParseError('roster: too many entries');
+  const entries: RosterEntry[] = [];
+  for (let i = 0; i < n; i++) {
+    const memberId = b64url(d.bytes());
+    const key = b64url(decodePubKeyOf(d.bytes(), 'ed25519').key);
+    const role = d.text();
+    d.word16();
+    entries.push({ memberId, key, role });
+  }
+  d.end();
+  return entries;
+}
+
+/** the roster roles only, each member once (validateGroupRoster) */
+export function validRoster(entries: RosterEntry[]): RosterEntry[] {
+  const seen = new Set<string>();
+  return entries.filter((r) => isRosterRole(r.role) && !seen.has(r.memberId) && !!seen.add(r.memberId));
+}
+
+/** what the owner signs about the roster blob that follows (InlineFileInvitation): its size and SHA-512 */
+export const rosterFileInv = (blob: Bytes): { fileSize: number; fileDigest: string } => ({ fileSize: blob.length, fileDigest: b64url(sha512(blob)) });
+
+export const xGrpRoster = (version: number, blob: Bytes, msgId: string): ChatMessage => ev('x.grp.roster', { version, fileInv: rosterFileInv(blob) }, msgId);
+export const xGrpRosterRequest = (version?: number): ChatMessage => ev('x.grp.roster.request', version !== undefined ? { version } : {});
 
 export interface MemberIdRole {
   memberId: string;
@@ -157,9 +225,13 @@ export const xGrpMemIntro = (mi: MemberInfo, msgId?: string) => ev('x.grp.mem.in
 export const xGrpMemInv = (memberId: string, groupConnReq: string, msgId?: string) => ev('x.grp.mem.inv', { memberId, memberIntro: { groupConnReq } }, msgId);
 export const xGrpMemFwd = (mi: MemberInfo, groupConnReq: string, msgId?: string) => ev('x.grp.mem.fwd', { memberInfo: mi, memberIntro: { groupConnReq } }, msgId);
 export const xGrpMemInfo = (memberId: string, profile: Profile) => ev('x.grp.mem.info', { memberId, profile });
-export const xGrpMemRole = (memberId: string, role: GroupMemberRole, msgId?: string) => ev('x.grp.mem.role', { memberId, role }, msgId);
+/** in channels, the owners send the member's key with roster roles, and the roster version the change makes */
+export const xGrpMemRole = (memberId: string, role: GroupMemberRole, msgId?: string, roster?: { memberKey?: string; rosterVersion?: number }) =>
+  ev('x.grp.mem.role', { memberId, role, ...(roster?.memberKey ? { memberKey: roster.memberKey } : {}), ...(roster?.rosterVersion !== undefined ? { rosterVersion: roster.rosterVersion } : {}) }, msgId);
 export const xGrpMemCon = (memberId: string, msgId?: string) => ev('x.grp.mem.con', { memberId }, msgId);
-export const xGrpMemDel = (memberId: string, msgId?: string, messages = false) => ev('x.grp.mem.del', { memberId, ...(messages ? { messages: true } : {}) }, msgId);
+export const xGrpMemDel = (memberId: string, msgId?: string, messages = false, rosterVersion?: number) =>
+  ev('x.grp.mem.del', { memberId, ...(messages ? { messages: true } : {}), ...(rosterVersion !== undefined ? { rosterVersion } : {}) }, msgId);
+export const xGrpMemRestrict = (memberId: string, blocked: boolean, msgId?: string) => ev('x.grp.mem.restrict', { memberId, memberRestrictions: { restriction: blocked ? 'blocked' : 'unrestricted' } }, msgId);
 export const xGrpLeave = (msgId?: string) => ev('x.grp.leave', {}, msgId);
 export const xGrpDel = (msgId?: string) => ev('x.grp.del', {}, msgId);
 export const xGrpInfo = (groupProfile: GroupProfile, msgId?: string) => ev('x.grp.info', { groupProfile }, msgId);
