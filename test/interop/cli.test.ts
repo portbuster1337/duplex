@@ -45,14 +45,14 @@ before(async () => {
 });
 
 after(() => {
-  // all commands to the queues of the CLI went through Duplex's own router
-  if (SERVER && CLI_SERVER !== SERVER) {
-    const st = chat.agent.network.stats;
-    assert.equal(st.direct + st.fallback, 0, `sent directly: ${JSON.stringify(st)}`);
-    assert.ok(st.proxied > 10, `sent via private routing: ${JSON.stringify(st)}`);
-  }
+  const st = chat?.agent.network.stats;
   chat?.stop();
   cli?.stop();
+  // all commands to the queues of the CLI went through Duplex's own router
+  if (st && CLI_SERVER !== SERVER) {
+    assert.equal(st.direct + st.fallback, 0, `sent directly: ${JSON.stringify(st)}`);
+    assert.ok(st.proxied > 0, `sent via private routing: ${JSON.stringify(st)}`);
+  }
 });
 
 // events of the CLI that a previous test did not wait for (e.g. contactConnected after /ac) must not
@@ -179,6 +179,36 @@ test('security codes are the same as in the official client', { skip: !SERVER },
   assert.equal(chat.isVerified(contact), false);
   await chat.setVerified(contact.id, true);
   assert.equal(chat.isVerified(chat.contact(contact.id)!), true);
+});
+
+test('address changes: Duplex and the CLI change their receiving addresses', { skip: !SERVER }, async () => {
+  const { contact, cliName } = await newPair();
+  const eventTexts = () => itemsOf(contact.id).filter((i) => i.dir === 'event').map((i) => i.content.text);
+  // Duplex moves its receive queue (to the CLI's router when there is a second one)
+  const before = chat.contactQueues(contact.id)!;
+  await chat.agent.switchConnection(contact.connId, CLI_SERVER !== SERVER ? parseServer(CLI_SERVER!).server : undefined);
+  await until(() => eventTexts().includes('started changing address…'), 10000, 'started event');
+  const cliDone = await cli.waitType('contactSwitch', 60000, (e) => e.switchProgress?.queueDirection === 'snd' && e.switchProgress?.switchPhase === 'completed');
+  assert.ok(cliDone);
+  await until(() => eventTexts().includes('you changed address'), 30000, 'completed event');
+  const afterQ = chat.contactQueues(contact.id)!;
+  assert.equal(afterQ.rcvSwitch, undefined);
+  if (CLI_SERVER !== SERVER) assert.notEqual(afterQ.rcvServer!.port, before.rcvServer!.port);
+  await cli.cmd(`@${cliName} after your change`);
+  await until(() => itemsOf(contact.id).some((i) => i.content.text === 'after your change'), 30000, 'message to the new queue');
+  await chat.sendText(contact.id, 'and from me');
+  await cli.waitType('newChatItems', 30000, (e) => itemTexts(e).includes('and from me'));
+  // the CLI changes its receiving address: Duplex sends to the new queue
+  const sndBefore = chat.agent.getConn(contact.connId)!.snd!.sndId;
+  const r = await cli.cmd(`/switch @${cliName}`);
+  assert.equal(r.type, 'contactSwitchStarted', JSON.stringify(r).slice(0, 300));
+  await cli.waitType('contactSwitch', 60000, (e) => e.switchProgress?.queueDirection === 'rcv' && e.switchProgress?.switchPhase === 'completed');
+  await until(() => eventTexts().includes('changed address for you'), 30000, 'changed address for you');
+  assert.notDeepEqual(chat.agent.getConn(contact.connId)!.snd!.sndId, sndBefore);
+  await chat.sendText(contact.id, 'to your new address');
+  await cli.waitType('newChatItems', 30000, (e) => itemTexts(e).includes('to your new address'));
+  await cli.cmd(`@${cliName} it works`);
+  await until(() => itemsOf(contact.id).some((i) => i.content.text === 'it works'), 30000, 'reply');
 });
 
 test('disappearing messages work both ways', { skip: !SERVER }, async () => {

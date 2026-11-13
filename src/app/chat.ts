@@ -1,6 +1,6 @@
 // Chat client: contacts, contact requests and chat items on top of the SMP agent, speaking the
 // SimpleX Chat protocol with the official apps.
-import { Agent, type AgentEvent, type MsgResult } from '../core/agent/agent';
+import { Agent, type AgentEvent, type ConnQueues, type MsgResult } from '../core/agent/agent';
 import type { ProxyFallback, ProxyMode } from '../core/agent/network';
 import type { Connector } from '../core/smp/client';
 import { parseServer, type ProtocolServer, type ServerWithAuth } from '../core/smp/server';
@@ -835,6 +835,27 @@ export class ChatClient {
     return !!c.verifiedCode && c.verifiedCode === this.agent.securityCode(c.connId);
   }
 
+  // ---- address changes
+
+  /** the routers used with a contact and the state of address changes */
+  contactQueues(contactId: string): ConnQueues | undefined {
+    const c = this.state.contacts[contactId];
+    return c ? this.agent.queueInfo(c.connId) : undefined;
+  }
+
+  /** changes the receiving address for a contact (a new queue, preferably on another router) */
+  async switchAddress(contactId: string): Promise<void> {
+    const c = this.activeContact(contactId);
+    await this.agent.switchConnection(c.connId);
+  }
+
+  async abortSwitch(contactId: string): Promise<void> {
+    const c = this.activeContact(contactId);
+    await this.agent.abortSwitch(c.connId);
+    await this.addEvent(c.id, 'stopped changing address');
+    this.emit({ type: 'state' });
+  }
+
   // ---- files
 
   /** whether the contact accepts files and media (the preference in its profile) */
@@ -1311,8 +1332,22 @@ export class ChatClient {
       }
       case 'DELD':
         return;
+      case 'SWITCH': {
+        const c = this.contactByConn(e.connId);
+        if (!c) return;
+        // the texts of the apps
+        if (e.phase === 'started') await this.addEvent(c.id, e.dir === 'rcv' ? 'started changing address…' : 'started changing address for you…');
+        else if (e.phase === 'completed') await this.addEvent(c.id, e.dir === 'rcv' ? 'you changed address' : 'changed address for you');
+        this.emit({ type: 'state' });
+        return;
+      }
       case 'ERR':
         console.warn('agent error', e.connId, e.err);
+        if (e.connId && e.err.startsWith('address change')) {
+          const c = this.contactByConn(e.connId);
+          if (c) await this.addEvent(c.id, `changing address failed: ${e.err.replace(/^address change: /, '')}`);
+          this.emit({ type: 'state' });
+        }
         return;
     }
   }

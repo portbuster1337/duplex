@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { Agent, MemoryAgentStore, type AgentEvent } from '../../src/core/agent/agent';
-import { parseServer } from '../../src/core/smp/server';
+import { parseServer, sameServer } from '../../src/core/smp/server';
 import { fromUtf8, utf8 } from '../../src/core/util/bytes';
 import { tcpConnector } from '../helpers/tcp';
 
@@ -150,6 +150,55 @@ test('private message routing: each agent sends through its own router to the ot
     assert.equal(fromUtf8((await bob.wait('MSG')).body), 'directly');
     await alice.wait('SENT', (e) => e.msgId === directId);
     assert.ok(alice.a.network.stats.direct >= 1);
+  } finally {
+    alice.a.stop();
+    bob.a.stop();
+  }
+});
+
+test('address change: the receive queue moves to the other router while the contact sends', { skip: !SERVER || !SERVER2 }, async () => {
+  const { alice, bob, aliceConnId, bobConnId } = await connectPair(true);
+  const srv1 = parseServer(SERVER!).server;
+  const srv2 = parseServer(SERVER2!).server;
+  try {
+    // alice can use both routers: the new queue is on the one the connection does not use
+    alice.a.config.servers = [srv1, srv2];
+    alice.a.config.retireDelay = 1500;
+    const old = alice.a.getConn(aliceConnId)!.rcv!;
+    assert.ok(sameServer(old.server, srv1));
+    await alice.a.switchConnection(aliceConnId);
+    await alice.wait('SWITCH', (e) => e.dir === 'rcv' && e.phase === 'started');
+    assert.equal(alice.a.queueInfo(aliceConnId)!.canAbort, true);
+    await assert.rejects(alice.a.switchConnection(aliceConnId), /already being changed/);
+    // bob keeps sending during the change
+    for (let i = 0; i < 3; i++) await bob.a.sendMessage(bobConnId, utf8(`during ${i}`));
+    await bob.wait('SWITCH', (e) => e.dir === 'snd' && e.phase === 'started');
+    await alice.wait('SWITCH', (e) => e.dir === 'rcv' && e.phase === 'secured');
+    await bob.wait('SWITCH', (e) => e.dir === 'snd' && e.phase === 'completed');
+    await alice.wait('SWITCH', (e) => e.dir === 'rcv' && e.phase === 'completed');
+    const got = new Set<string>();
+    for (let i = 0; i < 3; i++) got.add(fromUtf8((await alice.wait('MSG')).body));
+    assert.deepEqual([...got].sort(), ['during 0', 'during 1', 'during 2']);
+    const q = alice.a.queueInfo(aliceConnId)!;
+    assert.ok(sameServer(q.rcvServer!, srv2), 'alice receives on the other router');
+    assert.equal(q.rcvSwitch, undefined);
+    assert.ok(sameServer(bob.a.queueInfo(bobConnId)!.sndServer!, srv2), 'bob sends to it');
+    // messages in both directions after the change
+    await bob.a.sendMessage(bobConnId, utf8('after the change'));
+    assert.equal(fromUtf8((await alice.wait('MSG')).body), 'after the change');
+    await alice.a.sendMessage(aliceConnId, utf8('got it'));
+    assert.equal(fromUtf8((await bob.wait('MSG')).body), 'got it');
+    // the old queue is deleted when nothing more arrives in it
+    for (let i = 0; i < 50 && alice.a.getConn(aliceConnId)!.oldRcv; i++) await new Promise((r) => setTimeout(r, 100));
+    assert.equal(alice.a.getConn(aliceConnId)!.oldRcv, undefined);
+    await assert.rejects(bob.a.network.send(old.server, old.sndId, { tag: 'SEND', notification: false, body: utf8('x') }), /AUTH/);
+    // and bob changes his address too
+    await bob.a.switchConnection(bobConnId);
+    await bob.wait('SWITCH', (e) => e.dir === 'rcv' && e.phase === 'completed', 30000);
+    await alice.wait('SWITCH', (e) => e.dir === 'snd' && e.phase === 'completed');
+    await alice.a.sendMessage(aliceConnId, utf8('to the new queue of bob'));
+    assert.equal(fromUtf8((await bob.wait('MSG')).body), 'to the new queue of bob');
+    for (const x of [alice, bob]) assert.equal(x.events.filter((e) => e.type === 'ERR').length, 0, JSON.stringify(x.events.filter((e) => e.type === 'ERR')));
   } finally {
     alice.a.stop();
     bob.a.stop();

@@ -401,7 +401,16 @@ export type AMessage =
   | { tag: 'A_RCVD'; receipts: MsgReceiptOut[] }
   | { tag: 'A_QCONT'; addr: SndQAddr }
   | { tag: 'EREADY'; lastMsgId: number }
-  | { tag: 'Q'; sub: string; raw: Bytes };
+  // queue rotation: the recipient adds a queue (replacing one), the sender sends its keys for it,
+  // the recipient tells it is secured, and the sender tests it (the first message in it)
+  | { tag: 'QADD'; queues: Array<{ uri: QueueUri; replaces?: SndQAddr }> }
+  | { tag: 'QKEY'; queues: Array<{ info: QueueInfo; sndKey: PublicKey }> }
+  | { tag: 'QUSE'; queues: Array<{ addr: SndQAddr; primary: boolean }> }
+  | { tag: 'QTEST'; addrs: SndQAddr[] }
+  | { tag: 'QEND'; addrs: SndQAddr[] };
+
+const encSndQAddr = (e: Encoder, a: SndQAddr) => encServer(e, a.server).bytes(a.senderId);
+const decSndQAddr = (d: Decoder): SndQAddr => ({ server: decServer(d), senderId: d.bytes() });
 
 export type AgentMessage =
   | { tag: 'I'; connInfo: Bytes }
@@ -437,13 +446,25 @@ export function encodeAgentMessage(m: AgentMessage): Bytes {
           e.char('V').list(a.receipts, (e, r) => e.int64(r.agentMsgId).bytes(r.msgHash).large(r.rcptInfo));
           break;
         case 'A_QCONT':
-          encServer(e.str('QC'), a.addr.server).bytes(a.addr.senderId);
+          encSndQAddr(e.str('QC'), a.addr);
           break;
         case 'EREADY':
           e.char('E').int64(a.lastMsgId);
           break;
-        case 'Q':
-          e.str('Q' + a.sub).raw(a.raw);
+        case 'QADD':
+          e.str('QA').list(a.queues, (e, q) => encQueueUri(e, q.uri).maybe(q.replaces, encSndQAddr));
+          break;
+        case 'QKEY':
+          e.str('QK').list(a.queues, (e, q) => encPubKey(encQueueInfo(e, q.info), q.sndKey));
+          break;
+        case 'QUSE':
+          e.str('QU').list(a.queues, (e, q) => encSndQAddr(e, q.addr).bool(q.primary));
+          break;
+        case 'QTEST':
+          e.str('QT').list(a.addrs, encSndQAddr);
+          break;
+        case 'QEND':
+          e.str('QE').list(a.addrs, encSndQAddr);
           break;
       }
       break;
@@ -484,10 +505,28 @@ export function parseAgentMessage(b: Bytes): AgentMessage {
           break;
         case 'Q': {
           const sub = d.char();
-          if (sub === 'C') {
-            const server = decServer(d);
-            msg = { tag: 'A_QCONT', addr: { server, senderId: d.bytes() } };
-          } else msg = { tag: 'Q', sub, raw: d.rest() };
+          switch (sub) {
+            case 'C':
+              msg = { tag: 'A_QCONT', addr: decSndQAddr(d) };
+              break;
+            case 'A':
+              msg = { tag: 'QADD', queues: d.nonEmpty((d) => ({ uri: decQueueUri(d), replaces: d.maybe(decSndQAddr) })) };
+              break;
+            case 'K':
+              msg = { tag: 'QKEY', queues: d.nonEmpty((d) => ({ info: decQueueInfo(d), sndKey: decPubKey(d, 'ed25519', 'ed448', 'x25519') })) };
+              break;
+            case 'U':
+              msg = { tag: 'QUSE', queues: d.nonEmpty((d) => ({ addr: decSndQAddr(d), primary: d.bool() })) };
+              break;
+            case 'T':
+              msg = { tag: 'QTEST', addrs: d.nonEmpty(decSndQAddr) };
+              break;
+            case 'E':
+              msg = { tag: 'QEND', addrs: d.nonEmpty(decSndQAddr) };
+              break;
+            default:
+              throw new ParseError(`bad AMessage type Q${sub}`);
+          }
           break;
         }
         case 'E':

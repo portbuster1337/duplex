@@ -20,7 +20,7 @@ import {
   type SkippedKeys,
 } from '../crypto/ratchet';
 import { compatibleVersion, isCompatible, type VersionRange } from '../util/version';
-import { serverKey, type ProtocolServer } from '../smp/server';
+import { sameServer, serverKey, type ProtocolServer } from '../smp/server';
 import {
   decryptRcvMsg,
   encodeClientMessage,
@@ -112,9 +112,14 @@ export interface SndQueue {
 
 export interface PendingSend {
   id: number;
-  kind: 'skey' | 'conf' | 'msg' | 'rcpt' | 'hello';
-  /** SEND body (ClientMsgEnvelope), absent for SKEY */
+  /** ctrl: agent messages that are not reported to the client (queue rotation, quota) */
+  kind: 'skey' | 'conf' | 'msg' | 'rcpt' | 'hello' | 'ctrl';
+  /** SEND body (ClientMsgEnvelope) of confirmations */
   body?: Bytes;
+  /** the client message of other messages, encrypted for the send queue when it is sent (the queue can change) */
+  clientMsg?: Bytes;
+  /** sent to the new queue of an address change (QTEST) */
+  toNext?: boolean;
   notification: boolean;
   /** sign with the sender key (false for unsecured confirmations) */
   signed: boolean;
@@ -122,6 +127,35 @@ export interface PendingSend {
   msgId?: number;
   createdAt: number;
   attempts: number;
+}
+
+/** an address change started by this side: the new receive queue, used from the first message in it */
+export interface RcvSwitch {
+  rq: RcvQueue;
+  /** sending_qadd: waiting for the sender's keys; received_qkey: securing the queue; sending_quse: waiting for the first message */
+  status: 'sending_qadd' | 'received_qkey' | 'sending_quse';
+  /** the sender's key from QKEY, until the queue is secured */
+  sndKey?: PublicKey;
+  startedAt: number;
+}
+
+/** an address change started by the contact: the new send queue, used once QTEST is sent to it */
+export interface SndSwitch {
+  sq: SndQueue;
+  status: 'sending_qkey' | 'sending_qtest';
+  startedAt: number;
+}
+
+export type SwitchPhase = 'started' | 'confirmed' | 'secured' | 'completed';
+
+/** the routers of a connection and the state of address changes */
+export interface ConnQueues {
+  rcvServer?: ProtocolServer;
+  sndServer?: ProtocolServer;
+  rcvSwitch?: RcvSwitch['status'];
+  sndSwitch?: SndSwitch['status'];
+  /** our address change can still be stopped */
+  canAbort: boolean;
 }
 
 export interface ContactRequest {
@@ -163,6 +197,12 @@ export interface Conn {
   quotaPaused?: boolean;
   /** post-quantum encryption is supported (and proposed) in this connection: larger headers, smaller messages */
   pqSupport?: boolean;
+  /** our address change (queue rotation) */
+  rcvSwitch?: RcvSwitch;
+  /** the contact's address change */
+  sndSwitch?: SndSwitch;
+  /** receive queues replaced by an address change, deleted once no more messages arrive in them */
+  oldRcv?: RcvQueue[];
 }
 
 export type AgentEvent =
@@ -177,6 +217,7 @@ export type AgentEvent =
   | { type: 'ERR'; connId?: string; err: string }
   | { type: 'END'; connId: string }
   | { type: 'DELD'; connId: string }
+  | { type: 'SWITCH'; connId: string; dir: 'rcv' | 'snd'; phase: SwitchPhase }
   | { type: 'UP'; server: ProtocolServer }
   | { type: 'DOWN'; server: ProtocolServer; err?: string };
 
@@ -219,6 +260,8 @@ export interface AgentConfig {
   routing?: { mode: ProxyMode; fallback: ProxyFallback };
   /** post-quantum encryption for new connections (default true, as the apps do for contacts) */
   pq?: boolean;
+  /** how long a queue replaced by an address change is kept for late messages (ms) */
+  retireDelay?: number;
 }
 
 export class AgentError extends Error {
@@ -242,6 +285,20 @@ export interface ResolvedLink {
 const MAX_SENT_HASHES = 1000;
 const DEBUG = typeof process !== 'undefined' && !!process.env?.DEBUG_AGENT;
 const MAX_ENC_HASHES = 200;
+
+/** a replaced receive queue is deleted when no message arrived in it for this long */
+const RETIRE_DELAY = 20000;
+
+/** the receive queues of a connection: the current one, the new one of an address change, and replaced ones */
+function rcvQueues(c: Conn): RcvQueue[] {
+  const qs: RcvQueue[] = [];
+  if (c.rcv) qs.push(c.rcv);
+  if (c.rcvSwitch) qs.push(c.rcvSwitch.rq);
+  if (c.oldRcv) qs.push(...c.oldRcv);
+  return qs;
+}
+
+const sameQ = (q: { server: ProtocolServer; sndId: Bytes } | undefined, a: { server: ProtocolServer; senderId: Bytes }) => !!q && sameServer(q.server, a.server) && equal(q.sndId, a.senderId);
 
 function newConnId(): string {
   return b64urlNoPad(randomBytes(12));
@@ -281,6 +338,9 @@ export class Agent {
   private locks = new Map<string, Promise<unknown>>();
   private sending = new Set<string>();
   private retryTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  /** deleting replaced receive queues, and securing the new queue of an address change */
+  private retireTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private switchTimers = new Map<string, ReturnType<typeof setTimeout>>();
   private stopped = false;
   private serverIdx = Math.floor(Math.random() * 1000);
 
@@ -319,20 +379,27 @@ export class Agent {
     for (const c of await this.store.loadConns()) {
       c.rcvEncHashes ??= [];
       this.conns.set(c.id, c);
-      if (c.rcv) this.rcvIndex.set(qKey(c.rcv.server, c.rcv.rcvId), c.id);
+      for (const rq of rcvQueues(c)) this.rcvIndex.set(qKey(rq.server, rq.rcvId), c.id);
     }
     const servers = new Map<string, ProtocolServer>();
     for (const c of this.conns.values()) {
-      if (c.rcv && c.status !== 'deleted') servers.set(serverKey(c.rcv.server), c.rcv.server);
+      if (c.status !== 'deleted') for (const rq of rcvQueues(c)) servers.set(serverKey(rq.server), rq.server);
     }
     for (const s of servers.values()) this.network.keep(s);
-    for (const c of this.conns.values()) if (c.pending.length) this.kickSend(c.id);
+    for (const c of this.conns.values()) {
+      if (c.pending.length) this.kickSend(c.id);
+      // unfinished address changes
+      if (c.oldRcv?.length) this.retireLater(c.id);
+      if (c.rcvSwitch?.status === 'received_qkey') this.switchRetryLater(c.id, 1000);
+    }
   }
 
   stop(): void {
     this.stopped = true;
-    for (const t of this.retryTimers.values()) clearTimeout(t);
-    this.retryTimers.clear();
+    for (const timers of [this.retryTimers, this.retireTimers, this.switchTimers]) {
+      for (const t of timers.values()) clearTimeout(t);
+      timers.clear();
+    }
     this.network.stop();
   }
 
@@ -380,7 +447,7 @@ export class Agent {
 
   private async save(c: Conn): Promise<void> {
     this.conns.set(c.id, c);
-    if (c.rcv) this.rcvIndex.set(qKey(c.rcv.server, c.rcv.rcvId), c.id);
+    for (const rq of rcvQueues(c)) this.rcvIndex.set(qKey(rq.server, rq.rcvId), c.id);
     await this.store.saveConn(c);
   }
 
@@ -762,7 +829,7 @@ export class Agent {
     return id;
   }
 
-  private enqueueAgentMsg(c: Conn, msg: AMessage, notification: boolean): number {
+  private enqueueAgentMsg(c: Conn, msg: AMessage, notification: boolean, toNext = false): number {
     if (!c.snd || !c.ratchet) throw new AgentError('connection has no send queue');
     const sndMsgId = c.sndInternalId + 1;
     const am: AgentMessage = { tag: 'M', sndMsgId, prevMsgHash: c.sndLastHash, msg };
@@ -777,8 +844,8 @@ export class Agent {
       if (ids.length > MAX_SENT_HASHES) for (const k of ids.slice(0, ids.length - MAX_SENT_HASHES)) delete c.sentHashes[Number(k)];
     }
     const env = encodeAgentEnvelope({ tag: 'M', agentVersion: AGENT_VERSIONS.max, encAgentMessage: enc });
-    const kind = msg.tag === 'A_MSG' ? 'msg' : msg.tag === 'A_RCVD' ? 'rcpt' : msg.tag === 'HELLO' ? 'hello' : 'msg';
-    this.addPending(c, { kind, body: this.e2eEncrypt(c.snd, encodeClientMessage({ tag: '_' }, env), false), notification, signed: true, msgId: sndMsgId });
+    const kind = msg.tag === 'A_MSG' ? 'msg' : msg.tag === 'A_RCVD' ? 'rcpt' : msg.tag === 'HELLO' ? 'hello' : 'ctrl';
+    this.addPending(c, { kind, clientMsg: encodeClientMessage({ tag: '_' }, env), notification, signed: true, msgId: sndMsgId, ...(toNext ? { toNext } : {}) });
     return sndMsgId;
   }
 
@@ -803,12 +870,21 @@ export class Agent {
       const c = this.conns.get(connId);
       if (!c || c.status === 'deleted' || !c.snd || !c.pending.length || c.quotaPaused) return;
       const p = c.pending[0];
-      const sq = c.snd;
+      // QTEST goes to the new queue of the contact's address change, everything else to the current queue
+      const sq = p.toNext ? c.sndSwitch?.sq : c.snd;
+      if (!sq) {
+        await this.withLock(connId, async () => {
+          c.pending = c.pending.filter((x) => x.id !== p.id);
+          await this.save(c);
+        });
+        continue;
+      }
       try {
         if (p.kind === 'skey') {
           await this.network.sendToQueue(sq.server, sq.sndId, { tag: 'SKEY', sndKey: sq.sndPubKey }, sq.sndPrivKey);
         } else {
-          await this.network.sendToQueue(sq.server, sq.sndId, { tag: 'SEND', notification: p.notification, body: p.body! }, p.signed ? sq.sndPrivKey : undefined);
+          const body = p.body ?? this.e2eEncrypt(sq, p.clientMsg!, false);
+          await this.network.sendToQueue(sq.server, sq.sndId, { tag: 'SEND', notification: p.notification, body }, p.signed ? sq.sndPrivKey : undefined);
         }
       } catch (e) {
         if (e instanceof SMPError) {
@@ -821,12 +897,18 @@ export class Agent {
             return;
           }
           // AUTH and other permanent errors: the message cannot be delivered
+          let abandoned = false;
           await this.withLock(connId, async () => {
             c.pending = c.pending.filter((x) => x.id !== p.id);
+            // the new queue of an address change does not work: the change is abandoned
+            if (p.toNext && c.sndSwitch?.sq === sq) {
+              c.sndSwitch = undefined;
+              abandoned = true;
+            }
             await this.save(c);
           });
           if (p.kind === 'msg' && p.msgId) await this.emit({ type: 'MERR', connId, msgId: p.msgId, err: e.message });
-          else await this.emit({ type: 'ERR', connId, err: `${p.kind}: ${e.message}` });
+          else await this.emit({ type: 'ERR', connId, err: `${abandoned ? 'address change' : p.kind}: ${e.message}` });
           continue;
         }
         p.attempts++;
@@ -835,9 +917,16 @@ export class Agent {
         return;
       }
       let con = false;
+      let switched = false;
       await this.withLock(connId, async () => {
         c.pending = c.pending.filter((x) => x.id !== p.id);
-        if (p.kind === 'skey') sq.status = 'secured';
+        if (p.toNext && c.sndSwitch?.sq === sq) {
+          // QTEST is sent: the new queue replaces the old one, which the contact deletes
+          sq.status = 'active';
+          c.snd = sq;
+          c.sndSwitch = undefined;
+          switched = true;
+        } else if (p.kind === 'skey') sq.status = 'secured';
         else if (p.kind === 'conf') {
           if (c.status === 'allowed') {
             // the initiating party: the reply queue was secured by us, so the connection is ready
@@ -851,6 +940,7 @@ export class Agent {
         await this.save(c);
       });
       if (con) await this.emit({ type: 'CON', connId });
+      if (switched) await this.emit({ type: 'SWITCH', connId, dir: 'snd', phase: 'completed' });
       if (p.kind === 'msg' && p.msgId) await this.emit({ type: 'SENT', connId, msgId: p.msgId });
     }
   }
@@ -881,7 +971,8 @@ export class Agent {
   private onConnected(srv: ProtocolServer, client: SMPClient): void {
     const subs: Array<{ c: Conn; rq: RcvQueue }> = [];
     for (const c of this.conns.values()) {
-      if (c.rcv && c.status !== 'deleted' && serverKey(c.rcv.server) === serverKey(srv)) subs.push({ c, rq: c.rcv });
+      if (c.status === 'deleted') continue;
+      for (const rq of rcvQueues(c)) if (serverKey(rq.server) === serverKey(srv)) subs.push({ c, rq });
     }
     void this.emit({ type: 'UP', server: srv });
     if (!subs.length) return;
@@ -892,7 +983,9 @@ export class Agent {
       }),
     );
     // messages that could not be sent while disconnected
-    for (const c of this.conns.values()) if (c.pending.length && c.snd && serverKey(c.snd.server) === serverKey(srv)) this.kickSend(c.id);
+    for (const c of this.conns.values()) {
+      if (c.pending.length && [c.snd, c.sndSwitch?.sq].some((sq) => sq && serverKey(sq.server) === serverKey(srv))) this.kickSend(c.id);
+    }
   }
 
   private onRouterMessage(srv: ProtocolServer, entityId: Bytes, msg: BrokerMsg): void {
@@ -900,7 +993,7 @@ export class Agent {
     const connId = this.rcvIndex.get(qKey(srv, entityId));
     if (!connId) return;
     if (msg.tag === 'MSG') {
-      this.withLock(connId, () => this.processMsg(connId, msg.msgId, msg.body)).catch((e) => void this.emit({ type: 'ERR', connId, err: `message processing error: ${(e as Error).message}` }));
+      this.withLock(connId, () => this.processMsg(connId, srv, entityId, msg.msgId, msg.body)).catch((e) => void this.emit({ type: 'ERR', connId, err: `message processing error: ${(e as Error).message}` }));
     } else if (msg.tag === 'END') void this.emit({ type: 'END', connId });
     else if (msg.tag === 'DELD') void this.emit({ type: 'DELD', connId });
   }
@@ -913,10 +1006,11 @@ export class Agent {
     }
   }
 
-  private async processMsg(connId: string, srvMsgId: Bytes, encBody: Bytes): Promise<void> {
+  private async processMsg(connId: string, srv: ProtocolServer, rcvId: Bytes, srvMsgId: Bytes, encBody: Bytes): Promise<void> {
     const c = this.conns.get(connId);
-    if (!c || !c.rcv || c.status === 'deleted') return;
-    const rq = c.rcv;
+    if (!c || c.status === 'deleted') return;
+    const rq = rcvQueues(c).find((q) => serverKey(q.server) === serverKey(srv) && equal(q.rcvId, rcvId));
+    if (!rq) return;
     let ackNow = true;
     try {
       const rcv = decryptRcvMsg(rq.rcvDhSecret, srvMsgId, encBody);
@@ -931,6 +1025,7 @@ export class Agent {
       const env = parseClientMsgEnvelope(rcv.body);
       if (!isCompatible(env.version, SMP_CLIENT_VERSIONS) && env.version > rq.smpClientVersion) throw new AgentError('incompatible message version');
       if (!rq.e2eDhSecret && env.e2ePubKey) {
+        if (rq !== c.rcv) throw new AgentError('confirmation in the queue of an address change');
         const e2eDh = dh(env.e2ePubKey, rq.e2ePrivKey);
         const { header, body } = parseClientMessage(cbDecrypt(e2eDh, env.nonce, env.encBody));
         const ae = parseAgentEnvelope(body);
@@ -946,7 +1041,7 @@ export class Agent {
         const { body } = parseClientMessage(cbDecrypt(rq.e2eDhSecret, env.nonce, env.encBody));
         const ae = parseAgentEnvelope(body);
         if (ae.tag === 'M') {
-          ackNow = await this.agentMsg(c, ae.encAgentMessage, srvMsgId, rcv.ts, rcv.notification);
+          ackNow = await this.agentMsg(c, rq, ae.encAgentMessage, srvMsgId, rcv.ts, rcv.notification);
         } else if (ae.tag === 'R') {
           throw new AgentError('ratchet re-synchronization is not supported');
         } else throw new AgentError(`unexpected message ${ae.tag}`);
@@ -958,6 +1053,8 @@ export class Agent {
       await this.emit({ type: 'ERR', connId, err: (e as Error).message });
     } finally {
       if (ackNow && !this.stopped) await this.ack(rq, srvMsgId);
+      // messages still arrive in a replaced queue: it is deleted later
+      if (c.oldRcv?.includes(rq)) this.retireLater(c.id);
     }
   }
 
@@ -1036,7 +1133,7 @@ export class Agent {
   }
 
   /** processes a double-ratchet encrypted agent message; returns whether to ACK now */
-  private async agentMsg(c: Conn, encAgentMessage: Bytes, srvMsgId: Bytes, brokerTs: number, notification: boolean): Promise<boolean> {
+  private async agentMsg(c: Conn, rq: RcvQueue, encAgentMessage: Bytes, srvMsgId: Bytes, brokerTs: number, notification: boolean): Promise<boolean> {
     if (!c.ratchet) throw new AgentError('message without ratchet');
     const encHash = b64url(sha256(encAgentMessage));
     let dec;
@@ -1053,8 +1150,14 @@ export class Agent {
     c.skipped = dec.skipped;
     c.rcvEncHashes.push(encHash);
     if (c.rcvEncHashes.length > MAX_ENC_HASHES) c.rcvEncHashes.splice(0, c.rcvEncHashes.length - MAX_ENC_HASHES);
-    const rq = c.rcv!;
     if (rq.status !== 'active') rq.status = 'active';
+    // the first message in the new queue of our address change: it replaces the old queue
+    const switched = !!c.rcvSwitch && c.rcvSwitch.rq === rq;
+    if (switched) {
+      (c.oldRcv ??= []).push(c.rcv!);
+      c.rcv = rq;
+      c.rcvSwitch = undefined;
+    }
     const integrity = checkIntegrity(c.rcvLastExtId, am.sndMsgId, c.rcvLastHash, am.prevMsgHash);
     const msgHash = sha256(dec.msg);
     c.rcvLastExtId = am.sndMsgId;
@@ -1062,58 +1165,267 @@ export class Agent {
     c.rcvInternalId++;
     const msgId = c.rcvInternalId;
     const m = am.msg;
-    switch (m.tag) {
-      case 'HELLO': {
-        await this.save(c);
-        if (c.snd?.status === 'active' || c.status === 'ready') {
-          if (c.status !== 'ready') {
+    const ackNow = await (async (): Promise<boolean> => {
+      switch (m.tag) {
+        case 'HELLO': {
+          await this.save(c);
+          if (c.snd?.status === 'active' || c.status === 'ready') {
+            if (c.status !== 'ready') {
+              c.status = 'ready';
+              await this.save(c);
+              await this.emit({ type: 'CON', connId: c.id });
+            }
+          } else if (c.snd) {
+            c.snd.status = 'active';
+            this.enqueueAgentMsg(c, { tag: 'HELLO' }, true);
             c.status = 'ready';
             await this.save(c);
+            this.kickSend(c.id);
             await this.emit({ type: 'CON', connId: c.id });
           }
-        } else if (c.snd) {
-          c.snd.status = 'active';
-          this.enqueueAgentMsg(c, { tag: 'HELLO' }, true);
-          c.status = 'ready';
+          return true;
+        }
+        case 'A_MSG': {
+          // the ratchet state is saved after the client has stored the message: if the app stops in
+          // between, the message is not acknowledged and the router delivers it again
+          const r = await this.emit({ type: 'MSG', connId: c.id, msgId, sndMsgId: am.sndMsgId, body: m.body, brokerTs, integrity, notification });
+          if (this.stopped) throw new AgentError('stopped');
+          await this.save(c);
+          await this.ack(rq, srvMsgId);
+          if (r && r.receipt && c.snd && c.status === 'ready') {
+            this.enqueueAgentMsg(c, { tag: 'A_RCVD', receipts: [{ agentMsgId: am.sndMsgId, msgHash, rcptInfo: new Uint8Array(0) }] }, false);
+            await this.save(c);
+            this.kickSend(c.id);
+          }
+          return false;
+        }
+        case 'A_RCVD': {
+          await this.save(c);
+          const receipts = m.receipts.filter((r) => c.sentHashes[r.agentMsgId]).map((r) => ({ msgId: r.agentMsgId, ok: c.sentHashes[r.agentMsgId] === b64url(r.msgHash) }));
+          if (receipts.length) await this.emit({ type: 'RCVD', connId: c.id, receipts });
+          return true;
+        }
+        case 'A_QCONT':
+          c.quotaPaused = false;
           await this.save(c);
           this.kickSend(c.id);
-          await this.emit({ type: 'CON', connId: c.id });
-        }
-        return true;
-      }
-      case 'A_MSG': {
-        // the ratchet state is saved after the client has stored the message: if the app stops in
-        // between, the message is not acknowledged and the router delivers it again
-        const r = await this.emit({ type: 'MSG', connId: c.id, msgId, sndMsgId: am.sndMsgId, body: m.body, brokerTs, integrity, notification });
-        if (this.stopped) throw new AgentError('stopped');
-        await this.save(c);
-        await this.ack(rq, srvMsgId);
-        if (r && r.receipt && c.snd && c.status === 'ready') {
-          this.enqueueAgentMsg(c, { tag: 'A_RCVD', receipts: [{ agentMsgId: am.sndMsgId, msgHash, rcptInfo: new Uint8Array(0) }] }, false);
+          return true;
+        case 'EREADY':
+          await this.save(c);
+          return true;
+        case 'QADD':
+        case 'QKEY':
+        case 'QUSE': {
+          let events: AgentEvent[] = [];
+          let err: string | undefined;
+          try {
+            events = await this.rotationMsg(c, m);
+          } catch (e) {
+            if (!(e instanceof AgentError)) throw e;
+            err = e.message;
+          }
           await this.save(c);
           this.kickSend(c.id);
+          for (const ev of events) await this.emit(ev);
+          if (err) await this.emit({ type: 'ERR', connId: c.id, err });
+          return true;
         }
-        return false;
+        case 'QTEST':
+          // any message in the new queue completes the change
+          await this.save(c);
+          return true;
+        default:
+          // QEND is only used from agent version 8
+          await this.save(c);
+          await this.emit({ type: 'ERR', connId: c.id, err: `unexpected agent message ${m.tag}` });
+          return true;
       }
-      case 'A_RCVD': {
-        await this.save(c);
-        const receipts = m.receipts.filter((r) => c.sentHashes[r.agentMsgId]).map((r) => ({ msgId: r.agentMsgId, ok: c.sentHashes[r.agentMsgId] === b64url(r.msgHash) }));
-        if (receipts.length) await this.emit({ type: 'RCVD', connId: c.id, receipts });
-        return true;
-      }
-      case 'A_QCONT':
-        c.quotaPaused = false;
-        await this.save(c);
-        this.kickSend(c.id);
-        return true;
-      case 'EREADY':
-        await this.save(c);
-        return true;
-      default:
-        await this.save(c);
-        await this.emit({ type: 'ERR', connId: c.id, err: 'queue rotation is not supported' });
-        return true;
+    })();
+    if (switched) {
+      this.retireLater(c.id);
+      await this.emit({ type: 'SWITCH', connId: c.id, dir: 'rcv', phase: 'completed' });
     }
+    return ackNow;
+  }
+
+  // ---- address changes (queue rotation)
+
+  /** a router for the new queue: one that the connection does not use if possible, otherwise not the current one */
+  private switchServer(c: Conn): ProtocolServer {
+    const all = this.config.servers;
+    if (!all.length) throw new AgentError('no SMP servers configured');
+    const pick = (xs: ProtocolServer[]) => xs[Math.floor(Math.random() * xs.length)];
+    const used = [c.rcv?.server, c.snd?.server].filter((x): x is ProtocolServer => !!x);
+    const unused = all.filter((s) => !used.some((u) => sameServer(u, s)));
+    if (unused.length) return pick(unused);
+    const others = all.filter((s) => !c.rcv || !sameServer(s, c.rcv.server));
+    return pick(others.length ? others : all);
+  }
+
+  /**
+   * changes the receiving address of a connection: a new queue is created and the contact is asked to
+   * send to it (QADD); the change completes when the first message arrives in it, which can take
+   * until the contact is online
+   */
+  async switchConnection(connId: string, server?: ProtocolServer): Promise<void> {
+    await this.withLock(connId, async () => {
+      const c = this.mustConn(connId);
+      if (c.status !== 'ready' || !c.rcv || !c.snd || !c.ratchet) throw new AgentError('the connection is not ready');
+      if (c.rcvSwitch) throw new AgentError('the address is already being changed');
+      const { rq } = await this.newRcvQueue(server ?? this.switchServer(c), 'M');
+      c.rcvSwitch = { rq, status: 'sending_qadd', startedAt: Date.now() };
+      this.enqueueAgentMsg(c, { tag: 'QADD', queues: [{ uri: this.queueUri(rq), replaces: { server: c.rcv.server, senderId: c.rcv.sndId } }] }, false);
+      await this.save(c);
+      this.kickSend(c.id);
+      await this.emit({ type: 'SWITCH', connId, dir: 'rcv', phase: 'started' });
+    });
+  }
+
+  /** stops our address change, until the contact is told to use the new queue */
+  async abortSwitch(connId: string): Promise<void> {
+    await this.withLock(connId, async () => {
+      const c = this.mustConn(connId);
+      const s = c.rcvSwitch;
+      if (!s) return;
+      if (s.status === 'sending_quse') throw new AgentError('the address change cannot be stopped now');
+      c.rcvSwitch = undefined;
+      this.rcvIndex.delete(qKey(s.rq.server, s.rq.rcvId));
+      try {
+        await this.network.send(s.rq.server, s.rq.rcvId, { tag: 'DEL' }, s.rq.rcvPrivKey);
+      } catch (e) {
+        console.warn('failed to delete queue', (e as Error).message);
+      }
+      await this.save(c);
+    });
+  }
+
+  queueInfo(connId: string): ConnQueues | undefined {
+    const c = this.conns.get(connId);
+    if (!c) return undefined;
+    return { rcvServer: c.rcv?.server, sndServer: c.snd?.server, rcvSwitch: c.rcvSwitch?.status, sndSwitch: c.sndSwitch?.status, canAbort: !!c.rcvSwitch && c.rcvSwitch.status !== 'sending_quse' };
+  }
+
+  /** QADD, QKEY and QUSE; returns the events to emit once the connection is saved */
+  private async rotationMsg(c: Conn, m: AMessage): Promise<AgentEvent[]> {
+    switch (m.tag) {
+      // the contact changes its receiving address, which is our send queue: our keys for the new queue
+      case 'QADD': {
+        const { uri, replaces } = m.queues[0];
+        if (!replaces) throw new AgentError('QADD: adding a queue without replacing one is not supported');
+        if (!c.snd) throw new AgentError('QADD: no send queue');
+        const v = compatibleVersion(uri.versions, SMP_CLIENT_VERSIONS);
+        if (v === undefined) throw new AgentError('QADD: incompatible version');
+        if (sameQ(c.snd, uri.addr) || sameQ(c.sndSwitch?.sq, uri.addr)) throw new AgentError('QADD: queue address is already used in connection');
+        if (!sameQ(c.snd, replaces)) throw new AgentError('QADD: replaced queue address is not found in connection');
+        // a new change replaces an unfinished one
+        if (c.sndSwitch) c.pending = c.pending.filter((p) => !p.toNext);
+        const sq = this.newSndQueue(uri.addr, v);
+        c.sndSwitch = { sq, status: 'sending_qkey', startedAt: Date.now() };
+        const info: QueueInfo = { version: v, addr: { ...uri.addr, dhPublicKey: sq.e2ePubKey } };
+        this.enqueueAgentMsg(c, { tag: 'QKEY', queues: [{ info, sndKey: sq.sndPubKey }] }, false);
+        return [{ type: 'SWITCH', connId: c.id, dir: 'snd', phase: 'started' }];
+      }
+      // our change: the contact's keys for the new queue, which is then secured
+      case 'QKEY': {
+        const { info, sndKey } = m.queues[0];
+        const s = c.rcvSwitch;
+        if (!s || !sameQ(s.rq, info.addr)) throw new AgentError('QKEY: queue address not found in connection');
+        if (s.status !== 'sending_qadd' || s.rq.status !== 'new') throw new AgentError('QKEY: queue already secured');
+        if (!isCompatible(info.version, SMP_CLIENT_VERSIONS)) throw new AgentError('QKEY: incompatible version');
+        s.rq.e2eDhSecret = dh(info.addr.dhPublicKey, s.rq.e2ePrivKey);
+        s.rq.smpClientVersion = Math.min(s.rq.smpClientVersion, info.version);
+        s.rq.status = 'confirmed';
+        s.status = 'received_qkey';
+        s.sndKey = sndKey;
+        return [{ type: 'SWITCH', connId: c.id, dir: 'rcv', phase: 'confirmed' }, ...(await this.secureSwitchQueue(c))];
+      }
+      // the contact secured the new queue: it is tested with the first message in it
+      case 'QUSE': {
+        const { addr } = m.queues[0];
+        const s = c.sndSwitch;
+        if (!s || !sameQ(s.sq, addr)) throw new AgentError('QUSE: switched queue address not found in connection');
+        if (s.status !== 'sending_qkey') throw new AgentError('QUSE: the queue is already used');
+        s.sq.status = 'secured';
+        s.status = 'sending_qtest';
+        this.enqueueAgentMsg(c, { tag: 'QTEST', addrs: [addr] }, false, true);
+        return [{ type: 'SWITCH', connId: c.id, dir: 'snd', phase: 'secured' }];
+      }
+      default:
+        return [];
+    }
+  }
+
+  /** secures the new queue of our address change with the contact's key, then tells the contact to use it */
+  private async secureSwitchQueue(c: Conn): Promise<AgentEvent[]> {
+    const s = c.rcvSwitch;
+    if (!s || s.status !== 'received_qkey' || !s.sndKey) return [];
+    try {
+      await this.network.send(s.rq.server, s.rq.rcvId, { tag: 'KEY', sndKey: s.sndKey }, s.rq.rcvPrivKey);
+    } catch (e) {
+      if (!(e instanceof SMPError)) {
+        this.switchRetryLater(c.id);
+        return [];
+      }
+      c.rcvSwitch = undefined;
+      this.rcvIndex.delete(qKey(s.rq.server, s.rq.rcvId));
+      return [{ type: 'ERR', connId: c.id, err: `address change: ${e.message}` }];
+    }
+    s.rq.status = 'secured';
+    s.status = 'sending_quse';
+    s.sndKey = undefined;
+    this.enqueueAgentMsg(c, { tag: 'QUSE', queues: [{ addr: { server: s.rq.server, senderId: s.rq.sndId }, primary: true }] }, false);
+    return [{ type: 'SWITCH', connId: c.id, dir: 'rcv', phase: 'secured' }];
+  }
+
+  private switchRetryLater(connId: string, ms = 10000): void {
+    if (this.stopped || this.switchTimers.has(connId)) return;
+    this.switchTimers.set(
+      connId,
+      setTimeout(() => {
+        this.switchTimers.delete(connId);
+        this.withLock(connId, async () => {
+          const c = this.conns.get(connId);
+          if (!c || c.status === 'deleted' || this.stopped) return;
+          const events = await this.secureSwitchQueue(c);
+          await this.save(c);
+          this.kickSend(connId);
+          for (const e of events) await this.emit(e);
+        }).catch((e) => console.warn('address change', (e as Error).message));
+      }, ms),
+    );
+  }
+
+  /** deletes the replaced receive queues when no message arrived in them for a while */
+  private retireLater(connId: string, ms = this.config.retireDelay ?? RETIRE_DELAY): void {
+    if (this.stopped) return;
+    clearTimeout(this.retireTimers.get(connId));
+    this.retireTimers.set(
+      connId,
+      setTimeout(() => {
+        this.retireTimers.delete(connId);
+        this.withLock(connId, () => this.deleteOldQueues(connId)).catch((e) => console.warn('deleting replaced queue', (e as Error).message));
+      }, ms),
+    );
+  }
+
+  private async deleteOldQueues(connId: string): Promise<void> {
+    const c = this.conns.get(connId);
+    if (!c?.oldRcv?.length || c.status === 'deleted' || this.stopped) return;
+    for (const rq of [...c.oldRcv]) {
+      try {
+        await this.network.send(rq.server, rq.rcvId, { tag: 'DEL' }, rq.rcvPrivKey);
+      } catch (e) {
+        // a network error: tried again later; a router error: the queue is gone
+        if (!(e instanceof SMPError)) {
+          this.retireLater(connId, 60000);
+          break;
+        }
+      }
+      c.oldRcv = c.oldRcv!.filter((q) => q !== rq);
+      this.rcvIndex.delete(qKey(rq.server, rq.rcvId));
+    }
+    if (!c.oldRcv?.length) c.oldRcv = undefined;
+    await this.save(c);
   }
 
   // ---- deletion
@@ -1124,13 +1436,17 @@ export class Agent {
       if (!c) return;
       c.status = 'deleted';
       c.pending = [];
-      if (c.rcv) {
+      for (const timers of [this.retryTimers, this.retireTimers, this.switchTimers]) {
+        clearTimeout(timers.get(connId));
+        timers.delete(connId);
+      }
+      for (const rq of rcvQueues(c)) {
         try {
-          await this.network.send(c.rcv.server, c.rcv.rcvId, { tag: 'DEL' }, c.rcv.rcvPrivKey);
+          await this.network.send(rq.server, rq.rcvId, { tag: 'DEL' }, rq.rcvPrivKey);
         } catch (e) {
           console.warn('failed to delete queue', (e as Error).message);
         }
-        this.rcvIndex.delete(qKey(c.rcv.server, c.rcv.rcvId));
+        this.rcvIndex.delete(qKey(rq.server, rq.rcvId));
       }
       this.conns.delete(connId);
       await this.store.deleteConn(connId);
@@ -1140,7 +1456,7 @@ export class Agent {
   /** the router has no queue for this connection (e.g. after an error) - forget it locally */
   async forgetConnection(connId: string): Promise<void> {
     const c = this.conns.get(connId);
-    if (c?.rcv) this.rcvIndex.delete(qKey(c.rcv.server, c.rcv.rcvId));
+    if (c) for (const rq of rcvQueues(c)) this.rcvIndex.delete(qKey(rq.server, rq.rcvId));
     this.conns.delete(connId);
     await this.store.deleteConn(connId);
   }

@@ -612,6 +612,7 @@ function ContactInfo({ session, contact, onClose, onDeleted }: { session: Sessio
           </>
         )}
       </div>
+      <AddressChange session={session} contact={contact} />
       <div class="row">
         <button onClick={() => chat.clearChat(contact.id)}>Clear chat</button>
         {!confirm ? (
@@ -632,6 +633,54 @@ function ContactInfo({ session, contact, onClose, onDeleted }: { session: Sessio
         )}
       </div>
     </Modal>
+  );
+}
+
+/** changing the receiving address (queue rotation), as in the apps */
+function AddressChange({ session, contact }: { session: Session; contact: Contact }): JSX.Element {
+  const chat = session.chat;
+  const [busy, setBusy] = useState(false);
+  const [confirm, setConfirm] = useState(false);
+  const q = chat.contactQueues(contact.id);
+  if (!q || contact.status !== 'active') return <></>;
+  const run = async (f: () => Promise<void>) => {
+    setBusy(true);
+    try {
+      await f();
+    } catch (err) {
+      toast(errorText(err), 'error');
+    }
+    setBusy(false);
+    setConfirm(false);
+  };
+  return (
+    <div class="address-change">
+      {q.sndSwitch && <p class="hint">Your contact is changing their address…</p>}
+      {q.rcvSwitch ? (
+        <>
+          <p class="hint">Changing the receiving address… It completes when your contact is online.</p>
+          {q.canAbort && (
+            <button disabled={busy} onClick={() => run(() => chat.abortSwitch(contact.id))}>
+              Stop changing address
+            </button>
+          )}
+        </>
+      ) : confirm ? (
+        <>
+          <p class="hint">The receiving address will be changed to a new queue, on another of your servers if there is one. The change completes when your contact is online.</p>
+          <div class="row">
+            <button class="primary" disabled={busy} onClick={() => run(() => chat.switchAddress(contact.id))}>
+              Change
+            </button>
+            <button disabled={busy} onClick={() => setConfirm(false)}>
+              Cancel
+            </button>
+          </div>
+        </>
+      ) : (
+        <button onClick={() => setConfirm(true)}>Change receiving address</button>
+      )}
+    </div>
   );
 }
 

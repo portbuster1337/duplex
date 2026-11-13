@@ -1029,6 +1029,18 @@ h3 {
   align-self: center;
 }
 
+.address-change {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 10px 0;
+}
+
+.address-change .hint {
+  margin: 0;
+}
+
 .recording,
 .voice-preview {
   display: flex;
