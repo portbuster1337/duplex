@@ -262,7 +262,7 @@ function GroupRow({ g, items, active, onClick }: { g: Group; items?: ChatItem[];
       <span class="row-main">
         <span class="row-top">
           <span class="row-name">
-            <Icon name="users" size={13} class="kind" title="group" />
+            {g.channel ? <Icon name="megaphone" size={13} class="kind" title="channel" /> : <Icon name="users" size={13} class="kind" title="group" />}
             {groupName(g)}
             {g.incognito && <Icon name="incognito" size={13} class="incog" title={`incognito as ${g.incognito.displayName}`} />}
             {g.favorite && <Icon name="star" size={12} class="fav" />}

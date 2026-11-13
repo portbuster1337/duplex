@@ -294,7 +294,7 @@ export function ChatView({ session, chatId, onBack, onDeleted, onOpen }: { sessi
             </button>
           </>
         )}
-        <button class="icon-btn" onClick={() => setInfo(true)} aria-label={contact ? 'Contact info' : 'Group info'} title={contact ? 'Contact info' : 'Group info'}>
+        <button class="icon-btn" onClick={() => setInfo(true)} aria-label={contact ? 'Contact info' : group?.channel ? 'Channel info' : 'Group info'} title={contact ? 'Contact info' : group?.channel ? 'Channel info' : 'Group info'}>
           <Icon name="info" />
         </button>
       </header>
@@ -325,7 +325,7 @@ export function ChatView({ session, chatId, onBack, onDeleted, onOpen }: { sessi
         {shownItems.map((it) => {
           const day = fmtDay(it.brokerTs ?? it.ts);
           const sep = day !== lastDay ? <div class="day">{day}</div> : null;
-          // in groups, the sender is shown above the first of its consecutive messages
+          // in groups, the sender is shown above the first of its consecutive messages (channel posts have none)
           const sender = group && it.dir === 'rcv' ? it.memberId : undefined;
           const showSender = !!sender && (sender !== lastSender || !!sep);
           lastSender = it.dir === 'rcv' ? sender : undefined;
@@ -508,6 +508,10 @@ export function ChatView({ session, chatId, onBack, onDeleted, onOpen }: { sessi
 }
 
 function groupStatusText(g: Group, connected: number, ttl?: number): string {
+  if (g.channel && g.status === 'active') {
+    const n = g.channel.subscribers;
+    return ['channel', n !== undefined ? `${n} subscriber${n === 1 ? '' : 's'}` : '', g.incognito ? `incognito as ${g.incognito.displayName}` : ''].filter(Boolean).join(' · ');
+  }
   switch (g.status) {
     case 'invited':
       return 'you are invited';
@@ -625,6 +629,8 @@ function Bubble({
   onReact: (emoji: string, add: boolean) => void;
 }): JSX.Element {
   const sender = group && it.memberId ? group.members[it.memberId] : undefined;
+  // posts sent as a channel are its own: shown without a sender
+  const inGroup = !!group && it.dir === 'rcv' && !(group.channel && !it.memberId);
   const quoteWho = it.quote ? (it.quote.sent ? 'you' : group ? (it.quote.memberId && group.members[it.quote.memberId] ? memberName(group.members[it.quote.memberId]) : 'member') : 'contact') : '';
   const c = it.content;
   // images and videos with files are shown by FileContent
@@ -636,8 +642,8 @@ function Bubble({
     onMenu(e.clientX, e.clientY);
   };
   return (
-    <div class={`msg ${it.dir} ${group && it.dir === 'rcv' ? 'in-group' : ''} ${flash ? 'flash' : ''}`} data-item={it.id}>
-      {group && it.dir === 'rcv' && (showSender ? <Avatar profile={sender?.profile} size={28} /> : <span class="avatar-gap" />)}
+    <div class={`msg ${it.dir} ${inGroup ? 'in-group' : ''} ${flash ? 'flash' : ''}`} data-item={it.id}>
+      {inGroup && (showSender ? <Avatar profile={sender?.profile} size={28} /> : <span class="avatar-gap" />)}
       <div class={`bubble ${it.deleted ? 'deleted' : ''} ${it.file && (c.type === 'image' || c.type === 'video') ? 'has-media' : ''}`} onContextMenu={open}>
         {showSender && (
           <div class="sender">

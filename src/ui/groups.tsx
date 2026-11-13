@@ -97,6 +97,109 @@ export function NewGroup({ session, onCreated }: { session: Session; onCreated: 
 }
 
 export function GroupInfo({ session, group, onClose, onDeleted, onOpenChat }: { session: Session; group: Group; onClose: () => void; onDeleted: () => void; onOpenChat?: (chatId: string) => void }): JSX.Element {
+  if (group.channel) return <ChannelInfo session={session} group={group} onClose={onClose} onDeleted={onDeleted} />;
+  return <GroupPanel session={session} group={group} onClose={onClose} onDeleted={onDeleted} onOpenChat={onOpenChat} />;
+}
+
+/** a channel, as a subscriber sees it: the relays the posts come through, its owners, its link */
+function ChannelInfo({ session, group, onClose, onDeleted }: { session: Session; group: Group; onClose: () => void; onDeleted: () => void }): JSX.Element {
+  const chat = session.chat;
+  useChatUpdates(session);
+  const g = chat.group(group.id) ?? group;
+  const [alias, setAlias] = useState(g.localAlias ?? '');
+  const [confirm, setConfirm] = useState<'leave' | 'delete'>();
+  const [busy, setBusy] = useState(false);
+  const relays = chat.groups.members(g).filter((m) => m.role === 'relay');
+  const owners = chat.groups.members(g).filter((m) => m.role === 'owner');
+  const run = async (f: () => Promise<void>, done?: () => void) => {
+    setBusy(true);
+    try {
+      await f();
+      done?.();
+    } catch (e) {
+      toast(errorText(e), 'error');
+    }
+    setBusy(false);
+  };
+  return (
+    <Modal title="Channel" onClose={onClose}>
+      <div class="profile-card">
+        <Avatar profile={g.profile as Profile} size={88} />
+        <h3>
+          <Icon name="megaphone" size={18} /> {groupName(g)}
+        </h3>
+        {g.profile.fullName && <p class="muted">{g.profile.fullName}</p>}
+        {g.profile.description && <p class="welcome">{g.profile.description}</p>}
+      </div>
+      <div class="kv">
+        <span>Subscribers</span>
+        <span>{g.channel!.subscribers ?? 'unknown'}</span>
+        <span>Your role</span>
+        <span>{g.role}</span>
+        <span>Owners</span>
+        <span>{owners.map((m) => memberName(m)).join(', ') || 'unknown'}</span>
+        <span>Relays</span>
+        <span>
+          {relays.map((m) => `${memberName(m)} (${m.status === 'connected' ? 'connected' : memberGone(m) ? 'left' : 'connecting…'})`).join(', ') || 'none'}
+        </span>
+      </div>
+      <p class="hint">The posts come through the chat relays of the channel, which forward them to each subscriber; what changes the channel is signed by its owners, so a relay cannot change it. The relays and the owners see the profile you joined with, other subscribers do not.</p>
+      <h4 class="members-head">Channel link</h4>
+      <LinkShare link={g.channel!.link} note="Anyone with this link can subscribe." />
+      <label>
+        Local name (only you see it)
+        <input value={alias} onInput={(e) => setAlias((e.target as HTMLInputElement).value)} onBlur={() => chat.groups.updateLocal(g.id, { localAlias: alias.trim() || undefined })} placeholder={g.profile.displayName} />
+      </label>
+      <Toggle checked={!!g.favorite} onChange={(v) => chat.groups.updateLocal(g.id, { favorite: v })} label="Favorite" />
+      <Toggle checked={!!g.muted} onChange={(v) => chat.groups.updateLocal(g.id, { muted: v })} label="Mute notifications" />
+      {g.incognito && (
+        <p class="note">
+          <Icon name="incognito" size={16} /> You subscribed incognito: the relays and owners see the random profile <b>{g.incognito.displayName}</b>, not yours.
+        </p>
+      )}
+      <div class="row">
+        <button onClick={() => chat.clearChat(g.id)}>Clear chat</button>
+        {groupActive(g) && !confirm && (
+          <button class="danger" onClick={() => setConfirm('leave')}>
+            Leave channel
+          </button>
+        )}
+        {!confirm && (
+          <button class="danger" onClick={() => setConfirm('delete')}>
+            Delete channel
+          </button>
+        )}
+      </div>
+      {confirm && (
+        <div class="confirm">
+          <p>{confirm === 'leave' ? 'You will stop receiving the posts of this channel. They stay until you delete the chat.' : 'The channel and its posts are deleted from this browser.'}</p>
+          <div class="row">
+            <button onClick={() => setConfirm(undefined)}>Cancel</button>
+            <button
+              class="danger"
+              disabled={busy}
+              onClick={() =>
+                confirm === 'leave'
+                  ? run(() => chat.groups.leave(g.id), () => setConfirm(undefined))
+                  : run(
+                      () => chat.groups.delete(g.id),
+                      () => {
+                        onClose();
+                        onDeleted();
+                      },
+                    )
+              }
+            >
+              {confirm === 'leave' ? 'Leave' : 'Delete'}
+            </button>
+          </div>
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+function GroupPanel({ session, group, onClose, onDeleted, onOpenChat }: { session: Session; group: Group; onClose: () => void; onDeleted: () => void; onOpenChat?: (chatId: string) => void }): JSX.Element {
   const chat = session.chat;
   useChatUpdates(session);
   const g = chat.group(group.id) ?? group;

@@ -511,15 +511,16 @@ export class ChatClient {
   }
 
   /** what a link connects to, before connecting */
-  async previewLink(link: string): Promise<{ kind: 'invitation' | 'contact' | 'group' | 'channel'; profile?: Profile; groupProfile?: GroupProfile; message?: string; resolved?: Awaited<ReturnType<Agent['resolveLink']>> }> {
+  async previewLink(link: string): Promise<{ kind: 'invitation' | 'contact' | 'group' | 'channel'; profile?: Profile; groupProfile?: GroupProfile; message?: string; subscribers?: number; resolved?: Awaited<ReturnType<Agent['resolveLink']>> }> {
     const l = link.trim();
     if (isShortLink(l)) {
       const sl = parseShortLink(l);
-      if (sl.mode === 'contact' && (sl.type === 'C' || sl.type === 'R')) return { kind: 'channel' };
+      if (sl.mode === 'contact' && sl.type === 'R') throw new ChatError('this is the address of a chat relay, not of a channel');
       const resolved = await this.agent.resolveLink(l);
-      const d = parseShortLinkData(resolved.userData);
+      const d = parseShortLinkData(resolved.userData) as ReturnType<typeof parseShortLinkData> & { publicGroupData?: { publicMemberCount?: number } };
       const gp = d.groupProfile as GroupProfile | undefined;
-      if (sl.mode === 'contact' && (sl.type === 'G' || groupLinkIdOf(resolved.connReq.data.clientData))) return { kind: gp?.publicGroup ? 'channel' : 'group', groupProfile: gp, resolved };
+      if (sl.mode === 'contact' && (sl.type === 'C' || gp?.publicGroup)) return { kind: 'channel', groupProfile: gp, subscribers: d.publicGroupData?.publicMemberCount, resolved };
+      if (sl.mode === 'contact' && (sl.type === 'G' || groupLinkIdOf(resolved.connReq.data.clientData))) return { kind: 'group', groupProfile: gp, resolved };
       return { kind: sl.mode === 'invitation' ? 'invitation' : 'contact', profile: d.profile, message: d.message ? contentText(d.message) : undefined, resolved };
     }
     const resolved = await this.agent.resolveLink(l);
@@ -532,13 +533,14 @@ export class ChatClient {
     return this.groups.create(p, incognito ? randomProfile() : undefined);
   }
 
-  /** joins a group via its link (the group is shown once the admin accepts) */
+  /** joins a group via its link (the group is shown once the admin accepts), or a channel */
   async joinGroup(link: string, opts: { resolved?: Awaited<ReturnType<Agent['resolveLink']>>; incognito?: boolean } = {}): Promise<Group> {
     const resolved = opts.resolved ?? (await this.agent.resolveLink(link));
     if (resolved.connReq.mode !== 'contact') throw new ChatError('this is not a group link');
     const gp = parseShortLinkData(resolved.userData).groupProfile as GroupProfile | undefined;
-    if (gp?.publicGroup) throw new ChatError('channels are not supported yet');
-    return this.groups.joinViaLink(resolved, gp, opts.incognito ? randomProfile() : undefined);
+    const incognito = opts.incognito ? randomProfile() : undefined;
+    if (gp?.publicGroup) return this.groups.joinChannel(resolved, incognito);
+    return this.groups.joinViaLink(resolved, gp, incognito);
   }
 
   /** connects via a 1-time invitation or a contact address */

@@ -5,6 +5,7 @@ import { b64, b64url, fromB64, fromUtf8, fromUtf8Lossy, randomBytes, utf8, type 
 import { Decoder, Encoder, ParseError } from '../util/encoding';
 import { zstdCompress } from '../util/zstd';
 import { parseVR, strVR, type VersionRange } from '../util/version';
+import { sign, verify, type PrivateKey, type PublicKey } from '../crypto/crypto';
 
 /**
  * Chat protocol versions this client supports. Advertising v16 (short link data) keeps peers from
@@ -121,10 +122,31 @@ function toChatMessage(v: unknown): ChatMessage {
 export interface ParsedChatMsg {
   msg?: ChatMessage;
   error?: string;
-  /** the element was signed by a group member (signatures are not verified by this client) */
+  /** the element was signed by a group member */
   signed?: boolean;
+  /** a signed element: the binding tag (G group, D direct, C channel), the signatures, and the signed body */
+  sig?: { binding: string; sigs: Bytes[]; body: Bytes };
   /** forwarded by a group member or channel relay: the original sender, and when the router got it (ms) */
   forward?: { memberId?: string; memberName?: string; brokerTs: number };
+}
+
+/** the binding of a message signed by a member of a channel (CBGroup): the channel ID and the member ID */
+export const groupBinding = (publicGroupId: Bytes, memberId: Bytes): Bytes => new Encoder().char('G').bytes(publicGroupId).bytes(memberId).finish();
+
+/** the binding of a message sent as the channel (CBChannel) */
+export const channelBinding = (publicGroupId: Bytes): Bytes => new Encoder().char('C').bytes(publicGroupId).finish();
+
+/** a signed element ('/'): the binding tag, one member signature over the binding and the body, the body */
+export function signedElement(binding: Bytes, priv: PrivateKey<'ed25519'>, body: Bytes): Bytes {
+  const sig = sign(priv, new Encoder().raw(binding).raw(body).finish());
+  return new Encoder().char('/').byte(binding[0]).byte(1).char('M').bytes(sig).raw(body).finish();
+}
+
+/** all signatures of a signed element are by one of these keys, over this binding */
+export function verifySigned(sig: NonNullable<ParsedChatMsg['sig']>, binding: Bytes, keys: PublicKey<'ed25519'>[]): boolean {
+  if (!sig.sigs.length || String.fromCharCode(binding[0]) !== sig.binding) return false;
+  const signed = new Encoder().raw(binding).raw(sig.body).finish();
+  return sig.sigs.every((s) => keys.some((k) => verify(k, s, signed)));
 }
 
 function parseJsonElement(b: Bytes): ParsedChatMsg {
@@ -143,12 +165,13 @@ function parseElement(b: Bytes, fwd?: ParsedChatMsg['forward']): ParsedChatMsg {
     // '/' chatBinding signatures body: signed by a group member
     try {
       const d = new Decoder(b.subarray(1));
-      d.char();
-      d.list((d) => {
+      const binding = d.char();
+      const sigs = d.list((d) => {
         d.char();
-        d.bytes();
+        return d.bytes();
       });
-      return { ...parseJsonElement(d.rest()), signed: true, forward: fwd };
+      const body = d.rest();
+      return { ...parseJsonElement(body), signed: true, sig: { binding, sigs, body }, forward: fwd };
     } catch (e) {
       return { error: `bad signed element: ${(e as Error).message}` };
     }

@@ -31,6 +31,10 @@ Chat are trademarks of SimpleX Chat Ltd.
   the last 100 like the apps, or as many as that admin chooses, up to all of them. A group can
   review who joins via its link: until a moderator accepts them, they only chat privately with the
   moderators, as in the apps; any member can also chat privately with the moderators.
+- **Channels**: subscribe via a channel link and read the posts, which come through the channel's
+  chat relays (with the history the relays keep); what changes the channel (its profile, deletion,
+  removing you) is accepted only when signed by an owner, whose keys come from the channel link, so a
+  relay cannot make it up. What Duplex sends to the relays is signed with its own member key.
 - **Audio and video calls** with the apps, over WebRTC: the call page of the apps is followed
   closely (the media frames are encrypted end to end with the key agreed in the chat), and calls go
   through the TURN server of SimpleX Chat by default, so contacts do not see your IP address. You
@@ -111,7 +115,8 @@ use on it belong to the same client.
 
 ### Limitations
 
-- No channels (groups with relays) yet.
+- Channels: Duplex subscribes to channels but cannot create them or act as a relay, and it does not
+  read the signed roster of a channel, so only the owners (not admins or moderators) are recognised.
 - Calls: no group calls (SimpleX has none); calls ring only while the page is open. Tor Browser
   disables WebRTC, so calls do not work there.
 - Files are kept in the encrypted storage of this browser, which browsers limit in size; large files
@@ -152,8 +157,8 @@ Tests:
 |---|---|
 | `npm test` | unit tests: crypto against libsodium and OpenSSL vectors, sntrup761 against the C code of simplexmq, the post-quantum ratchet, links of the official client, certificate pinning, zstd compression, the encrypted storage, HTTP/2 header compression (RFC 7541 examples), file descriptions against the fixture of simplexmq, voice formats (with `FFMPEG_DIR`, against ffmpeg) |
 | `SMP_SERVER=smp://…@localhost:7001 SMP_SERVER2=smp://…@localhost:7003 npm run test:local` | two agents connecting through local `smp-server`s: invitations, short links, addresses, receipts, private message routing and address changes between the two |
-| `SMP_SERVER=… SMP_SERVER2=… XFTP_SERVER=xftp://…@localhost:7002 SIMPLEX_CHAT_BIN=… npm run test:interop` | the chat client against the official SimpleX Chat CLI (on the second router, so that Duplex sends to it with private routing): post-quantum encryption, address changes both ways, files through a local `xftp-server`; groups with two CLI users: invitations, introductions in both directions, Duplex as the admin, group links both ways, leaving and removing |
-| `CHROME_PATH=… SIMPLEX_CHAT_BIN=… npm run e2e` | the production build in headless Chrome on the real SimpleX network, chatting with the official CLI, and a video call through the TURN server of SimpleX Chat with the call page of the apps (`test/e2e/fixtures/official-call`) on the other side (run `npm run build` and `npm run relay` first, or set `APP_URL` to the published page; without `CHROME_PATH`, it uses a browser installed with `npx playwright install chromium`) |
+| `SMP_SERVER=… SMP_SERVER2=… XFTP_SERVER=xftp://…@localhost:7002 SIMPLEX_CHAT_BIN=… npm run test:interop` | the chat client against the official SimpleX Chat CLI (on the second router, so that Duplex sends to it with private routing): post-quantum encryption, address changes both ways, files through a local `xftp-server`; groups with two CLI users: invitations, introductions in both directions, Duplex as the admin, group links both ways, the history for new members, member review as host, joiner and moderator, leaving and removing; a channel with a CLI chat relay and a CLI owner, with Duplex as a subscriber |
+| `CHROME_PATH=… SIMPLEX_CHAT_BIN=… npm run e2e` | the production build in headless Chrome on the real SimpleX network, chatting with the official CLI (groups, member review, a channel served by a CLI chat relay), and a video call through the TURN server of SimpleX Chat with the call page of the apps (`test/e2e/fixtures/official-call`) on the other side (run `npm run build` and `npm run relay` first, or set `APP_URL` to the published page; without `CHROME_PATH`, it uses a browser installed with `npx playwright install chromium`) |
 
 `npm run check-server -- smp://… [wss://relay/]` connects to a server (directly or through a relay)
 and makes a queue.

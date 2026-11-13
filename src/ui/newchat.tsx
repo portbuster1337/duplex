@@ -131,9 +131,7 @@ function Connect({ session, onOpen }: { session: Session; onOpen: (s: Selection)
     setPreview(undefined);
     setBusy(true);
     try {
-      const p = await session.chat.previewLink(link);
-      if (p.kind === 'channel') setErr('This is a channel link — channels are not supported in Duplex yet.');
-      else setPreview(p);
+      setPreview(await session.chat.previewLink(link));
     } catch (e) {
       setErr(`This link cannot be used: ${errorText(e)}`);
     }
@@ -144,7 +142,7 @@ function Connect({ session, onOpen }: { session: Session; onOpen: (s: Selection)
     setBusy(true);
     setErr('');
     try {
-      if (preview?.kind === 'group') {
+      if (preview?.kind === 'group' || preview?.kind === 'channel') {
         const g = await session.chat.joinGroup(link, { resolved: preview.resolved, incognito });
         onOpen({ kind: 'group', id: g.id });
         return;
@@ -160,7 +158,7 @@ function Connect({ session, onOpen }: { session: Session; onOpen: (s: Selection)
   return (
     <div class="connect">
       <label>
-        Paste a SimpleX link (1-time link, contact address or group link)
+        Paste a SimpleX link (1-time link, contact address, group or channel link)
         <textarea
           rows={3}
           value={link}
@@ -179,11 +177,14 @@ function Connect({ session, onOpen }: { session: Session; onOpen: (s: Selection)
       )}
       {preview && (
         <div class="preview">
-          {preview.kind === 'group' ? (
+          {preview.kind === 'group' || preview.kind === 'channel' ? (
             <div class="profile-card small">
-              <Avatar profile={(preview.groupProfile as Profile | undefined) ?? { displayName: 'group', fullName: '' }} size={64} />
-              <h3>{preview.groupProfile?.displayName ?? 'A group'}</h3>
+              <Avatar profile={(preview.groupProfile as Profile | undefined) ?? { displayName: preview.kind, fullName: '' }} size={64} />
+              <h3>
+                {preview.kind === 'channel' && <Icon name="megaphone" size={18} />} {preview.groupProfile?.displayName ?? `A ${preview.kind}`}
+              </h3>
               {preview.groupProfile?.description && <p class="muted">{preview.groupProfile.description}</p>}
+              {preview.kind === 'channel' && preview.subscribers !== undefined && <p class="muted small">{preview.subscribers} subscribers</p>}
             </div>
           ) : preview.profile ? (
             <div class="profile-card small">
@@ -200,9 +201,16 @@ function Connect({ session, onOpen }: { session: Session; onOpen: (s: Selection)
               ? 'You will share your profile with this contact. The connection is established once both of you are online.'
               : preview.kind === 'group'
                 ? 'You will join this group with your profile: its members see it. The group admin accepts you, then introduces you to the members.'
-                : 'A contact request with your profile will be sent. The address owner can accept or reject it.'}
+                : preview.kind === 'channel'
+                  ? 'You will get the posts of this channel through its chat relays. The relays and the owners see the profile you join with; other subscribers do not.'
+                  : 'A contact request with your profile will be sent. The address owner can accept or reject it.'}
           </p>
-          <Toggle checked={incognito} onChange={setIncognito} label={preview.kind === 'group' ? 'Join incognito' : 'Connect incognito'} hint={preview.kind === 'group' ? 'Members see a new random profile instead of yours' : 'Share a new random profile with this contact instead of yours'} />
+          <Toggle
+            checked={incognito}
+            onChange={setIncognito}
+            label={preview.kind === 'group' || preview.kind === 'channel' ? 'Join incognito' : 'Connect incognito'}
+            hint={preview.kind === 'group' ? 'Members see a new random profile instead of yours' : preview.kind === 'channel' ? 'The relays and the owners see a new random profile instead of yours' : 'Share a new random profile with this contact instead of yours'}
+          />
           {preview.kind === 'contact' && (
             <label>
               Message (optional)
@@ -212,7 +220,7 @@ function Connect({ session, onOpen }: { session: Session; onOpen: (s: Selection)
           <div class="row">
             <button onClick={() => setPreview(undefined)}>Back</button>
             <button class="primary" disabled={busy} onClick={connect}>
-              {busy ? <Spinner label="Connecting…" /> : preview.kind === 'invitation' ? 'Connect' : preview.kind === 'group' ? 'Join group' : 'Send request'}
+              {busy ? <Spinner label="Connecting…" /> : preview.kind === 'invitation' ? 'Connect' : preview.kind === 'group' ? 'Join group' : preview.kind === 'channel' ? 'Join channel' : 'Send request'}
             </button>
           </div>
         </div>

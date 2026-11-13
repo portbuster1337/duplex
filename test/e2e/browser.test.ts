@@ -415,6 +415,40 @@ test('the browser reviews who joins its group link, and chats with them first', 
   await page.locator('.chat-head .chat-sub', { hasText: 'only this member and the moderators' }).waitFor({ timeout: 30000 });
 });
 
+test('the browser subscribes to a channel of the CLI, served by a CLI chat relay', async () => {
+  // a second CLI runs as a chat relay; the CLI user owns the channel
+  const relay = await Cli.start('relay', 5330, SERVER, ['--relay', '--headless']);
+  try {
+    const sa = await relay.cmd('/sa');
+    const rl = sa.contactLink?.connLinkContact;
+    assert.equal((await cli.cmd(`/relays name=relay ${rl?.connShortLink ?? rl?.connFullLink}`)).type, 'cmdOk');
+    const rs = await cli.cmd('/relays');
+    const relayId = (rs.userServers ?? []).flatMap((u: any) => u.chatRelays ?? []).find((c: any) => !c.preset && c.relayProfile?.displayName === 'relay')?.chatRelayId;
+    assert.equal((await cli.cmd(`/public group relays=${relayId} #bulletin`)).type, 'publicGroupCreated');
+    await cli.waitType('groupLinkDataUpdated', NET);
+    const gl = (await cli.cmd('/show link #bulletin')).groupLink?.connLinkContact;
+    const link = gl?.connShortLink ?? gl?.connFullLink;
+    await cli.cmd('#bulletin The first post of the bulletin');
+    await page.getByLabel('New chat').first().click();
+    await page.getByRole('button', { name: /^Connect via a link/ }).click();
+    await page.locator('.connect textarea').fill(link);
+    await page.getByRole('button', { name: 'Continue' }).click();
+    await page.getByRole('button', { name: 'Join channel' }).click({ timeout: NET });
+    await page.locator('.chat-head .chat-name', { hasText: 'bulletin' }).waitFor({ timeout: NET });
+    // the history, then a new post, shown as the channel's
+    await page.locator('.msg.rcv', { hasText: 'The first post of the bulletin' }).waitFor({ timeout: NET });
+    await cli.cmd('#bulletin A second post');
+    await page.locator('.msg.rcv:not(.in-group)', { hasText: 'A second post' }).waitFor({ timeout: NET });
+    await page.locator('.composer textarea[disabled]').waitFor();
+    await shot('19-channel');
+    await page.getByLabel('Channel info').click();
+    await page.locator('.kv', { hasText: 'connected' }).waitFor({ timeout: 30000 });
+    await page.getByLabel('Close').click();
+  } finally {
+    relay.stop();
+  }
+});
+
 /** serves a directory on 127.0.0.1 (a secure context for getUserMedia) */
 function serveDir(dir: string): Promise<{ url: string; close: () => void }> {
   const types: Record<string, string> = { '.html': 'text/html', '.js': 'text/javascript' };
