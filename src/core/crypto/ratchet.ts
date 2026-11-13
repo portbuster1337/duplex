@@ -1,10 +1,12 @@
 // Double ratchet with header encryption, as in Simplex.Messaging.Crypto.Ratchet (e2e version 3):
 // X448 DH keys, HKDF-SHA512, AES-256-GCM with 16-byte IVs, padded headers and bodies.
-// Post-quantum KEM parameters are parsed, and this side does not propose or accept KEM.
+// With post-quantum encryption, each ratchet step also exchanges an sntrup761 key and ciphertext, and
+// the KEM secret is added to the DH secret (the PQ double ratchet of SimpleX, e2e version 3).
 import { concat, b64url, type Bytes } from '../util/bytes';
 import { Decoder, Encoder, ParseError } from '../util/encoding';
 import { decPubKey, decryptAEAD, dh, encPubKey, encryptAEAD, generateKeyPair, hkdf, publicKey, CryptoError, type PrivateKey, type PublicKey } from './crypto';
 import { decVR, encVR, type VersionRange } from '../util/version';
+import { sntrup761Dec, sntrup761Enc, sntrup761Keypair, type KemKeyPair } from './sntrup761';
 
 export const E2E_VERSIONS: VersionRange = { min: 3, max: 3 };
 export const PADDED_HEADER_LEN_PQ = 2310;
@@ -75,15 +77,48 @@ export function decE2EParamsUri(d: Decoder): E2EParamsUri {
   return { versions, k1, k2, kem };
 }
 
+/** the private part of the KEM parameters: a proposed key, or an accepted one with the encapsulation */
+export type PrivKem = { tag: 'P'; kp: KemKeyPair } | { tag: 'A'; ct: Bytes; ss: Bytes; kp: KemKeyPair };
+
 export interface E2EPrivParams {
   pk1: X448Priv;
   pk2: X448Priv;
+  kem?: PrivKem;
 }
 
-export function generateE2EParams(version: number): { priv: E2EPrivParams; params: E2EParams } {
+/** whether to propose a KEM key, or accept a received one (UseKEM) */
+export type UseKem = { tag: 'propose' } | { tag: 'accept'; key: Bytes };
+
+export function generateE2EParams(version: number, useKem?: UseKem): { priv: E2EPrivParams; params: E2EParams } {
   const a = generateKeyPair('x448');
   const b = generateKeyPair('x448');
-  return { priv: { pk1: a.priv, pk2: b.priv }, params: { version, k1: a.pub, k2: b.pub } };
+  const priv: E2EPrivParams = { pk1: a.priv, pk2: b.priv };
+  const params: E2EParams = { version, k1: a.pub, k2: b.pub };
+  if (useKem) {
+    const kp = sntrup761Keypair();
+    if (useKem.tag === 'propose') {
+      priv.kem = { tag: 'P', kp };
+      params.kem = { tag: 'P', key: kp.pub };
+    } else {
+      const { ct, ss } = sntrup761Enc(useKem.key);
+      priv.kem = { tag: 'A', ct, ss, kp };
+      params.kem = { tag: 'A', ct, key: kp.pub };
+    }
+  }
+  return { priv, params };
+}
+
+/** replyKEM_: the joining party accepts a proposed KEM key, or proposes its own */
+export function replyKem(received: KemParams | undefined, pqSupport: boolean): UseKem | undefined {
+  if (!pqSupport) return undefined;
+  return received?.tag === 'P' ? { tag: 'accept', key: received.key } : { tag: 'propose' };
+}
+
+/** a KEM exchange: the received key, the shared secret and the ciphertext sent with it */
+export interface KemAccepted {
+  pqRr: Bytes;
+  pqRss: Bytes;
+  pqRct: Bytes;
 }
 
 export interface RatchetInitParams {
@@ -92,6 +127,7 @@ export interface RatchetInitParams {
   ratchetKey: Bytes;
   sndHK: Bytes;
   rcvNextHK: Bytes;
+  kemAccepted?: KemAccepted;
 }
 
 function hkdf3(salt: Bytes, ikm: Bytes, info: string): [Bytes, Bytes, Bytes] {
@@ -99,23 +135,46 @@ function hkdf3(salt: Bytes, ikm: Bytes, info: string): [Bytes, Bytes, Bytes] {
   return [out.slice(0, 32), out.slice(32, 64), out.slice(64, 96)];
 }
 
-function pqX3dh(sk1: X448Pub, rk1: X448Pub, dh1: Bytes, dh2: Bytes, dh3: Bytes): RatchetInitParams {
+function pqX3dh(sk1: X448Pub, rk1: X448Pub, dh1: Bytes, dh2: Bytes, dh3: Bytes, kemAccepted?: KemAccepted): RatchetInitParams {
   const assocData = concat(sk1.key, rk1.key);
-  const dhs = concat(dh1, dh2, dh3);
+  // the KEM shared secret is added to the DH secrets (hybrid key agreement)
+  const dhs = concat(dh1, dh2, dh3, kemAccepted?.pqRss ?? new Uint8Array(0));
   const salt = new Uint8Array(64);
   const [hk, nhk, sk] = hkdf3(salt, dhs, 'SimpleXX3DH');
   const vcPQ = hkdf(salt, dhs, 'SimpleXVerifyCode', 32);
-  return { assocData, vcPQ, ratchetKey: sk, sndHK: hk, rcvNextHK: nhk };
+  return { assocData, vcPQ, ratchetKey: sk, sndHK: hk, rcvNextHK: nhk, kemAccepted };
 }
 
-/** used by the party joining the connection, with its own params and the received ones */
-export function pqX3dhSnd(own: E2EPrivParams, rcv: E2EParams): RatchetInitParams {
-  return pqX3dh(publicKey(own.pk1), rcv.k1, dh(rcv.k1, own.pk2), dh(rcv.k2, own.pk1), dh(rcv.k2, own.pk2));
+/** used by the party joining the connection, with its own params and the received ones; also returns its KEM key pair */
+export function pqX3dhSnd(own: E2EPrivParams, rcv: E2EParams): { init: RatchetInitParams; pqRs?: KemKeyPair } {
+  let kemAccepted: KemAccepted | undefined;
+  let pqRs: KemKeyPair | undefined;
+  if (own.kem?.tag === 'A') {
+    if (rcv.kem?.tag !== 'P') throw new RatchetError('KEM', 'ratchet: bad KEM state');
+    kemAccepted = { pqRr: rcv.kem.key, pqRss: own.kem.ss, pqRct: own.kem.ct };
+    pqRs = own.kem.kp;
+  } else if (own.kem?.tag === 'P') pqRs = own.kem.kp;
+  const init = pqX3dh(publicKey(own.pk1), rcv.k1, dh(rcv.k1, own.pk2), dh(rcv.k2, own.pk1), dh(rcv.k2, own.pk2), kemAccepted);
+  return { init, pqRs };
 }
 
-/** used by the party that created the connection, after receiving the reply */
-export function pqX3dhRcv(own: E2EPrivParams, snd: E2EParams): RatchetInitParams {
-  return pqX3dh(snd.k1, publicKey(own.pk1), dh(snd.k2, own.pk1), dh(snd.k1, own.pk2), dh(snd.k2, own.pk2));
+/** used by the party that created the connection, after receiving the reply; also returns its KEM key pair if the reply accepted it */
+export function pqX3dhRcv(own: E2EPrivParams, snd: E2EParams): { init: RatchetInitParams; pqRs?: KemKeyPair } {
+  let kemAccepted: KemAccepted | undefined;
+  let pqRs: KemKeyPair | undefined;
+  // a proposal in the reply is answered on the first ratchet step
+  if (snd.kem?.tag === 'A') {
+    if (own.kem?.tag !== 'P') throw new RatchetError('KEM', 'ratchet: bad KEM state');
+    kemAccepted = { pqRr: snd.kem.key, pqRss: sntrup761Dec(snd.kem.ct, own.kem.kp.priv), pqRct: snd.kem.ct };
+    pqRs = own.kem.kp;
+  }
+  const init = pqX3dh(snd.k1, publicKey(own.pk1), dh(snd.k2, own.pk1), dh(snd.k1, own.pk2), dh(snd.k2, own.pk2), kemAccepted);
+  return { init, pqRs };
+}
+
+export interface RatchetKem {
+  pqRs: KemKeyPair;
+  kems?: KemAccepted;
 }
 
 export interface Ratchet {
@@ -123,8 +182,14 @@ export interface Ratchet {
   ad: Bytes;
   vcPQ?: Bytes;
   dhRs: X448Priv;
-  /** whether large (PQ) headers are used when sending; always false on this side */
+  kem?: RatchetKem;
+  /** whether large (PQ) headers are used when sending; it can only be enabled */
   supportKEM: boolean;
+  /** KEM is used from the next ratchet step */
+  enableKEM?: boolean;
+  /** the current sending and receiving ratchets use KEM secrets (post-quantum encryption) */
+  sndKEM?: boolean;
+  rcvKEM?: boolean;
   rk: Bytes;
   snd?: { dhRr: X448Pub; cks: Bytes; hks: Bytes };
   rcv?: { ckr: Bytes; hkr: Bytes };
@@ -138,8 +203,9 @@ export interface Ratchet {
 /** skipped message keys: header key (base64) -> message number -> [key, iv] */
 export type SkippedKeys = Record<string, { hk: Bytes; keys: Record<number, [Bytes, Bytes]> }>;
 
-function rootKdf(rk: Bytes, k: X448Pub, pk: X448Priv): [Bytes, Bytes, Bytes] {
-  return hkdf3(rk, dh(k, pk), 'SimpleXRootRatchet');
+function rootKdf(rk: Bytes, k: X448Pub, pk: X448Priv, kemSecret?: Bytes): [Bytes, Bytes, Bytes] {
+  const dhOut = dh(k, pk);
+  return hkdf3(rk, kemSecret ? concat(dhOut, kemSecret) : dhOut, 'SimpleXRootRatchet');
 }
 
 function chainKdf(ck: Bytes): { ck: Bytes; mk: Bytes; iv: Bytes; ehIV: Bytes } {
@@ -147,14 +213,18 @@ function chainKdf(ck: Bytes): { ck: Bytes; mk: Bytes; iv: Bytes; ehIV: Bytes } {
   return { ck: ck2, mk, iv: ivs.slice(0, 16), ehIV: ivs.slice(16, 32) };
 }
 
-export function initSndRatchet(versions: { current: number; maxSupported: number }, dhRr: X448Pub, dhRs: X448Priv, p: RatchetInitParams): Ratchet {
-  const [rk, cks, nhks] = rootKdf(p.ratchetKey, dhRr, dhRs);
+export function initSndRatchet(versions: { current: number; maxSupported: number }, dhRr: X448Pub, dhRs: X448Priv, p: RatchetInitParams, pqRs?: KemKeyPair): Ratchet {
+  const [rk, cks, nhks] = rootKdf(p.ratchetKey, dhRr, dhRs, p.kemAccepted?.pqRss);
   return {
     version: versions,
     ad: p.assocData,
     vcPQ: p.vcPQ,
     dhRs,
-    supportKEM: false,
+    kem: pqRs ? { pqRs, kems: p.kemAccepted } : undefined,
+    supportKEM: !!pqRs,
+    enableKEM: !!pqRs,
+    sndKEM: !!p.kemAccepted,
+    rcvKEM: false,
     rk,
     snd: { dhRr, cks, hks: p.sndHK },
     ns: 0,
@@ -165,13 +235,17 @@ export function initSndRatchet(versions: { current: number; maxSupported: number
   };
 }
 
-export function initRcvRatchet(versions: { current: number; maxSupported: number }, dhRs: X448Priv, p: RatchetInitParams): Ratchet {
+export function initRcvRatchet(versions: { current: number; maxSupported: number }, dhRs: X448Priv, p: RatchetInitParams, pqRs?: KemKeyPair, pqSupport = false): Ratchet {
   return {
     version: versions,
     ad: p.assocData,
     vcPQ: p.vcPQ,
     dhRs,
-    supportKEM: false,
+    kem: pqRs ? { pqRs, kems: p.kemAccepted } : undefined,
+    supportKEM: pqSupport,
+    enableKEM: pqSupport,
+    sndKEM: false,
+    rcvKEM: false,
     rk: p.ratchetKey,
     ns: 0,
     nr: 0,
@@ -235,20 +309,39 @@ function parseEncMessage(b: Bytes): { header: Bytes; tag: Bytes; body: Bytes } {
   return { header, tag, body: d.rest() };
 }
 
-/** encrypts a message, returning the encoded EncRatchetMessage and the updated ratchet */
-export function ratchetEncrypt(rc: Ratchet, msg: Bytes, paddedLen: number, maxE2EVersion = E2E_VERSIONS.max): { enc: Bytes; rc: Ratchet } {
+/** the KEM parameters in message headers: our key, with the ciphertext for the peer's key once accepted */
+function kemHeaderParams(k: RatchetKem): KemParams {
+  return k.kems ? { tag: 'A', ct: k.kems.pqRct, key: k.pqRs.pub } : { tag: 'P', key: k.pqRs.pub };
+}
+
+/**
+ * encrypts a message, returning the encoded EncRatchetMessage and the updated ratchet. pqEnc turns
+ * post-quantum encryption on or off from the next ratchet step (undefined keeps it as it is).
+ */
+export function ratchetEncrypt(rc: Ratchet, msg: Bytes, paddedLen: number, maxE2EVersion = E2E_VERSIONS.max, pqEnc?: boolean): { enc: Bytes; rc: Ratchet } {
   if (!rc.snd) throw new CryptoError('ratchet: no sending chain');
   const { ck, mk, iv, ehIV } = chainKdf(rc.snd.cks);
   const v = Math.max(E2E_VERSIONS.min, rc.version.current);
+  const enableKEM = pqEnc ?? !!rc.enableKEM;
+  // large headers, once used, stay
+  const supportKEM = rc.supportKEM || enableKEM;
   const maxSupported = Math.max(maxE2EVersion, v);
-  const header = encodeMsgHeader({ maxVersion: maxSupported, dhRs: publicKey(rc.dhRs), pn: rc.pn, ns: rc.ns });
-  const eh = encryptAEAD(rc.snd.hks, ehIV, rc.supportKEM ? PADDED_HEADER_LEN_PQ : PADDED_HEADER_LEN, rc.ad, header);
+  const header = encodeMsgHeader({ maxVersion: maxSupported, dhRs: publicKey(rc.dhRs), kem: rc.kem ? kemHeaderParams(rc.kem) : undefined, pn: rc.pn, ns: rc.ns });
+  const eh = encryptAEAD(rc.snd.hks, ehIV, supportKEM ? PADDED_HEADER_LEN_PQ : PADDED_HEADER_LEN, rc.ad, header);
   const emHeader = new Encoder().word16(v).raw(ehIV).raw(eh.tag).large(eh.body).finish();
   const em = encryptAEAD(mk, iv, paddedLen, concat(rc.ad, emHeader), msg);
   const enc = new Encoder().large(emHeader).raw(em.tag).raw(em.body).finish();
   return {
     enc,
-    rc: { ...rc, snd: { ...rc.snd, cks: ck }, ns: rc.ns + 1, version: { ...rc.version, maxSupported } },
+    rc: {
+      ...rc,
+      snd: { ...rc.snd, cks: ck },
+      ns: rc.ns + 1,
+      supportKEM,
+      enableKEM,
+      version: { ...rc.version, maxSupported },
+      kem: pqEnc === false && rc.kem ? { pqRs: rc.kem.pqRs } : rc.kem,
+    },
   };
 }
 
@@ -368,14 +461,37 @@ function decryptRcMessage(rc0: Ratchet, skipped0: SkippedKeys, h: MsgHeader, adv
   return { msg: out, rc: { ...rc, rcv: { ...rc.rcv, ckr: ck }, nr: rc.nr + 1 }, skipped };
 }
 
+/** the KEM part of a ratchet step: the secrets for the receiving and the sending ratchets, and the new KEM state */
+function pqRatchetStep(rc: Ratchet, hkem: KemParams | undefined): { kemSS?: Bytes; kemSS2?: Bytes; kem?: RatchetKem } {
+  const pqEnc = !!rc.enableKEM;
+  // no KEM in the header, but this side enabled it: a new key is proposed
+  if (!hkem) return !rc.kem && pqEnc ? { kem: { pqRs: sntrup761Keypair() } } : {};
+  let kemSS: Bytes | undefined;
+  if (hkem.tag === 'A') {
+    if (!rc.kem) throw new RatchetError('KEM', 'ratchet: bad KEM state');
+    kemSS = sntrup761Dec(hkem.ct, rc.kem.pqRs.priv);
+  }
+  if (!pqEnc) return { kemSS };
+  const { ct, ss } = sntrup761Enc(hkem.key);
+  return { kemSS, kemSS2: ss, kem: { pqRs: sntrup761Keypair(), kems: { pqRr: hkem.key, pqRss: ss, pqRct: ct } } };
+}
+
 function ratchetStep(rc: Ratchet, h: MsgHeader): Ratchet {
-  if (h.kem?.tag === 'A') throw new RatchetError('KEM', 'ratchet: unexpected KEM ciphertext');
+  const { kemSS, kemSS2, kem } = pqRatchetStep(rc, h.kem);
   const dhRs2 = generateKeyPair('x448').priv;
-  const [rk1, ckr, nhkr] = rootKdf(rc.rk, h.dhRs, rc.dhRs);
-  const [rk2, cks, nhks] = rootKdf(rk1, h.dhRs, dhRs2);
+  const [rk1, ckr, nhkr] = rootKdf(rc.rk, h.dhRs, rc.dhRs, kemSS);
+  const [rk2, cks, nhks] = rootKdf(rk1, h.dhRs, dhRs2, kemSS2);
+  const sndKEM = !!kemSS2;
+  const rcvKEM = !!kemSS;
+  const enableKEM = sndKEM || rcvKEM || !!kem;
   return {
     ...rc,
     dhRs: dhRs2,
+    kem,
+    supportKEM: rc.supportKEM || enableKEM,
+    enableKEM,
+    sndKEM,
+    rcvKEM,
     rk: rk2,
     snd: { dhRr: h.dhRs, cks, hks: rc.nhks },
     rcv: { ckr, hkr: rc.nhkr },

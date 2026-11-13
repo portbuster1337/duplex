@@ -12,7 +12,9 @@ import { parseServer, serverString } from '../../src/core/smp/server';
 import { sha256 } from '../../src/core/crypto/crypto';
 import { b64url, fromB64, toHex, utf8 } from '../../src/core/util/bytes';
 import { Decoder, Encoder, pad, unPad } from '../../src/core/util/encoding';
-import { encodeChatMessage, MAX_DECOMPRESSED_LENGTH, newSharedMsgId, parseChatMessages, xMsgNew, zstdContentSize } from '../../src/core/chat/protocol';
+import { compressedBatch, compressToLimit, encodeChatMessage, MAX_DECOMPRESSED_LENGTH, newSharedMsgId, parseChatMessages, xMsgNew, zstdContentSize } from '../../src/core/chat/protocol';
+import { zstdCompress } from '../../src/core/util/zstd';
+import { decompress } from 'fzstd';
 import { MemoryBackend, Vault, VaultLockedError, WrongPassphraseError } from '../../src/app/vault';
 
 const fixture = (name: string) => new URL(`./fixtures/${name}`, import.meta.url);
@@ -202,4 +204,31 @@ test('the vault stores only padded ciphertext under keyed hashes', async () => {
   v3.lock();
   await assert.rejects(v3.get('contact:b'), VaultLockedError);
   await assert.rejects(v3.put('contact:b', {}), VaultLockedError);
+});
+
+test('zstd frames of the compressor are read by zstd and by fzstd', () => {
+  const rnd = (n: number) => Uint8Array.from({ length: n }, (_, i) => (i * 2654435761) >>> 24);
+  const cases = [new Uint8Array(0), utf8('x'), new Uint8Array(400).fill(65), utf8('The quick brown fox. '.repeat(60)), utf8(Buffer.from(rnd(30000)).toString('base64')), rnd(5000), utf8('Привет! '.repeat(300))];
+  for (const d of cases) {
+    const z = zstdCompress(d);
+    assert.equal(zstdContentSize(z), d.length);
+    assert.deepEqual(new Uint8Array(zlib.zstdDecompressSync(z)), d);
+    assert.deepEqual(decompress(z), d);
+  }
+  // base64 shrinks by about a quarter
+  const b64 = utf8(Buffer.from(rnd(9000)).toString('base64'));
+  assert.ok(zstdCompress(b64).length < b64.length * 0.8);
+});
+
+test('compressed chat messages for the smaller limits of post-quantum connections', () => {
+  const m = encodeChatMessage(xMsgNew(newSharedMsgId(), { content: { type: 'text', text: 'a long text with words '.repeat(700) } }));
+  assert.ok(m.length > 13380);
+  const c = compressToLimit(13380, m)!;
+  assert.ok(c.length <= 13380);
+  assert.equal(c[0], 0x58);
+  const parsed = parseChatMessages(c);
+  assert.equal(parsed[0].msg?.params.content.text, 'a long text with words '.repeat(700));
+  // short bodies are not compressed
+  assert.deepEqual(compressToLimit(100, utf8('{}')), utf8('{}'));
+  assert.equal(parseChatMessages(compressedBatch(utf8('{"event":"x.ok","params":{}}')))[0].msg?.event, 'x.ok');
 });

@@ -17,6 +17,9 @@ export const SRV_HOSTNAMES_SMP_CLIENT_VERSION = 2;
 
 export const E2E_ENC_CONN_INFO_LENGTH = 14832;
 export const E2E_ENC_AGENT_MSG_LENGTH = 15840;
+/** with post-quantum encryption the ratchet headers are larger, so less is left for the content */
+export const E2E_ENC_CONN_INFO_LENGTH_PQ = 11106;
+export const E2E_ENC_AGENT_MSG_LENGTH_PQ = 13618;
 
 // ---- query strings (http-types renderSimpleQuery / parseSimpleQuery)
 

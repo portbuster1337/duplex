@@ -88,6 +88,12 @@ test('connect via the CLI invitation and exchange messages', { skip: !SERVER }, 
   assert.equal(got.chatItems[0].chatItem.quotedItem?.content?.text, 'hello dave');
   await until(() => chat['items'].get(contact.id)?.find((i) => i.id === sent.id)?.status === 'delivered', 30000, 'delivery receipt');
 
+  // both sides agreed on post-quantum encryption (the CLI proposes it for contacts)
+  await until(() => chat.contact(contact.id)?.pq, 30000, 'post-quantum encryption');
+  const info = await cli.cmd('/i @dave');
+  const ac = info.contact?.activeConn;
+  assert.ok(ac?.pqSndEnabled && ac?.pqRcvEnabled, `CLI: ${JSON.stringify({ pqSupport: ac?.pqSupport, pqEncryption: ac?.pqEncryption, snd: ac?.pqSndEnabled, rcv: ac?.pqRcvEnabled })}`);
+
   // edit, react, delete
   await chat.editItem(contact.id, sent.id, 'hello carol (edited)');
   await cli.waitType('chatItemUpdated', 30000);

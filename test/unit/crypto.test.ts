@@ -128,8 +128,8 @@ function pair(): { alice: Ratchet; bob: Ratchet } {
   const a = generateE2EParams(3);
   const b = generateE2EParams(3);
   const v = { current: 3, maxSupported: 3 };
-  const bob = initSndRatchet(v, a.params.k2, generateKeyPair('x448').priv, pqX3dhSnd(b.priv, a.params));
-  const alice = initRcvRatchet(v, a.priv.pk2, pqX3dhRcv(a.priv, b.params));
+  const bob = initSndRatchet(v, a.params.k2, generateKeyPair('x448').priv, pqX3dhSnd(b.priv, a.params).init);
+  const alice = initRcvRatchet(v, a.priv.pk2, pqX3dhRcv(a.priv, b.params).init);
   return { alice, bob };
 }
 

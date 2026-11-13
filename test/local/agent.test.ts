@@ -134,8 +134,10 @@ test('private message routing: each agent sends through its own router to the ot
     assert.ok(bob.a.network.stats.proxied >= 2, `bob proxied ${bob.a.network.stats.proxied}`);
     assert.ok(alice.a.network.stats.proxied >= 2, `alice proxied ${alice.a.network.stats.proxied}`);
     const before = alice.a.network.stats.proxied;
-    await alice.a.sendMessage(aliceConnId, utf8('via my router'));
+    const viaId = await alice.a.sendMessage(aliceConnId, utf8('via my router'));
     assert.equal(fromUtf8((await bob.wait('MSG')).body), 'via my router');
+    // the counters change when the router's response arrives
+    await alice.wait('SENT', (e) => e.msgId === viaId);
     await bob.a.sendMessage(bobConnId, utf8('via mine'));
     assert.equal(fromUtf8((await alice.wait('MSG')).body), 'via mine');
     assert.ok(alice.a.network.stats.proxied > before);
@@ -144,8 +146,9 @@ test('private message routing: each agent sends through its own router to the ot
     await assert.rejects(alice.a.network.sendToQueue(dest, new Uint8Array(24), { tag: 'SEND', notification: false, body: utf8('x') }), /AUTH/);
     // with private routing off, the commands go directly
     alice.a.config.routing = { mode: 'never', fallback: 'allow' };
-    await alice.a.sendMessage(aliceConnId, utf8('directly'));
+    const directId = await alice.a.sendMessage(aliceConnId, utf8('directly'));
     assert.equal(fromUtf8((await bob.wait('MSG')).body), 'directly');
+    await alice.wait('SENT', (e) => e.msgId === directId);
     assert.ok(alice.a.network.stats.direct >= 1);
   } finally {
     alice.a.stop();

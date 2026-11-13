@@ -12,6 +12,7 @@ import {
   pqX3dhSnd,
   ratchetDecrypt,
   ratchetEncrypt,
+  replyKem,
   RatchetError,
   type E2EParams,
   type E2EPrivParams,
@@ -38,7 +39,9 @@ import type { Connector, SMPClient } from '../smp/client';
 import {
   AGENT_VERSIONS,
   E2E_ENC_AGENT_MSG_LENGTH,
+  E2E_ENC_AGENT_MSG_LENGTH_PQ,
   E2E_ENC_CONN_INFO_LENGTH,
+  E2E_ENC_CONN_INFO_LENGTH_PQ,
   encodeAgentEnvelope,
   encodeAgentMessage,
   parseAgentEnvelope,
@@ -158,6 +161,8 @@ export interface Conn {
   link?: string;
   createdAt: number;
   quotaPaused?: boolean;
+  /** post-quantum encryption is supported (and proposed) in this connection: larger headers, smaller messages */
+  pqSupport?: boolean;
 }
 
 export type AgentEvent =
@@ -212,6 +217,8 @@ export interface AgentConfig {
   shortLinks?: boolean;
   /** private message routing; by default for routers the user does not use, as in the apps */
   routing?: { mode: ProxyMode; fallback: ProxyFallback };
+  /** post-quantum encryption for new connections (default true, as the apps do for contacts) */
+  pq?: boolean;
 }
 
 export class AgentError extends Error {
@@ -258,6 +265,8 @@ export function securityCode(hash: Bytes): string {
     .toString()
     .replace(/(\d{5})(?=\d)/g, '$1 ');
 }
+
+const connInfoLength = (c: Conn) => (c.pqSupport ? E2E_ENC_CONN_INFO_LENGTH_PQ : E2E_ENC_CONN_INFO_LENGTH);
 
 export function isNetworkError(e: unknown): boolean {
   return !(e instanceof SMPError) && !(e instanceof AgentError) && !(e instanceof CryptoError);
@@ -334,6 +343,17 @@ export class Agent {
 
   getConn(id: string): Conn | undefined {
     return this.conns.get(id);
+  }
+
+  /** whether the connection supports post-quantum encryption (and has the smaller message limits) */
+  pqSupport(connId: string): boolean {
+    return !!this.conns.get(connId)?.pqSupport;
+  }
+
+  /** whether messages are post-quantum encrypted in both directions now */
+  pqEncryption(connId: string): boolean {
+    const rc = this.conns.get(connId)?.ratchet;
+    return !!rc?.sndKEM && !!rc.rcvKEM;
   }
 
   /** the security code of a connection, which both parties can compare (codeAD in simplexmq) */
@@ -444,15 +464,18 @@ export class Agent {
   // ---- 1-time invitations (the initiating party)
 
   /** creates a 1-time invitation link; userData (e.g. the chat profile) is stored with the short link */
-  async createInvitation(opts: { userData?: Bytes; shortLink?: boolean } = {}): Promise<{ connId: string; link: string; fullLink: string }> {
+  async createInvitation(opts: { userData?: Bytes; shortLink?: boolean; pq?: boolean } = {}): Promise<{ connId: string; link: string; fullLink: string }> {
     const c = this.newConn('invitation', 'new');
     const srv = this.nextServer();
-    const { priv, params } = generateE2EParams(E2E_VERSIONS.max);
+    const short = opts.shortLink ?? this.config.shortLinks ?? true;
+    c.pqSupport = opts.pq ?? this.config.pq ?? true;
+    // the KEM key is too large for full links: then it is proposed on the first ratchet step
+    const { priv, params } = generateE2EParams(E2E_VERSIONS.max, c.pqSupport && short ? { tag: 'propose' } : undefined);
     c.x3dh = priv;
-    const e2eUri = { versions: E2E_VERSIONS, k1: params.k1, k2: params.k2 };
+    const e2eUri = { versions: E2E_VERSIONS, k1: params.k1, k2: params.k2, kem: params.kem };
     const mkReq = (q: QueueUri): ConnectionRequest => ({ mode: 'invitation', data: { scheme: 'simplex', agentVersions: AGENT_VERSIONS, queues: [q] }, e2e: e2eUri });
     let connReq!: ConnectionRequest;
-    if (opts.shortLink ?? this.config.shortLinks ?? true) {
+    if (short) {
       const root = generateKeyPair('ed25519');
       let linkKey!: Bytes;
       let encFixed!: Bytes;
@@ -496,7 +519,7 @@ export class Agent {
     const am = encodeAgentMessage({ tag: 'I', connInfo });
     c.sndInternalId = 1;
     c.sndLastHash = sha256(am);
-    const { enc, rc } = ratchetEncrypt(c.ratchet, am, E2E_ENC_CONN_INFO_LENGTH);
+    const { enc, rc } = ratchetEncrypt(c.ratchet, am, connInfoLength(c));
     c.ratchet = rc;
     const env = encodeAgentEnvelope({ tag: 'C', agentVersion: c.agentVersion, encConnInfo: enc });
     const clientMsg = encodeClientMessage(sndSecure ? { tag: '_' } : { tag: 'K', senderKey: c.snd.sndPubKey }, env);
@@ -570,12 +593,13 @@ export class Agent {
   }
 
   /** joins a 1-time invitation or sends a contact request to an address; returns the new connection ID */
-  async joinConnection(link: string | ResolvedLink, connInfo: Bytes): Promise<string> {
+  async joinConnection(link: string | ResolvedLink, connInfo: Bytes, opts: { pq?: boolean } = {}): Promise<string> {
     const r = typeof link === 'string' ? await this.resolveLink(link) : link;
-    return r.connReq.mode === 'invitation' ? this.joinInvitation(r, connInfo) : this.joinContact(r, connInfo);
+    const pq = opts.pq ?? this.config.pq ?? true;
+    return r.connReq.mode === 'invitation' ? this.joinInvitation(r, connInfo, pq) : this.joinContact(r, connInfo, pq);
   }
 
-  private async joinInvitation(r: ResolvedLink, connInfo: Bytes): Promise<string> {
+  private async joinInvitation(r: ResolvedLink, connInfo: Bytes, pq: boolean): Promise<string> {
     const cr = r.connReq;
     if (cr.mode !== 'invitation') throw new AgentError('not an invitation');
     const q = cr.data.queues[0];
@@ -587,9 +611,12 @@ export class Agent {
     c.agentVersion = aV;
     c.link = r.link;
     c.snd = this.newSndQueue(q.addr, smpV, r.sndKey);
-    const own = generateE2EParams(e2eV);
+    c.pqSupport = pq;
+    // a proposed KEM key is accepted (encapsulated), otherwise ours is proposed
+    const own = generateE2EParams(e2eV, replyKem(cr.e2e.kem, pq));
     const rcvParams: E2EParams = { version: e2eV, k1: cr.e2e.k1, k2: cr.e2e.k2, kem: cr.e2e.kem };
-    c.ratchet = initSndRatchet({ current: e2eV, maxSupported: E2E_VERSIONS.max }, rcvParams.k2, generateKeyPair('x448').priv, pqX3dhSnd(own.priv, rcvParams));
+    const x3dh = pqX3dhSnd(own.priv, rcvParams);
+    c.ratchet = initSndRatchet({ current: e2eV, maxSupported: E2E_VERSIONS.max }, rcvParams.k2, generateKeyPair('x448').priv, x3dh.init, x3dh.pqRs);
     const sndSecure = c.snd.queueMode === 'M';
     await this.withLock(c.id, async () => {
       await this.save(c);
@@ -604,7 +631,7 @@ export class Agent {
       const am = encodeAgentMessage({ tag: 'D', replyQueues: [replyInfo], connInfo });
       c.sndInternalId = 1;
       c.sndLastHash = sha256(am);
-      const { enc, rc } = ratchetEncrypt(c.ratchet!, am, E2E_ENC_CONN_INFO_LENGTH);
+      const { enc, rc } = ratchetEncrypt(c.ratchet!, am, connInfoLength(c));
       c.ratchet = rc;
       const env = encodeAgentEnvelope({ tag: 'C', agentVersion: c.agentVersion, e2e: own.params, encConnInfo: enc });
       const clientMsg = encodeClientMessage(sndSecure ? { tag: '_' } : { tag: 'K', senderKey: c.snd!.sndPubKey }, env);
@@ -617,7 +644,7 @@ export class Agent {
   }
 
   /** sends a contact request (an invitation to this new connection) to a contact address */
-  private async joinContact(r: ResolvedLink, connInfo: Bytes): Promise<string> {
+  private async joinContact(r: ResolvedLink, connInfo: Bytes, pq: boolean): Promise<string> {
     const cr = r.connReq;
     if (cr.mode !== 'contact') throw new AgentError('not a contact address');
     const q = cr.data.queues[0];
@@ -626,14 +653,16 @@ export class Agent {
     if (smpV === undefined || aV === undefined) throw new AgentError('incompatible address version');
     const c = this.newConn('invitation', 'new');
     c.link = r.link;
-    const { priv, params } = generateE2EParams(E2E_VERSIONS.max);
+    c.pqSupport = pq;
+    // the invitation in a contact request proposes a KEM key (joinContactInitialKeys)
+    const { priv, params } = generateE2EParams(E2E_VERSIONS.max, pq ? { tag: 'propose' } : undefined);
     c.x3dh = priv;
     const { rq } = await this.newRcvQueue(this.nextServer(), 'M');
     c.rcv = rq;
     const inv: ConnectionRequest = {
       mode: 'invitation',
       data: { scheme: 'simplex', agentVersions: AGENT_VERSIONS, queues: [this.queueUri(rq)] },
-      e2e: { versions: E2E_VERSIONS, k1: params.k1, k2: params.k2 },
+      e2e: { versions: E2E_VERSIONS, k1: params.k1, k2: params.k2, kem: params.kem },
     };
     await this.save(c);
     const env = encodeAgentEnvelope({ tag: 'I', agentVersion: aV, connReq: inv, connInfo });
@@ -698,11 +727,11 @@ export class Agent {
   }
 
   /** accepts a contact request received via an address: joins the requester's invitation */
-  async acceptRequest(addressConnId: string, invId: string, connInfo: Bytes): Promise<string> {
+  async acceptRequest(addressConnId: string, invId: string, connInfo: Bytes, opts: { pq?: boolean } = {}): Promise<string> {
     const addr = this.mustConn(addressConnId);
     const req = addr.requests?.[invId];
     if (!req) throw new AgentError('contact request not found');
-    const connId = await this.joinConnection(req.connReq, connInfo);
+    const connId = await this.joinConnection(req.connReq, connInfo, opts);
     await this.withLock(addressConnId, async () => {
       delete addr.requests![invId];
       await this.save(addr);
@@ -738,7 +767,7 @@ export class Agent {
     const sndMsgId = c.sndInternalId + 1;
     const am: AgentMessage = { tag: 'M', sndMsgId, prevMsgHash: c.sndLastHash, msg };
     const agentMsgStr = encodeAgentMessage(am);
-    const { enc, rc } = ratchetEncrypt(c.ratchet, agentMsgStr, E2E_ENC_AGENT_MSG_LENGTH);
+    const { enc, rc } = ratchetEncrypt(c.ratchet, agentMsgStr, c.pqSupport ? E2E_ENC_AGENT_MSG_LENGTH_PQ : E2E_ENC_AGENT_MSG_LENGTH);
     c.ratchet = rc;
     c.sndInternalId = sndMsgId;
     c.sndLastHash = sha256(agentMsgStr);
@@ -940,7 +969,8 @@ export class Agent {
       // the initiating party: create the ratchet from our invitation keys and the received keys
       if (!e2e) throw new AgentError('confirmation without e2e keys');
       if (!isCompatible(e2e.version, E2E_VERSIONS)) throw new AgentError('incompatible e2e version');
-      const rc0 = initRcvRatchet({ current: e2e.version, maxSupported: E2E_VERSIONS.max }, c.x3dh.pk2, pqX3dhRcv(c.x3dh, e2e));
+      const x3dh = pqX3dhRcv(c.x3dh, e2e);
+      const rc0 = initRcvRatchet({ current: e2e.version, maxSupported: E2E_VERSIONS.max }, c.x3dh.pk2, x3dh.init, x3dh.pqRs, !!c.pqSupport);
       const dec = ratchetDecrypt(rc0, {}, encConnInfo);
       const am = parseAgentMessage(dec.msg);
       if (am.tag !== 'D') throw new AgentError('confirmation: unexpected message');

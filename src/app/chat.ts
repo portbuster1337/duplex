@@ -14,8 +14,12 @@ import {
   CHAT_VERSIONS,
   contactShortLinkData,
   encodeChatMessage,
+  COMPRESSION_CHAT_VERSION,
+  compressToLimit,
   MAX_CONN_INFO_LENGTH,
+  MAX_CONN_INFO_LENGTH_PQ,
   MAX_ENCODED_MSG_LENGTH,
+  MAX_ENCODED_MSG_LENGTH_PQ,
   newSharedMsgId,
   parseChatMessages,
   parseShortLinkData,
@@ -82,6 +86,8 @@ export interface Contact {
   incognito?: Profile;
   /** the security code when it was verified */
   verifiedCode?: string;
+  /** messages are post-quantum encrypted in both directions */
+  pq?: boolean;
 }
 
 export interface PendingInvitation {
@@ -400,10 +406,25 @@ export class ChatClient {
     return p;
   }
 
-  private encodeInfo(m: ChatMessage): Bytes {
-    const b = encodeChatMessage(m);
-    if (b.length > MAX_CONN_INFO_LENGTH) throw new ChatError('profile is too large (try a smaller picture)');
+  /** connection info: post-quantum connections leave less space for it, so it may be compressed (compressConnInfo) */
+  private encodeInfo(m: ChatMessage, pq = this.agent.config.pq ?? true): Bytes {
+    const b = compressToLimit(pq ? MAX_CONN_INFO_LENGTH_PQ : MAX_CONN_INFO_LENGTH, encodeChatMessage(m));
+    if (!b) throw new ChatError('profile is too large (try a smaller picture)');
     return b;
+  }
+
+  /** the largest message to this contact: smaller with post-quantum encryption */
+  private maxMsgLength(c: Contact): number {
+    return this.agent.pqSupport(c.connId) ? MAX_ENCODED_MSG_LENGTH_PQ : MAX_ENCODED_MSG_LENGTH;
+  }
+
+  /** a message body that fits, compressed if the contact can decompress it */
+  private fitBody(c: Contact, m: ChatMessage): Bytes | undefined {
+    const raw = encodeChatMessage(m);
+    const max = this.maxMsgLength(c);
+    if (raw.length <= max) return raw;
+    if ((c.peerChatVR?.max ?? COMPRESSION_CHAT_VERSION) < COMPRESSION_CHAT_VERSION) return undefined;
+    return compressToLimit(max, raw);
   }
 
   // ---- connecting
@@ -540,8 +561,8 @@ export class ChatClient {
   // ---- messages
 
   private async send(c: Contact, m: ChatMessage): Promise<number> {
-    const body = encodeChatMessage(m);
-    if (body.length > MAX_ENCODED_MSG_LENGTH) throw new ChatError('message is too large');
+    const body = this.fitBody(c, m);
+    if (!body) throw new ChatError('message is too large');
     return this.agent.sendMessage(c.connId, body, m.event === 'x.msg.new');
   }
 
@@ -603,7 +624,7 @@ export class ChatClient {
     if (file) mc.file = { fileName: file.name, fileSize: file.size, fileDescr: { fileDescrText: '', fileDescrPartNo: 0, fileDescrComplete: false } };
     const ttl = this.sendTtl(c);
     if (ttl) mc.ttl = ttl;
-    const tooLarge = () => encodeChatMessage(xMsgNew(sharedMsgId, mc)).length > MAX_ENCODED_MSG_LENGTH;
+    const tooLarge = () => !this.fitBody(c, xMsgNew(sharedMsgId, mc));
     // a quoted image may not fit with the message: then only its text is quoted
     if (mc.quote && quote && tooLarge()) mc.quote.content = { type: 'text', text: quote.text };
     // nor a preview with a long caption: then the small preview of the apps is used
@@ -1213,7 +1234,7 @@ export class ChatClient {
         if (m?.v) c.peerChatVR = m.v;
         if (inv) delete this.state.invitations[inv.id];
         await this.saveState();
-        return { allow: this.encodeInfo(xInfo(this.ourProfile(c))) };
+        return { allow: this.encodeInfo(xInfo(this.ourProfile(c)), this.agent.pqSupport(e.connId)) };
       }
       case 'INFO': {
         const c = this.contactByConn(e.connId);
@@ -1231,8 +1252,9 @@ export class ChatClient {
         if (!c) return;
         c.status = 'active';
         c.lastActivity = Date.now();
+        c.pq = this.agent.pqEncryption(c.connId);
         await this.saveState();
-        await this.addEvent(c.id, 'connected — messages are end-to-end encrypted');
+        await this.addEvent(c.id, c.pq ? 'connected — messages are quantum resistant end-to-end encrypted' : 'connected — messages are end-to-end encrypted');
         this.emit({ type: 'connected', contactId: c.id });
         return;
       }
@@ -1318,6 +1340,12 @@ export class ChatClient {
       }
     }
     c.lastActivity = Date.now();
+    // post-quantum encryption is agreed on the ratchet steps
+    const pq = this.agent.pqEncryption(c.connId);
+    if (c.status === 'active' && pq !== !!c.pq) {
+      c.pq = pq;
+      await this.addEvent(c.id, pq ? 'messages are now quantum resistant end-to-end encrypted' : 'messages are no longer quantum resistant (standard end-to-end encryption)');
+    }
     await this.saveState();
     return { receipt: receipt && (c.sendReceipts ?? this.settings.sendReceipts) };
   }

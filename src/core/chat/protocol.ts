@@ -2,7 +2,8 @@
 // batches ('[...]'), compressed batches ('X'), and the element prefixes used by newer clients.
 import { decompress } from 'fzstd';
 import { b64, b64url, b64urlNoPad, fromB64, fromUtf8, fromUtf8Lossy, randomBytes, utf8, type Bytes } from '../util/bytes';
-import { Decoder, ParseError } from '../util/encoding';
+import { Decoder, Encoder, ParseError } from '../util/encoding';
+import { zstdCompress } from '../util/zstd';
 import { parseVR, strVR, type VersionRange } from '../util/version';
 
 /**
@@ -12,8 +13,16 @@ import { parseVR, strVR, type VersionRange } from '../util/version';
 export const CHAT_VERSIONS: VersionRange = { min: 1, max: 16 };
 
 export const MAX_ENCODED_MSG_LENGTH = 15602;
+/** with post-quantum encryption (maxEncodedMsgLengthPQ) */
+export const MAX_ENCODED_MSG_LENGTH_PQ = 13380;
+/** e2eEncConnInfoLength - 2 - maxReplyQueueFraming, without and with post-quantum encryption */
 export const MAX_CONN_INFO_LENGTH = 14574;
+export const MAX_CONN_INFO_LENGTH_PQ = 10848;
 export const MAX_DECOMPRESSED_LENGTH = 65536;
+/** the chat version from which peers decompress messages (pqEncryptionCompressionVersion) */
+export const COMPRESSION_CHAT_VERSION = 8;
+/** shorter messages are not compressed (maxLengthPassthrough) */
+const MAX_PASSTHROUGH_LENGTH = 180;
 
 export interface Preferences {
   timedMessages?: { allow: 'always' | 'yes' | 'no'; ttl?: number };
@@ -213,6 +222,21 @@ export function zstdContentSize(b: Bytes): number | undefined {
   let v = 0;
   for (let i = fcsLen - 1; i >= 0; i--) v = v * 256 + b[off + i];
   return fcsLen === 2 ? v + 256 : v;
+}
+
+/** compressedBatchMsgBody_: 'X', a list of one element, compressed with zstd unless it is short */
+export function compressedBatch(body: Bytes): Bytes {
+  const e = new Encoder().char('X').byte(1);
+  if (body.length <= MAX_PASSTHROUGH_LENGTH) e.char('0').bytes(body);
+  else e.char('1').large(zstdCompress(body));
+  return e.finish();
+}
+
+/** compressToLimit: the body as it is when it fits, otherwise compressed */
+export function compressToLimit(maxLen: number, body: Bytes): Bytes | undefined {
+  if (body.length <= maxLen) return body;
+  const c = compressedBatch(body);
+  return c.length <= maxLen ? c : undefined;
 }
 
 /** parses an agent message body into chat messages */

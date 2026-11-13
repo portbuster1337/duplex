@@ -1,0 +1,29 @@
+{
+ "note": "sntrup761 of simplexmq (cbits/sntrup761.c) with an xorshift64* random generator seeded with 0x9E3779B97F4A7C15 * seed; byte i of the ciphertext 5 flipped for k_bad_ct",
+ "vectors": [
+  {
+   "seed": 1,
+   "pk_sha256": "e4e57d1344634924471b1a4af39b5e8d41e532571c48280c7f9edc7ce3678a55",
+   "sk_sha256": "51bfe7f0da9015307af4c1b5ef81a62511b6f907ce2b7ca1f47967f22de881bd",
+   "ct_sha256": "8c71ddb6961e42cdc57d28633b27d43a7d40366b1ec7eda59d98fbd0d446c7c8",
+   "k": "ece390fac917bf4d495f58bd1938e1460e611b5a734848d4d95611ec0481be9b",
+   "k_bad_ct": "f73b4bf6a2934b1ed86b8a437728add6374e8a7988d8bf1e9412a897026b2630"
+  },
+  {
+   "seed": 2,
+   "pk_sha256": "6d1ab58e6a34e80b4683edce20ffc585841e2c5fb7f15a1d10c611832320020a",
+   "sk_sha256": "cf42f64583aac263ebb945597af437645b477503c941bf1c5ff9d1835f4567c5",
+   "ct_sha256": "dbb4797f3e06ff9119a789c2365db4a0b4f37e8121ff25c7dfb10f4462c20c7e",
+   "k": "e0b0d2a87dc0270f7ca1d884ba91f96868d7f7479304f89affb9755dbd32ae9a",
+   "k_bad_ct": "11bd96a4deebe36d9f3fb570de1e27a57a868d2984ef3b319233a49828357ce7"
+  },
+  {
+   "seed": 3,
+   "pk_sha256": "39f4bc65e04c3f57343fda057d9394d58dffff55cf3a613ba282ceee90b95fe6",
+   "sk_sha256": "f1c5a12824f2585f3968d76825cfe3c5dc787e5041599aad21cb368b8dfb5317",
+   "ct_sha256": "d34b7c326e858ebf1d6f9d09eb4d9bddfc2eaa9cf44379e833c90710bc65f0a5",
+   "k": "b1e2fb63a0c33258cbe7f4288a00e2bb9c33ef0b5eb64eddc4ea8330526325eb",
+   "k_bad_ct": "24e779c3e103f112fec66b6afdc45f0a930f91ef032735b662970ad6977b8405"
+  }
+ ]
+}

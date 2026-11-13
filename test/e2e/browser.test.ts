@@ -123,7 +123,8 @@ test('the official CLI connects via a 1-time link from the browser', async () =>
   await cli.waitType('contactConnected', NET);
   await page.locator('.chat-list .row', { hasText: PEER }).first().waitFor({ timeout: NET });
   await page.locator('.chat-list .row', { hasText: PEER }).first().click();
-  await page.locator('.messages .event', { hasText: 'connected — messages are end-to-end encrypted' }).waitFor({ timeout: NET });
+  // the official client accepts the post-quantum key of the 1-time link
+  await page.locator('.messages .event', { hasText: 'connected — messages are quantum resistant end-to-end encrypted' }).waitFor({ timeout: NET });
   await shot('4-connected');
 });
 

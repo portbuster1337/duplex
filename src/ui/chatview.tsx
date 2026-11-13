@@ -598,7 +598,7 @@ function ContactInfo({ session, contact, onClose, onDeleted }: { session: Sessio
         <span>Status</span>
         <span>{contact.status}</span>
         <span>Encryption</span>
-        <span>double ratchet (X448, AES-256-GCM)</span>
+        <span>{contact.pq ? 'quantum resistant: double ratchet with X448 and sntrup761, AES-256-GCM' : 'double ratchet (X448, AES-256-GCM)'}</span>
         <span>Receiving via</span>
         <span>{conn?.rcv?.server.hosts[0] ?? '—'}</span>
         <span>Sending via</span>
