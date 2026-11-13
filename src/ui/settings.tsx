@@ -416,7 +416,7 @@ function About(): JSX.Element {
         <span>Encryption</span>
         <span>double ratchet with X448 and sntrup761 (post-quantum), AES-256-GCM; NaCl boxes per queue; files with XSalsa20-Poly1305; call media with AES-256-GCM over WebRTC; TLS 1.3 with server fingerprint pinning</span>
       </div>
-      <p class="hint">Not supported yet: channels, screen sharing in calls.</p>
+      <p class="hint">Not supported yet: channels.</p>
       <p>
         Browsers cannot open TCP connections, so Duplex tunnels its own TLS connections to the SimpleX servers through a Wisp relay — by default a public one. To use your own, run <code>npm run relay</code> in the source code (Node.js, no dependencies; add <code>-- --tor</code> to connect through Tor) and choose “Relay on this computer” in the network settings.
       </p>

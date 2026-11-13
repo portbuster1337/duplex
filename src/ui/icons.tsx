@@ -41,6 +41,7 @@ const paths: Record<string, string> = {
   play: 'M6 4l14 8-14 8V4z',
   mic: 'M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3zM19 10v2a7 7 0 0 1-14 0v-2M12 19v3M8 22h8',
   video: 'M2 6h13v12H2zM22 8l-7 4 7 4V8z',
+  screen: 'M2 3h20v14H2zM8 21h8M12 17v4',
   retry: 'M23 4v6h-6M20.49 15a9 9 0 1 1-2.12-9.36L23 10',
   upload: 'M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M17 8l-5-5-5 5M12 3v12',
 };

@@ -30,7 +30,9 @@ Chat are trademarks of SimpleX Chat Ltd.
   connected.
 - **Audio and video calls** with the apps, over WebRTC: the call page of the apps is followed
   closely (the media frames are encrypted end to end with the key agreed in the chat), and calls go
-  through the TURN server of SimpleX Chat by default, so contacts do not see your IP address.
+  through the TURN server of SimpleX Chat by default, so contacts do not see your IP address. You
+  can share your screen, a window or a tab (in desktop browsers), and see the screen your contact
+  shares from the apps.
 - **Voice messages**, recorded in the page: AAC in M4A like the apps where the browser can encode
   it, otherwise 8 kHz μ-law WAV, which the apps play too.
 - **Post-quantum encryption**: the double ratchet with the sntrup761 key encapsulation that the apps
@@ -102,7 +104,7 @@ use on it belong to the same client.
 
 - No channels (groups with relays) yet. In groups, members cannot be accepted after review, and the
   history is not sent to new members.
-- Calls: no screen sharing and no group calls; calls ring only while the page is open. Tor Browser
+- Calls: no group calls (SimpleX has none); calls ring only while the page is open. Tor Browser
   disables WebRTC, so calls do not work there.
 - Files are kept in the encrypted storage of this browser, which browsers limit in size; large files
   should be saved to disk.

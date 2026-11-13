@@ -57,6 +57,25 @@ export function supportsCalls(): boolean {
   return typeof RTCPeerConnection !== 'undefined' && !!navigator.mediaDevices?.getUserMedia;
 }
 
+/** desktop browsers: mobile ones cannot capture the screen */
+export const supportsScreenSharing = (): boolean => typeof navigator !== 'undefined' && !!navigator.mediaDevices?.getDisplayMedia;
+
+/** what each transceiver carries, by its mid, as in the apps */
+export type MediaSource = 'mic' | 'camera' | 'screenAudio' | 'screenVideo';
+const SOURCES: readonly MediaSource[] = ['mic', 'camera', 'screenAudio', 'screenVideo'];
+
+const CAMERA: MediaTrackConstraints = { frameRate: 24, width: { min: 480, ideal: 720, max: 1280 }, aspectRatio: 1.33, facingMode: 'user' };
+
+async function userMedia(audio: boolean, video: boolean): Promise<MediaStream> {
+  try {
+    return await navigator.mediaDevices.getUserMedia({ audio, video: video ? CAMERA : false });
+  } catch (e) {
+    // a camera that does not meet the constraints
+    if (!video || (e as Error).name !== 'OverconstrainedError') throw e;
+    return await navigator.mediaDevices.getUserMedia({ audio, video: true });
+  }
+}
+
 export interface CallOptions {
   iceServers?: RTCIceServer[];
   /** only relayed ICE candidates: the contact does not see our IP address */
@@ -65,12 +84,20 @@ export interface CallOptions {
 
 export class WebRTCCall {
   readonly pc: RTCPeerConnection;
+  /** the microphone and camera of the contact */
   readonly remoteStream = new MediaStream();
+  /** the screen the contact shares */
+  readonly remoteScreen = new MediaStream();
+  /** what the contact sends now: the apps switch a source off by sending nothing on its transceiver */
+  readonly peerMedia: Record<MediaSource, boolean> = { mic: false, camera: false, screenAudio: false, screenVideo: false };
   localStream = new MediaStream();
+  /** the screen, window or tab we share */
+  screen: MediaStream | undefined;
   /** later local ICE candidates, for x.call.extra */
   onIce: (iceCandidates: string) => void = () => {};
   onState: (state: RTCPeerConnectionState) => void = () => {};
-  onRemoteTrack: () => void = () => {};
+  /** the media of either side changed */
+  onMedia: () => void = () => {};
   private mode: EncryptionMode;
   private key?: CryptoKey;
   private worker?: Worker;
@@ -126,23 +153,50 @@ export class WebRTCCall {
   }
 
   private async getMedia(): Promise<void> {
-    const video: MediaTrackConstraints | false = this.media === 'video' ? { frameRate: 24, width: { min: 480, ideal: 720, max: 1280 }, aspectRatio: 1.33, facingMode: 'user' } : false;
-    try {
-      this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video });
-    } catch (e) {
-      // a camera that does not meet the constraints
-      if (!video || (e as Error).name !== 'OverconstrainedError') throw e;
-      this.localStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: true });
-    }
+    this.localStream = await userMedia(true, this.media === 'video');
   }
 
   private onTrack(e: RTCTrackEvent): void {
     this.transform('decrypt', e.receiver as Transformable);
-    // the microphone and camera of the contact (screen sharing is not shown)
-    if (e.transceiver.mid === '0' || e.transceiver.mid === '1') {
-      this.remoteStream.addTrack(e.track);
-      this.onRemoteTrack();
-    }
+    const source = SOURCES[Number(e.transceiver.mid)];
+    if (source) this.watch(e.transceiver, e.track, source);
+  }
+
+  /**
+   * a source of the contact is on while bytes arrive on its transceiver, as the apps detect it: they
+   * switch the camera or the screen off by sending nothing (no renegotiation). Its track joins the
+   * stream when it first plays (Safari does not play a stream with a silent track).
+   */
+  private watch(t: RTCRtpTransceiver, track: MediaStreamTrack, source: MediaSource): void {
+    let statsId = '';
+    let last = 0;
+    let idle = 4;
+    const iv = setInterval(async () => {
+      if (this.closed) return clearInterval(iv);
+      let stats: RTCStatsReport;
+      try {
+        stats = await t.receiver.getStats();
+      } catch {
+        return;
+      }
+      if (!statsId) stats.forEach((s: { type: string; id: string }) => s.type === 'inbound-rtp' && (statsId = s.id));
+      const bytes = (stats.get(statsId) as { bytesReceived?: number } | undefined)?.bytesReceived;
+      if (bytes === undefined) return;
+      if (bytes > last) {
+        last = bytes;
+        if (idle >= 3) this.setPeerMedia(source, track, true);
+        idle = 0;
+      } else if (++idle === 3) this.setPeerMedia(source, track, false);
+    }, 1000);
+    this.intervals.push(iv);
+  }
+
+  private setPeerMedia(source: MediaSource, track: MediaStreamTrack, on: boolean): void {
+    if (this.closed || this.peerMedia[source] === on) return;
+    this.peerMedia[source] = on;
+    const stream = source === 'mic' || source === 'camera' ? this.remoteStream : this.remoteScreen;
+    if (on && !stream.getTracks().includes(track)) stream.addTrack(track);
+    this.onMedia();
   }
 
   private transform(operation: TransformOperation, peer: Transformable): void {
@@ -301,27 +355,68 @@ export class WebRTCCall {
   }
 
   get cameraOn(): boolean {
-    return this.localStream.getVideoTracks().some((t) => t.enabled && t.readyState === 'live');
+    return this.localStream.getVideoTracks().some((t) => t.readyState === 'live');
+  }
+
+  private transceiver(source: MediaSource): RTCRtpTransceiver | undefined {
+    const mid = String(SOURCES.indexOf(source));
+    return this.pc.getTransceivers().find((t) => t.mid === mid);
   }
 
   setMic(on: boolean): void {
     for (const t of this.localStream.getAudioTracks()) t.enabled = on;
   }
 
-  /** the camera: switched off and on in video calls, added in audio calls */
+  /**
+   * the camera, also in audio calls. Off, it is released and nothing is sent, as in the apps: the
+   * contact sees the picture of the profile rather than a black video.
+   */
   async setCamera(on: boolean): Promise<void> {
-    const tracks = this.localStream.getVideoTracks();
-    if (tracks.length) {
-      for (const t of tracks) t.enabled = on;
+    const t = this.transceiver('camera');
+    if (!on) {
+      for (const track of this.localStream.getVideoTracks()) {
+        track.stop();
+        this.localStream.removeTrack(track);
+      }
+      await t?.sender.replaceTrack(null);
+      this.onMedia();
       return;
     }
-    if (!on) return;
-    const s = await navigator.mediaDevices.getUserMedia({ video: { frameRate: 24, width: { ideal: 720, max: 1280 }, facingMode: 'user' } });
+    if (this.cameraOn || !t) return;
+    const s = await userMedia(false, true);
     const track = s.getVideoTracks()[0];
-    const t = this.pc.getTransceivers().find((x) => x.mid === '1');
-    if (!track || !t) return;
+    if (this.closed || !track) return s.getTracks().forEach((x) => x.stop());
     await t.sender.replaceTrack(track);
     this.localStream.addTrack(track);
+    this.onMedia();
+  }
+
+  /** the apps of older versions negotiated two transceivers, without the screen */
+  get canShareScreen(): boolean {
+    return supportsScreenSharing() && !!this.transceiver('screenVideo');
+  }
+
+  /** shares a screen, window or tab chosen in the browser, without its sound (as the apps do) */
+  async shareScreen(on: boolean): Promise<void> {
+    const t = this.transceiver('screenVideo');
+    if (!on) {
+      const s = this.screen;
+      if (!s) return;
+      this.screen = undefined;
+      s.getTracks().forEach((x) => x.stop());
+      await t?.sender.replaceTrack(null).catch(() => {});
+      this.onMedia();
+      return;
+    }
+    if (this.screen || !t) return;
+    const s = await navigator.mediaDevices.getDisplayMedia({ video: { frameRate: 24 }, audio: false });
+    const track = s.getVideoTracks()[0];
+    if (this.closed || !track || this.screen) return s.getTracks().forEach((x) => x.stop());
+    // "Stop sharing" in the browser
+    track.addEventListener('ended', () => this.screen === s && void this.shareScreen(false));
+    this.screen = s;
+    await t.sender.replaceTrack(track);
+    this.onMedia();
   }
 
   close(): void {
@@ -330,6 +425,8 @@ export class WebRTCCall {
     this.timers.forEach(clearTimeout);
     this.intervals.forEach(clearInterval);
     for (const t of this.localStream.getTracks()) t.stop();
+    for (const t of this.screen?.getTracks() ?? []) t.stop();
+    this.screen = undefined;
     try {
       this.pc.close();
     } catch {

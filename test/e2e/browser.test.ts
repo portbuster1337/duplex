@@ -426,6 +426,25 @@ test('a video call with the official CLI, whose media run in the call page of th
     await peer.waitForFunction(() => ((document.getElementById('remote-video-stream') as HTMLVideoElement | null)?.videoWidth ?? 0) > 0, null, { timeout: NET });
     assert.match((await page.locator('.call-enc').textContent()) ?? '', /end-to-end encrypted/);
     await shot('15-call');
+    // screen sharing, both ways: the apps see it from the bytes on the screen transceiver
+    const peerSources = () => peer.evaluate(() => (0, eval)('activeCall')?.peerMediaSources as Record<string, boolean>);
+    await page.getByLabel('Share your screen').click();
+    await page.locator('.local-screen video').waitFor({ timeout: 30000 });
+    await peer.waitForFunction(() => ((document.getElementById('remote-screen-video-stream') as HTMLVideoElement | null)?.videoWidth ?? 0) > 0 && (0, eval)('activeCall')?.peerMediaSources?.screenVideo, null, { timeout: NET });
+    await page.getByLabel('Stop sharing your screen').click();
+    await peer.waitForFunction(() => !(0, eval)('activeCall')?.peerMediaSources?.screenVideo, null, { timeout: 30000 });
+    await peer.evaluate(() => (0, eval)('toggleScreenShare')());
+    await page.waitForFunction(() => ((document.querySelector('.remote-screen:not(.hidden)') as HTMLVideoElement | null)?.videoWidth ?? 0) > 0, null, { timeout: NET });
+    await page.getByText('sharing their screen').waitFor({ timeout: 5000 });
+    await shot('16-call-screen');
+    await peer.evaluate(() => (0, eval)('toggleScreenShare')());
+    await page.locator('.remote-screen.hidden').waitFor({ state: 'attached', timeout: 30000 });
+    // the camera off: nothing is sent, and the apps show the picture of the profile
+    await page.getByLabel('Turn the camera off').click();
+    await peer.waitForFunction(() => !(0, eval)('activeCall')?.peerMediaSources?.camera, null, { timeout: 30000 });
+    await page.getByLabel('Turn the camera on').click();
+    await peer.waitForFunction(() => (0, eval)('activeCall')?.peerMediaSources?.camera, null, { timeout: 30000 });
+    assert.ok((await peerSources()).mic);
     await page.getByLabel('End call').click();
     await cli.waitType('callEnded', NET);
     relaying = false;

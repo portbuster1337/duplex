@@ -9,7 +9,7 @@ import type { CallMedia } from '../core/chat/calls';
 import { Avatar } from './util';
 import { Icon } from './icons';
 import { errorText, toast } from './components';
-import { parseIceServer, supportsCallEncryption, WebRTCCall, type CallOptions } from './webrtc';
+import { parseIceServer, supportsCallEncryption, supportsScreenSharing, WebRTCCall, type CallOptions } from './webrtc';
 
 /** connects the signalling of the chat client with WebRTC in the page */
 class CallEngine {
@@ -57,7 +57,7 @@ class CallEngine {
       else if (st === 'disconnected') lost = setTimeout(() => void calls.end('the connection was lost'), 15000);
       this.onChange();
     };
-    rtc.onRemoteTrack = () => this.onChange();
+    rtc.onMedia = () => this.onChange();
     this.onChange();
   }
 
@@ -138,13 +138,21 @@ const clock = (ms: number) => {
   return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
 };
 
+function attach(v: HTMLVideoElement | null, stream: MediaStream | undefined, play = false): void {
+  if (!v || v.srcObject === (stream ?? null)) return;
+  v.srcObject = stream ?? null;
+  if (play && stream) v.play().catch(() => {});
+}
+
 export function CallScreen({ session }: { session: Session }): JSX.Element | null {
   const chat = session.chat;
   const eng = callEngine(session);
   const [, bump] = useReducer((x: number) => x + 1, 0);
   const [busy, setBusy] = useState(false);
   const remoteRef = useRef<HTMLVideoElement>(null);
+  const screenRef = useRef<HTMLVideoElement>(null);
   const localRef = useRef<HTMLVideoElement>(null);
+  const myScreenRef = useRef<HTMLVideoElement>(null);
   useEffect(() => {
     eng.onChange = () => bump(0);
     const off = chat.on((e) => e.type === 'call' && bump(0));
@@ -159,11 +167,10 @@ export function CallScreen({ session }: { session: Session }): JSX.Element | nul
   const rtc = eng.rtc;
   useTicker(call?.status === 'connected');
   useEffect(() => {
-    if (remoteRef.current && rtc && remoteRef.current.srcObject !== rtc.remoteStream) {
-      remoteRef.current.srcObject = rtc.remoteStream;
-      remoteRef.current.play().catch(() => {});
-    }
-    if (localRef.current && rtc && localRef.current.srcObject !== rtc.localStream) localRef.current.srcObject = rtc.localStream;
+    attach(remoteRef.current, rtc?.remoteStream, true);
+    attach(screenRef.current, rtc?.remoteScreen, true);
+    attach(localRef.current, rtc?.localStream);
+    attach(myScreenRef.current, rtc?.screen);
   });
   // the screen closes a moment after the call ended
   useEffect(() => {
@@ -174,7 +181,9 @@ export function CallScreen({ session }: { session: Session }): JSX.Element | nul
   if (!call) return null;
   const c = chat.contact(call.contactId);
   const name = c ? c.localAlias || profileName(c.profile) : 'contact';
-  const remoteVideo = !!rtc && rtc.remoteStream.getVideoTracks().some((t) => !t.muted && t.readyState === 'live') && call.status === 'connected';
+  const live = !!rtc && call.status === 'connected';
+  const remoteVideo = live && rtc.peerMedia.camera;
+  const peerScreen = live && rtc.peerMedia.screenVideo;
   const status =
     call.status === 'ringing'
       ? `incoming ${call.media} call`
@@ -193,9 +202,10 @@ export function CallScreen({ session }: { session: Session }): JSX.Element | nul
     setBusy(false);
   };
   return (
-    <div class={`call-screen ${call.status}`} role="dialog" aria-label={`Call with ${name}`}>
+    <div class={`call-screen ${call.status} ${remoteVideo || peerScreen ? 'with-video' : ''} ${peerScreen ? 'peer-screen' : ''}`} role="dialog" aria-label={`Call with ${name}`}>
+      <video ref={screenRef} class={`remote-screen ${peerScreen ? '' : 'hidden'}`} autoplay playsinline aria-label={peerScreen ? `The screen of ${name}` : undefined} />
       <video ref={remoteRef} class={`remote-video ${remoteVideo ? '' : 'hidden'}`} autoplay playsinline />
-      {!remoteVideo && (
+      {!remoteVideo && !peerScreen && (
         <div class="call-peer">
           <Avatar profile={c?.profile} size={120} />
         </div>
@@ -210,8 +220,15 @@ export function CallScreen({ session }: { session: Session }): JSX.Element | nul
             <Icon name={call.aesKey ? 'shieldCheck' : 'shield'} size={14} /> {call.aesKey ? 'end-to-end encrypted' : 'encrypted (DTLS) — not end-to-end'}
           </p>
         )}
+        {peerScreen && <p class="call-enc">sharing their screen</p>}
       </div>
-      {rtc && rtc.media === 'video' && <video ref={localRef} class="local-video" autoplay playsinline muted />}
+      {rtc?.cameraOn && <video ref={localRef} class="local-video" autoplay playsinline muted />}
+      {rtc?.screen && (
+        <figure class="local-screen">
+          <video ref={myScreenRef} autoplay playsinline muted />
+          <figcaption>You are sharing your screen</figcaption>
+        </figure>
+      )}
       <div class="call-controls">
         {call.status === 'ringing' ? (
           <>
@@ -254,6 +271,23 @@ export function CallScreen({ session }: { session: Session }): JSX.Element | nul
             >
               <Icon name="video" size={24} />
             </button>
+            {supportsScreenSharing() && (
+              <button
+                class={`call-btn ${rtc?.screen ? 'active' : ''}`}
+                disabled={!rtc?.canShareScreen || call.status !== 'connected'}
+                onClick={() =>
+                  rtc?.shareScreen(!rtc.screen).catch((e) => {
+                    // closing the browser's picker is not an error
+                    if ((e as Error).name !== 'NotAllowedError' && (e as Error).name !== 'AbortError') toast(errorText(e), 'error');
+                  })
+                }
+                aria-label={rtc?.screen ? 'Stop sharing your screen' : 'Share your screen'}
+                aria-pressed={!!rtc?.screen}
+                title={rtc && !rtc.canShareScreen ? 'The app of your contact cannot show a shared screen' : undefined}
+              >
+                <Icon name="screen" size={24} />
+              </button>
+            )}
             <button class="call-btn end" onClick={() => void chat.calls.end()} aria-label="End call">
               <Icon name="phoneOff" size={26} />
             </button>
