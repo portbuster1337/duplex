@@ -59,7 +59,12 @@ import {
   type OutgoingFile,
 } from './files';
 import { ItemStore, VaultAgentStore } from './store';
+import { ChatError, FileApprovalError, localId, profileName, randomIndex } from './common';
+import { GroupManager, type Group, type GroupMember } from './groups';
+import { contentAllowedInGroup, groupLinkIdOf, groupPrefOn, normMemberId, roleRank, type GroupProfile } from '../core/chat/groups';
 import type { Vault } from './vault';
+
+export { ChatError, FileApprovalError, profileName };
 
 export type ContactStatus = 'connecting' | 'requested' | 'active' | 'deleted';
 
@@ -120,11 +125,19 @@ export interface ChatItem {
   brokerTs?: number;
   status: ItemStatus;
   agentMsgId?: number;
-  quote?: { sharedMsgId?: string; text: string; sent: boolean };
+  /** in groups: whose message was quoted (sent: we sent it) */
+  quote?: { sharedMsgId?: string; text: string; sent: boolean; memberId?: string };
   edited?: boolean;
   deleted?: boolean;
+  /** deleted by a group moderator */
+  moderated?: boolean;
   forwarded?: boolean;
-  reactions?: Record<string, { me?: boolean; peer?: boolean }>;
+  /** peer: the contact's reaction; members: the group members who reacted */
+  reactions?: Record<string, { me?: boolean; peer?: boolean; members?: string[] }>;
+  /** in groups: the member who sent a received message, or who an event is about */
+  memberId?: string;
+  /** an invitation to a group, received from a contact */
+  groupInv?: { groupId: string; status: 'pending' | 'accepted' | 'rejected'; name: string; role: string };
   /** disappearing message: deletion time */
   deleteAt?: number;
   /** a received disappearing message: its TTL in seconds, counted from when it is read */
@@ -163,6 +176,14 @@ interface ChatState {
   address?: Address;
   /** files being uploaded or downloaded, to continue after a reload */
   pendingFiles?: Record<string, { contactId: string; itemId: string }>;
+  groups?: Record<string, Group>;
+}
+
+/** where a message was received: a contact's chat, or a group and the member who sent it */
+export interface ChatTarget {
+  chatId: string;
+  group?: Group;
+  sender?: GroupMember;
 }
 
 export type ChatEvent =
@@ -174,10 +195,6 @@ export type ChatEvent =
   | { type: 'network' }
   | { type: 'fileProgress'; fileId: string }
   | { type: 'error'; message: string };
-
-function localId(): string {
-  return Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
-}
 
 const DEFAULT_PREFERENCES = {
   timedMessages: { allow: 'yes' as const },
@@ -194,15 +211,6 @@ export const PREFS_VERSION = 2;
 export function withDefaultPreferences(p: Profile): Profile {
   // calls are not supported
   return { ...p, preferences: { ...DEFAULT_PREFERENCES, ...(p.preferences ?? {}), calls: { allow: 'no' } } };
-}
-
-function randomIndex(n: number): number {
-  const b = new Uint32Array(1);
-  const limit = Math.floor(2 ** 32 / n) * n;
-  for (;;) {
-    crypto.getRandomValues(b);
-    if (b[0] < limit) return b[0] % n;
-  }
 }
 
 /** a random profile for an incognito connection, named like those of the official apps */
@@ -228,22 +236,8 @@ export function ttlText(s: number): string {
   return `${s} seconds`;
 }
 
-export function profileName(p?: Profile): string {
-  return p?.displayName?.trim() || 'unknown';
-}
-
 export function contentText(c: MsgContent): string {
   return typeof c.text === 'string' ? c.text : '';
-}
-
-export class ChatError extends Error {}
-
-/** the file is on servers that the user does not use: it is downloaded after the user agrees, as in the apps */
-export class FileApprovalError extends ChatError {
-  constructor(readonly servers: string[]) {
-    super(`the file is on a server you do not use: ${servers.join(', ')}`);
-    this.name = 'FileApprovalError';
-  }
 }
 
 /** the text of an item, or the name of its file */
@@ -288,6 +282,7 @@ export class ChatClient {
   private up = new Set<string>();
   /** file transfers and the local copies of files */
   readonly files: FileManager;
+  readonly groups: GroupManager;
 
   constructor(
     private vault: Vault,
@@ -299,6 +294,7 @@ export class ChatClient {
     this.agent.onEvent = (e) => this.onAgentEvent(e);
     this.itemStore = new ItemStore<ChatItem>(vault);
     this.files = new FileManager(vault, () => this.agent.network.connector);
+    this.groups = new GroupManager(this);
   }
 
   on(f: (e: ChatEvent) => void): () => void {
@@ -306,6 +302,11 @@ export class ChatClient {
     return () => {
       this.listeners = this.listeners.filter((g) => g !== f);
     };
+  }
+
+  /** @internal */
+  emitError(message: string): void {
+    this.emit({ type: 'error', message });
   }
 
   private emit(e: ChatEvent): void {
@@ -324,8 +325,9 @@ export class ChatClient {
 
   async start(): Promise<void> {
     const s = await this.vault.get<ChatState>('chat');
-    if (s) this.state = { contacts: s.contacts ?? {}, requests: s.requests ?? {}, invitations: s.invitations ?? {}, address: s.address, pendingFiles: s.pendingFiles ?? {} };
+    if (s) this.state = { contacts: s.contacts ?? {}, requests: s.requests ?? {}, invitations: s.invitations ?? {}, address: s.address, pendingFiles: s.pendingFiles ?? {}, groups: s.groups ?? {} };
     for (const c of Object.values(this.state.contacts)) this.connToContact.set(c.connId, c.id);
+    this.groups.index();
     await this.agent.start();
     this.ttlTimer = setInterval(() => this.expireItems(), 10000);
     void this.resumeTransfers().catch((e) => console.warn('resuming file transfers failed', e));
@@ -346,7 +348,8 @@ export class ChatClient {
     await this.itemStore.idle();
   }
 
-  private saveState(): Promise<void> {
+  /** @internal */
+  saveState(): Promise<void> {
     const snapshot = structuredClone(this.state);
     this.stateWrite = this.stateWrite.then(() => this.vault.put('chat', snapshot)).catch((e) => console.error('save failed', e));
     this.emit({ type: 'state' });
@@ -383,14 +386,16 @@ export class ChatClient {
     return it;
   }
 
-  private async addItem(contactId: string, item: ChatItem): Promise<void> {
+  /** @internal */
+  async addItem(contactId: string, item: ChatItem): Promise<void> {
     const items = await this.chatItems(contactId);
     items.push(item);
     await this.itemStore.save(contactId, items, items.length - 1);
     this.emit({ type: 'newItem', contactId, item });
   }
 
-  private async updateItem(contactId: string, item: ChatItem): Promise<void> {
+  /** @internal */
+  async updateItem(contactId: string, item: ChatItem): Promise<void> {
     const items = await this.chatItems(contactId);
     const i = items.findIndex((x) => x.id === item.id);
     if (i < 0) return;
@@ -407,7 +412,8 @@ export class ChatClient {
   }
 
   /** connection info: post-quantum connections leave less space for it, so it may be compressed (compressConnInfo) */
-  private encodeInfo(m: ChatMessage, pq = this.agent.config.pq ?? true): Bytes {
+  /** @internal */
+  encodeInfo(m: ChatMessage, pq = this.agent.config.pq ?? true): Bytes {
     const b = compressToLimit(pq ? MAX_CONN_INFO_LENGTH_PQ : MAX_CONN_INFO_LENGTH, encodeChatMessage(m));
     if (!b) throw new ChatError('profile is too large (try a smaller picture)');
     return b;
@@ -459,31 +465,36 @@ export class ChatClient {
   }
 
   /** what a link connects to, before connecting */
-  async previewLink(link: string): Promise<{ kind: 'invitation' | 'contact' | 'group' | 'channel'; profile?: Profile; message?: string; resolved?: Awaited<ReturnType<Agent['resolveLink']>> }> {
+  async previewLink(link: string): Promise<{ kind: 'invitation' | 'contact' | 'group' | 'channel'; profile?: Profile; groupProfile?: GroupProfile; message?: string; resolved?: Awaited<ReturnType<Agent['resolveLink']>> }> {
     const l = link.trim();
     if (isShortLink(l)) {
       const sl = parseShortLink(l);
-      if (sl.mode === 'contact' && (sl.type === 'G' || sl.type === 'C' || sl.type === 'R')) return { kind: sl.type === 'G' ? 'group' : 'channel' };
+      if (sl.mode === 'contact' && (sl.type === 'C' || sl.type === 'R')) return { kind: 'channel' };
       const resolved = await this.agent.resolveLink(l);
       const d = parseShortLinkData(resolved.userData);
+      const gp = d.groupProfile as GroupProfile | undefined;
+      if (sl.mode === 'contact' && (sl.type === 'G' || groupLinkIdOf(resolved.connReq.data.clientData))) return { kind: gp?.publicGroup ? 'channel' : 'group', groupProfile: gp, resolved };
       return { kind: sl.mode === 'invitation' ? 'invitation' : 'contact', profile: d.profile, message: d.message ? contentText(d.message) : undefined, resolved };
     }
     const resolved = await this.agent.resolveLink(l);
+    if (resolved.connReq.mode === 'contact' && groupLinkIdOf(resolved.connReq.data.clientData)) return { kind: 'group', resolved };
     return { kind: resolved.connReq.mode === 'invitation' ? 'invitation' : 'contact', resolved };
+  }
+
+  /** joins a group via its link (the group is shown once the admin accepts) */
+  async joinGroup(link: string, opts: { resolved?: Awaited<ReturnType<Agent['resolveLink']>>; incognito?: boolean } = {}): Promise<Group> {
+    const resolved = opts.resolved ?? (await this.agent.resolveLink(link));
+    if (resolved.connReq.mode !== 'contact') throw new ChatError('this is not a group link');
+    const gp = parseShortLinkData(resolved.userData).groupProfile as GroupProfile | undefined;
+    if (gp?.publicGroup) throw new ChatError('channels are not supported yet');
+    return this.groups.joinViaLink(resolved, gp, opts.incognito ? randomProfile() : undefined);
   }
 
   /** connects via a 1-time invitation or a contact address */
   async connect(link: string, opts: { resolved?: Awaited<ReturnType<Agent['resolveLink']>>; message?: string; incognito?: boolean } = {}): Promise<Contact> {
     const resolved = opts.resolved ?? (await this.agent.resolveLink(link));
-    if (resolved.connReq.data.clientData) {
-      // group links carry group data
-      try {
-        const d = JSON.parse(resolved.connReq.data.clientData);
-        if (d && d.groupLinkId) throw new ChatError('groups are not supported yet');
-      } catch (e) {
-        if (e instanceof ChatError) throw e;
-      }
-    }
+    // group links carry the group link ID
+    if (groupLinkIdOf(resolved.connReq.data.clientData)) throw new ChatError('this is a group link: join the group instead');
     const d = parseShortLinkData(resolved.userData);
     const profile: Profile = d.profile ?? { displayName: 'contact', fullName: '' };
     const isInv = resolved.connReq.mode === 'invitation';
@@ -566,6 +577,37 @@ export class ChatClient {
     return this.agent.sendMessage(c.connId, body, m.event === 'x.msg.new');
   }
 
+  /** @internal */
+  sendDirect(c: Contact, m: ChatMessage): Promise<number> {
+    return this.send(c, m);
+  }
+
+  /** sends to a contact, or to the members of a group */
+  private async sendToChat(chatId: string, m: ChatMessage): Promise<void> {
+    const g = this.state.groups?.[chatId];
+    if (!g) {
+      await this.send(this.activeContact(chatId), m);
+      return;
+    }
+    const err = this.groups.canSend(g);
+    if (err) throw new ChatError(err);
+    await this.groups.send(g, m);
+  }
+
+  isGroup(chatId: string): boolean {
+    return !!this.state.groups?.[chatId];
+  }
+
+  group(id: string): Group | undefined {
+    return this.state.groups?.[id];
+  }
+
+  /** the TTL of messages in a group: its disappearing messages preference */
+  groupTtl(g: Group): number | undefined {
+    const tm = g.profile.groupPreferences?.timedMessages;
+    return groupPrefOn(g.profile, 'timedMessages') && typeof tm?.ttl === 'number' && tm.ttl > 0 ? tm.ttl : undefined;
+  }
+
   private activeContact(contactId: string): Contact {
     const c = this.state.contacts[contactId];
     if (!c) throw new ChatError('contact not found');
@@ -582,9 +624,15 @@ export class ChatClient {
    * is stored in this browser and uploaded in the background
    */
   async sendFile(contactId: string, out: OutgoingFile, text = '', quoteItemId?: string): Promise<ChatItem> {
-    const c = this.activeContact(contactId);
-    if (!this.peerAllowsFiles(c)) throw new ChatError('the contact does not allow files and media');
-    if (out.kind === 'voice' && !this.peerAllowsVoice(c)) throw new ChatError('the contact does not allow voice messages');
+    const g = this.state.groups?.[contactId];
+    if (g) {
+      const err = this.groups.canSend(g) ?? contentAllowedInGroup(g.profile, { type: out.kind === 'voice' ? 'voice' : 'file', text: '' });
+      if (err) throw new ChatError(err);
+    } else {
+      const c = this.activeContact(contactId);
+      if (!this.peerAllowsFiles(c)) throw new ChatError('the contact does not allow files and media');
+      if (out.kind === 'voice' && !this.peerAllowsVoice(c)) throw new ChatError('the contact does not allow voice messages');
+    }
     const size = out.blob.size;
     if (!size) throw new ChatError('the file is empty');
     if (size > MAX_FILE_SIZE) throw new ChatError(`the file is too large: files can be up to ${MAX_FILE_SIZE / GB} GB`);
@@ -609,22 +657,30 @@ export class ChatClient {
   }
 
   private async sendContent(contactId: string, content: MsgContent, quoteItemId?: string, file?: ChatFile): Promise<ChatItem> {
-    const c = this.activeContact(contactId);
+    const g = this.state.groups?.[contactId];
+    const c = g ? undefined : this.activeContact(contactId);
+    if (g) {
+      const err = this.groups.canSend(g) ?? contentAllowedInGroup(g.profile, content);
+      if (err) throw new ChatError(err);
+    }
     const sharedMsgId = newSharedMsgId();
     const mc: MsgContainer = { content };
     let quote: ChatItem['quote'];
     if (quoteItemId) {
       const q = (await this.chatItems(contactId)).find((i) => i.id === quoteItemId);
       if (q && q.sharedMsgId) {
-        mc.quote = { msgRef: { msgId: q.sharedMsgId, sentAt: new Date(q.brokerTs ?? q.ts).toISOString(), sent: q.dir === 'snd' }, content: quoteContent(content, q) };
-        quote = { sharedMsgId: q.sharedMsgId, text: itemText(q), sent: q.dir === 'snd' };
+        const sent = q.dir === 'snd';
+        // in groups the reference says whose message it is
+        const memberId = g ? (sent ? g.memberId : q.memberId) : undefined;
+        mc.quote = { msgRef: { msgId: q.sharedMsgId, sentAt: new Date(q.brokerTs ?? q.ts).toISOString(), sent, ...(memberId ? { memberId } : {}) }, content: quoteContent(content, q) };
+        quote = { sharedMsgId: q.sharedMsgId, text: itemText(q), sent, ...(g && !sent && q.memberId ? { memberId: q.memberId } : {}) };
       }
     }
     // XFTP files: the description follows in x.msg.file.descr messages
     if (file) mc.file = { fileName: file.name, fileSize: file.size, fileDescr: { fileDescrText: '', fileDescrPartNo: 0, fileDescrComplete: false } };
-    const ttl = this.sendTtl(c);
+    const ttl = g ? this.groupTtl(g) : this.sendTtl(c!);
     if (ttl) mc.ttl = ttl;
-    const tooLarge = () => !this.fitBody(c, xMsgNew(sharedMsgId, mc));
+    const tooLarge = () => (c ? !this.fitBody(c, xMsgNew(sharedMsgId, mc)) : !compressToLimit(MAX_ENCODED_MSG_LENGTH, encodeChatMessage(xMsgNew(sharedMsgId, mc))));
     // a quoted image may not fit with the message: then only its text is quoted
     if (mc.quote && quote && tooLarge()) mc.quote.content = { type: 'text', text: quote.text };
     // nor a preview with a long caption: then the small preview of the apps is used
@@ -634,7 +690,11 @@ export class ChatClient {
     await this.addItem(contactId, item);
     if (file) this.trackTransfer(file.id, contactId, item.id);
     try {
-      item.agentMsgId = await this.send(c, xMsgNew(sharedMsgId, mc));
+      if (c) item.agentMsgId = await this.send(c, xMsgNew(sharedMsgId, mc));
+      else {
+        await this.groups.send(g!, xMsgNew(sharedMsgId, mc));
+        item.status = 'sent';
+      }
     } catch (e) {
       item.status = 'error';
       item.error = (e as Error).message;
@@ -646,19 +706,18 @@ export class ChatClient {
       }
     }
     await this.updateItem(contactId, item);
-    c.lastActivity = now;
+    (c ?? g!).lastActivity = now;
     await this.saveState();
     if (file && item.status !== 'error') this.startUpload(contactId, item.id, file.id);
     return item;
   }
 
   async editItem(contactId: string, itemId: string, text: string): Promise<void> {
-    const c = this.activeContact(contactId);
     const items = await this.chatItems(contactId);
     const item = items.find((i) => i.id === itemId);
     if (!item || item.dir !== 'snd' || !item.sharedMsgId || item.deleted) throw new ChatError('cannot edit this message');
     const content: MsgContent = { ...item.content, text } as MsgContent;
-    await this.send(c, xMsgUpdate(newSharedMsgId(), item.sharedMsgId, content));
+    await this.sendToChat(contactId, xMsgUpdate(newSharedMsgId(), item.sharedMsgId, content));
     item.content = content;
     item.edited = true;
     await this.updateItem(contactId, item);
@@ -669,9 +728,17 @@ export class ChatClient {
     const i = items.findIndex((x) => x.id === itemId);
     if (i < 0) return;
     const item = items[i];
+    const g = this.state.groups?.[contactId];
+    // group moderators can delete the messages of other members for everyone
+    if (forEveryone && g && item.dir === 'rcv' && item.sharedMsgId && item.memberId && !item.deleted && this.canModerate(g, item)) {
+      await this.sendToChat(contactId, xMsgDel(newSharedMsgId(), item.sharedMsgId, item.memberId));
+      await this.dropFile(item, false);
+      Object.assign(item, { deleted: true, moderated: true, content: { type: 'text', text: '' }, file: undefined });
+      await this.updateItem(contactId, item);
+      return;
+    }
     if (forEveryone && item.dir === 'snd' && item.sharedMsgId && !item.deleted) {
-      const c = this.activeContact(contactId);
-      await this.send(c, xMsgDel(newSharedMsgId(), item.sharedMsgId));
+      await this.sendToChat(contactId, xMsgDel(newSharedMsgId(), item.sharedMsgId, g ? g.memberId : undefined));
       // a sent file is deleted from the file servers too
       await this.dropFile(item, true);
       item.deleted = true;
@@ -688,11 +755,19 @@ export class ChatClient {
     this.emit({ type: 'items', contactId });
   }
 
+  /** whether we can delete this member's message for everyone */
+  canModerate(g: Group, item: ChatItem): boolean {
+    const author = item.memberId ? g.members[item.memberId] : undefined;
+    return g.status === 'active' && roleRank(g.role) >= roleRank('moderator') && (!author || roleRank(author.role) <= roleRank(g.role));
+  }
+
   async react(contactId: string, itemId: string, emoji: string, add: boolean): Promise<void> {
-    const c = this.activeContact(contactId);
     const item = (await this.chatItems(contactId)).find((i) => i.id === itemId);
     if (!item || !item.sharedMsgId) return;
-    await this.send(c, xMsgReact(newSharedMsgId(), item.sharedMsgId, emoji, add));
+    const g = this.state.groups?.[contactId];
+    // in groups: whose message it is
+    const author = g ? (item.dir === 'snd' ? g.memberId : item.memberId) : undefined;
+    await this.sendToChat(contactId, xMsgReact(newSharedMsgId(), item.sharedMsgId, emoji, add, author));
     item.reactions ??= {};
     const r = (item.reactions[emoji] ??= {});
     r.me = add;
@@ -701,7 +776,7 @@ export class ChatClient {
   }
 
   async markRead(contactId: string): Promise<void> {
-    const c = this.state.contacts[contactId];
+    const c = this.state.contacts[contactId] ?? this.state.groups?.[contactId];
     if (!c) return;
     const items = await this.chatItems(contactId);
     let changed = -1;
@@ -934,7 +1009,7 @@ export class ChatClient {
   }
 
   private async fileItem(contactId: string, itemId: string, fileId: string): Promise<ChatItem | undefined> {
-    if (!this.state.contacts[contactId]) return undefined;
+    if (!this.state.contacts[contactId] && !this.state.groups?.[contactId]) return undefined;
     const it = (await this.chatItems(contactId)).find((i) => i.id === itemId);
     return it?.file?.id === fileId ? it : undefined;
   }
@@ -985,12 +1060,11 @@ export class ChatClient {
         Object.assign(meta, { sndDescr: encodeFileDescription(up.snd), rcvDescr: encodeFileDescription(up.rcv), sentParts: 0, expiresAt: up.expiresAt });
         await this.files.putMeta(fileId, meta);
       }
-      const c = this.activeContact(contactId);
       const fileExpires = meta.expiresAt ? new Date(meta.expiresAt * 1000).toISOString() : undefined;
       const parts = splitFileDescr(meta.rcvDescr!);
       for (let i = meta.sentParts ?? 0; i < parts.length; i++) {
         signal.throwIfAborted();
-        await this.send(c, xMsgFileDescr(newSharedMsgId(), sharedMsgId, parts[i], fileExpires));
+        await this.sendToChat(contactId, xMsgFileDescr(newSharedMsgId(), sharedMsgId, parts[i], fileExpires));
         meta.sentParts = i + 1;
         await this.files.putMeta(fileId, meta);
       }
@@ -1170,8 +1244,7 @@ export class ChatClient {
     const meta = await this.files.getMeta(f.id);
     if (meta?.sndDescr) await deleteUploadedFile(this.files.pool, decodeFileDescription(meta.sndDescr)).catch((e) => console.warn('deleting the file from the server failed', e));
     await this.files.delMeta(f.id);
-    const c = this.state.contacts[contactId];
-    if (c?.status === 'active' && it.sharedMsgId) await this.send(c, xFileCancel(newSharedMsgId(), it.sharedMsgId)).catch(() => {});
+    if (it.sharedMsgId) await this.sendToChat(contactId, xFileCancel(newSharedMsgId(), it.sharedMsgId)).catch(() => {});
     this.untrackTransfer(f.id);
     await this.setFile(contactId, it, { status: 'sndCancelled', error: undefined });
   }
@@ -1205,8 +1278,17 @@ export class ChatClient {
     this.untrackTransfer(f.id);
   }
 
-  private async addEvent(contactId: string, text: string): Promise<void> {
-    await this.addItem(contactId, { id: localId(), dir: 'event', content: { type: 'text', text }, ts: Date.now(), status: 'read' });
+  /** @internal */
+  async addEvent(contactId: string, text: string, memberId?: string): Promise<void> {
+    await this.addItem(contactId, { id: localId(), dir: 'event', content: { type: 'text', text }, ts: Date.now(), status: 'read', ...(memberId ? { memberId } : {}) });
+  }
+
+  /** @internal the items of a deleted chat, and their files */
+  async deleteChatItems(chatId: string): Promise<void> {
+    const items = await this.chatItems(chatId);
+    for (const it of items) await this.dropFile(it, false);
+    await this.itemStore.delete(chatId);
+    this.items.delete(chatId);
   }
 
   private async expireItems(): Promise<void> {
@@ -1229,12 +1311,18 @@ export class ChatClient {
     return id ? this.state.contacts[id] : undefined;
   }
 
-  private parseInfo(b: Bytes): ChatMessage | undefined {
+  /** @internal */
+  parseInfo(b: Bytes): ChatMessage | undefined {
     const ms = parseChatMessages(b);
     return ms.find((m) => m.msg)?.msg;
   }
 
   private async onAgentEvent(e: AgentEvent): Promise<MsgResult | void> {
+    // the connections with group members, and group links
+    if ('connId' in e && e.connId && this.groups.owns(e.connId)) {
+      if (e.type === 'ERR') console.warn('agent error (group)', e.err);
+      return this.groups.onAgentEvent(e);
+    }
     switch (e.type) {
       case 'CONF': {
         const m = this.parseInfo(e.connInfo);
@@ -1385,29 +1473,40 @@ export class ChatClient {
     return { receipt: receipt && (c.sendReceipts ?? this.settings.sendReceipts) };
   }
 
-  /** returns true for messages that get delivery receipts */
-  private async processMsg(c: Contact, m: ChatMessage, e: Extract<AgentEvent, { type: 'MSG' }>): Promise<boolean> {
-    const brokerTs = e.brokerTs * 1000;
-    const items = await this.chatItems(c.id);
-    const bySharedId = (id: unknown, dir: 'snd' | 'rcv') => (typeof id === 'string' ? items.find((i) => i.sharedMsgId === id && i.dir === dir) : undefined);
+  /**
+   * @internal the content events of a contact or of a group member: new messages, edits, deletions,
+   * reactions and files; returns true for messages that get delivery receipts
+   */
+  async processContent(t: ChatTarget, m: ChatMessage, meta: { brokerTs: number; integrity?: string }): Promise<boolean> {
+    const chatId = t.chatId;
+    const g = t.group;
+    const items = await this.chatItems(chatId);
+    const bySharedId = (id: unknown, dir: 'snd' | 'rcv', memberId = t.sender?.memberId) =>
+      typeof id === 'string' ? items.find((i) => i.sharedMsgId === id && i.dir === dir && (!g || dir === 'snd' || i.memberId === memberId)) : undefined;
+    // in groups: an item of the member with this ID, or ours
+    const byAuthor = (id: unknown, author: string | undefined) => (g && author === g.memberId ? bySharedId(id, 'snd') : bySharedId(id, 'rcv', author));
     switch (m.event) {
       case 'x.msg.new': {
         if (m.msgId && bySharedId(m.msgId, 'rcv')) return true;
         const mc = m.params as MsgContainer;
         const content = mc.content ?? { type: 'text', text: '' };
-        const item: ChatItem = { id: localId(), dir: 'rcv', sharedMsgId: m.msgId, content, ts: Date.now(), brokerTs, status: 'received', integrity: e.integrity };
+        const item: ChatItem = { id: localId(), dir: 'rcv', sharedMsgId: m.msgId, content, ts: Date.now(), brokerTs: meta.brokerTs, status: 'received', integrity: meta.integrity, ...(t.sender ? { memberId: t.sender.memberId } : {}) };
         if (mc.quote) {
-          const q = bySharedId(mc.quote.msgRef?.msgId, mc.quote.msgRef?.sent ? 'rcv' : 'snd');
-          item.quote = { sharedMsgId: mc.quote.msgRef?.msgId, text: q ? itemText(q) : contentText(mc.quote.content ?? { type: 'text', text: '' }), sent: !mc.quote.msgRef?.sent };
+          const ref = mc.quote.msgRef;
+          const author = g ? (normMemberId(ref?.memberId) ?? (ref?.sent ? t.sender?.memberId : undefined)) : undefined;
+          const q = g ? byAuthor(ref?.msgId, author) : bySharedId(ref?.msgId, ref?.sent ? 'rcv' : 'snd');
+          const sent = g ? author === g.memberId : !ref?.sent;
+          item.quote = { sharedMsgId: ref?.msgId, text: q ? itemText(q) : contentText(mc.quote.content ?? { type: 'text', text: '' }), sent, ...(g && !sent && author ? { memberId: author } : {}) };
         }
         if (mc.forward) item.forwarded = true;
         if (mc.file && typeof mc.file === 'object') await this.newRcvFile(item, mc.file);
         if (typeof mc.ttl === 'number' && mc.ttl > 0) item.ttl = mc.ttl;
-        c.unread++;
-        await this.addItem(c.id, item);
+        const chat = g ?? this.state.contacts[chatId];
+        if (chat) chat.unread++;
+        await this.addItem(chatId, item);
         if (item.file?.status === 'rcvAccepted') {
-          this.trackTransfer(item.file.id, c.id, item.id);
-          this.startDownload(c.id, item.id, item.file.id);
+          this.trackTransfer(item.file.id, chatId, item.id);
+          this.startDownload(chatId, item.id, item.file.id);
         }
         return true;
       }
@@ -1416,32 +1515,72 @@ export class ChatClient {
         if (!it || it.deleted) return false;
         it.content = m.params.content as MsgContent;
         it.edited = true;
-        await this.updateItem(c.id, it);
+        await this.updateItem(chatId, it);
         return false;
       }
       case 'x.msg.del': {
-        const it = bySharedId(m.params.msgId, 'rcv');
+        // in groups, moderators delete the messages of others (memberId is the author)
+        const author = g ? (normMemberId(m.params.memberId) ?? t.sender?.memberId) : undefined;
+        const moderated = !!g && author !== t.sender?.memberId;
+        if (moderated) {
+          const target = byAuthor(m.params.msgId, author);
+          const tm = author && author !== g.memberId ? g.members[author] : undefined;
+          const authorRole = author === g.memberId ? g.role : tm?.role;
+          if (!target || roleRank(t.sender?.role) < roleRank('moderator') || roleRank(t.sender?.role) < roleRank(authorRole)) return false;
+        }
+        const it = moderated ? byAuthor(m.params.msgId, author) : bySharedId(m.params.msgId, 'rcv');
         if (!it) return false;
         it.deleted = true;
+        if (moderated) it.moderated = true;
         it.content = { type: 'text', text: '' };
         if (it.file) {
           await this.dropFile(it, false);
           it.file = undefined;
         }
-        await this.updateItem(c.id, it);
+        await this.updateItem(chatId, it);
         return false;
       }
       case 'x.msg.react': {
-        const target = bySharedId(m.params.msgId, 'snd') ?? bySharedId(m.params.msgId, 'rcv');
+        const target = g ? byAuthor(m.params.msgId, normMemberId(m.params.memberId)) : (bySharedId(m.params.msgId, 'snd') ?? bySharedId(m.params.msgId, 'rcv'));
         const emoji = m.params.reaction?.emoji;
         if (!target || typeof emoji !== 'string') return false;
         target.reactions ??= {};
         const r = (target.reactions[emoji] ??= {});
-        r.peer = !!m.params.add;
-        if (!r.me && !r.peer) delete target.reactions[emoji];
-        await this.updateItem(c.id, target);
+        if (t.sender) {
+          const others = (r.members ?? []).filter((x) => x !== t.sender!.memberId);
+          r.members = m.params.add ? [...others, t.sender.memberId] : others;
+          if (!r.members.length) delete r.members;
+        } else r.peer = !!m.params.add;
+        if (!r.me && !r.peer && !r.members?.length) delete target.reactions[emoji];
+        await this.updateItem(chatId, target);
         return false;
       }
+      case 'x.msg.file.descr': {
+        const it = bySharedId(m.params.msgId, 'rcv');
+        const part = m.params.fileDescr;
+        if (it?.file && part && typeof part === 'object') await this.addFileDescrPart(chatId, it, part, m.params.fileExpires);
+        return false;
+      }
+      case 'x.file.cancel': {
+        const it = bySharedId(m.params.msgId, 'rcv');
+        if (it?.file) await this.fileCancelledBySender(chatId, it);
+        return false;
+      }
+      default:
+        return false;
+    }
+  }
+
+  /** returns true for messages that get delivery receipts */
+  private async processMsg(c: Contact, m: ChatMessage, e: Extract<AgentEvent, { type: 'MSG' }>): Promise<boolean> {
+    switch (m.event) {
+      case 'x.msg.new':
+      case 'x.msg.update':
+      case 'x.msg.del':
+      case 'x.msg.react':
+      case 'x.msg.file.descr':
+      case 'x.file.cancel':
+        return this.processContent({ chatId: c.id }, m, { brokerTs: e.brokerTs * 1000, integrity: e.integrity });
       case 'x.info': {
         if (m.params.profile) {
           c.profile = m.params.profile as Profile;
@@ -1461,7 +1600,7 @@ export class ChatClient {
       case 'x.ok':
         return false;
       case 'x.grp.inv':
-        await this.addEvent(c.id, `${profileName(c.profile)} invited you to the group "${m.params.groupInvitation?.groupProfile?.displayName ?? ''}" — groups are not supported yet`);
+        await this.groups.onInvitation(c, m);
         return true;
       case 'x.call.inv':
         await this.addEvent(c.id, `${profileName(c.profile)} is calling — calls are not supported in Duplex`);
@@ -1471,17 +1610,6 @@ export class ChatClient {
       case 'x.call.extra':
       case 'x.call.end':
         return false;
-      case 'x.msg.file.descr': {
-        const it = bySharedId(m.params.msgId, 'rcv');
-        const part = m.params.fileDescr;
-        if (it?.file && part && typeof part === 'object') await this.addFileDescrPart(c.id, it, part, m.params.fileExpires);
-        return false;
-      }
-      case 'x.file.cancel': {
-        const it = bySharedId(m.params.msgId, 'rcv');
-        if (it?.file) await this.fileCancelledBySender(c.id, it);
-        return false;
-      }
       case 'x.file.acpt.inv':
         // files sent over SMP connections (not used by the apps anymore)
         return false;

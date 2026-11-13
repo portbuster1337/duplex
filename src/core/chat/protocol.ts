@@ -1,7 +1,7 @@
 // SimpleX Chat protocol messages (Simplex.Chat.Protocol): JSON events like x.info and x.msg.new,
 // batches ('[...]'), compressed batches ('X'), and the element prefixes used by newer clients.
 import { decompress } from 'fzstd';
-import { b64, b64url, b64urlNoPad, fromB64, fromUtf8, fromUtf8Lossy, randomBytes, utf8, type Bytes } from '../util/bytes';
+import { b64, b64url, fromB64, fromUtf8, fromUtf8Lossy, randomBytes, utf8, type Bytes } from '../util/bytes';
 import { Decoder, Encoder, ParseError } from '../util/encoding';
 import { zstdCompress } from '../util/zstd';
 import { parseVR, strVR, type VersionRange } from '../util/version';
@@ -123,8 +123,8 @@ export interface ParsedChatMsg {
   error?: string;
   /** the element was signed by a group member (signatures are not verified by this client) */
   signed?: boolean;
-  /** forwarded by a group member or channel relay */
-  forward?: { memberId?: string; memberName?: string; brokerTs: string };
+  /** forwarded by a group member or channel relay: the original sender, and when the router got it (ms) */
+  forward?: { memberId?: string; memberName?: string; brokerTs: number };
 }
 
 function parseJsonElement(b: Bytes): ParsedChatMsg {
@@ -167,15 +167,16 @@ function parseElement(b: Bytes, fwd?: ParsedChatMsg['forward']): ParsedChatMsg {
 }
 
 function parseFwd(d: Decoder): ParsedChatMsg['forward'] {
-  // GrpMsgForward: fwdSender ('M' memberId memberName | 'C') + brokerTs (text)
+  // GrpMsgForward: fwdSender ('M' memberId memberName | 'C'), then the router time (SystemTime: Int64 seconds)
   const t = d.char();
   let memberId: string | undefined;
   let memberName: string | undefined;
   if (t === 'M') {
-    memberId = b64urlNoPad(d.bytes());
+    // member IDs are base64url in JSON (strEncode)
+    memberId = b64url(d.bytes());
     memberName = fromUtf8Lossy(d.bytes());
   } else if (t !== 'C') throw new ParseError('bad forward sender');
-  const brokerTs = fromUtf8Lossy(d.bytes());
+  const brokerTs = d.int64n() * 1000;
   return { memberId, memberName, brokerTs };
 }
 
@@ -284,12 +285,14 @@ export const xMsgNew = (msgId: string, mc: MsgContainer): ChatMessage => ({ msgI
 
 export const xMsgUpdate = (msgId: string, refMsgId: string, content: MsgContent): ChatMessage => ({ msgId, event: 'x.msg.update', params: { msgId: refMsgId, content } });
 
-export const xMsgDel = (msgId: string, refMsgId: string): ChatMessage => ({ msgId, event: 'x.msg.del', params: { msgId: refMsgId } });
+/** in groups, memberId is the author of the message (moderators delete the messages of others) */
+export const xMsgDel = (msgId: string, refMsgId: string, memberId?: string): ChatMessage => ({ msgId, event: 'x.msg.del', params: { msgId: refMsgId, ...(memberId ? { memberId } : {}) } });
 
-export const xMsgReact = (msgId: string, refMsgId: string, emoji: string, add: boolean): ChatMessage => ({
+/** in groups, memberId is the author of the message */
+export const xMsgReact = (msgId: string, refMsgId: string, emoji: string, add: boolean, memberId?: string): ChatMessage => ({
   msgId,
   event: 'x.msg.react',
-  params: { msgId: refMsgId, reaction: { type: 'emoji', emoji }, add },
+  params: { msgId: refMsgId, ...(memberId ? { memberId } : {}), reaction: { type: 'emoji', emoji }, add },
 });
 
 export const xDirectDel = (msgId: string): ChatMessage => ({ msgId, event: 'x.direct.del', params: {} });
@@ -313,10 +316,17 @@ export function contactShortLinkData(profile: Profile, message?: MsgContent, bus
   return utf8(JSON.stringify({ profile, ...(message ? { message } : {}), business }));
 }
 
-export function parseShortLinkData(b?: Bytes): { profile?: Profile; message?: MsgContent; business?: boolean } {
+/** the user data of short links: JSON, compressed with zstd after 'X' when it is large (decodeLinkUserData) */
+export function parseShortLinkData(b?: Bytes): { profile?: Profile; message?: MsgContent; business?: boolean; groupProfile?: Record<string, unknown> } {
   if (!b || !b.length) return {};
   try {
-    const o = JSON.parse(fromUtf8Lossy(b));
+    let s = b;
+    if (b[0] === 0x58) {
+      const size = zstdContentSize(b.subarray(1));
+      if (size === undefined || size > MAX_DECOMPRESSED_LENGTH) return {};
+      s = decompress(b.subarray(1), new Uint8Array(size));
+    }
+    const o = JSON.parse(fromUtf8Lossy(s));
     return o && typeof o === 'object' ? o : {};
   } catch {
     return {};

@@ -412,6 +412,16 @@ export class Agent {
     return this.conns.get(id);
   }
 
+  /** waits until the messages queued for a connection are sent (or the time is over), e.g. before deleting it */
+  async drain(connId: string, ms = 10000): Promise<boolean> {
+    for (let t = 0; t < ms; t += 100) {
+      const c = this.conns.get(connId);
+      if (!c || !c.pending.length || c.status === 'deleted') return true;
+      await new Promise((r) => setTimeout(r, 100));
+    }
+    return false;
+  }
+
   /** whether the connection supports post-quantum encryption (and has the smaller message limits) */
   pqSupport(connId: string): boolean {
     return !!this.conns.get(connId)?.pqSupport;
@@ -743,7 +753,8 @@ export class Agent {
 
   // ---- contact addresses
 
-  async createAddress(opts: { userData?: Bytes } = {}): Promise<{ connId: string; link: string; fullLink: string }> {
+  /** a contact address; group links have client data (the group link ID) and the short link type 'G' */
+  async createAddress(opts: { userData?: Bytes; clientData?: string; linkType?: 'A' | 'G' } = {}): Promise<{ connId: string; link: string; fullLink: string }> {
     const c = this.newConn('contact', 'address');
     const srv = this.nextServer();
     const root = generateKeyPair('ed25519');
@@ -753,7 +764,7 @@ export class Agent {
     const { rq } = await this.newRcvQueue(srv, 'C', SMP_CLIENT_VERSIONS.max, (sndId, e2ePub) => {
       connReq = {
         mode: 'contact',
-        data: { scheme: 'simplex', agentVersions: AGENT_VERSIONS, queues: [{ versions: SMP_CLIENT_VERSIONS, addr: { server: srv, senderId: sndId, dhPublicKey: e2ePub, queueMode: 'C' } }] },
+        data: { scheme: 'simplex', agentVersions: AGENT_VERSIONS, queues: [{ versions: SMP_CLIENT_VERSIONS, addr: { server: srv, senderId: sndId, dhPublicKey: e2ePub, queueMode: 'C' } }], ...(opts.clientData !== undefined ? { clientData: opts.clientData } : {}) },
       };
       const s = encodeSignLinkData(
         root,
@@ -766,7 +777,7 @@ export class Agent {
       encFixed = data.fixedData;
       return { linkId: k.linkId, data };
     });
-    const link = strShortLink({ mode: 'contact', scheme: 'server', type: 'A', server: srv, linkKey });
+    const link = strShortLink({ mode: 'contact', scheme: 'server', type: opts.linkType ?? 'A', server: srv, linkKey });
     rq.shortLink = { linkId: contactShortLinkKdf(linkKey).linkId, linkKey, rootPriv: root.priv, rootPub: root.pub, encFixedData: encFixed, link };
     c.rcv = rq;
     c.link = link;
