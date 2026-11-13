@@ -23,12 +23,23 @@ Chat are trademarks of SimpleX Chat Ltd.
   messages are downloaded automatically like in the apps (this can be turned off); other files when
   you choose; files on servers you do not use only after you agree. Sent files can be deleted from
   the server at any time.
+- **Voice messages**, recorded in the page: AAC in M4A like the apps where the browser can encode
+  it, otherwise 8 kHz μ-law WAV, which the apps play too.
+- **Post-quantum encryption**: the double ratchet with the sntrup761 key encapsulation that the apps
+  add, agreed with the contact automatically; the chat says when messages are quantum resistant.
+- **Private message routing**: messages to your contacts' servers go through one of your servers,
+  which forwards them encrypted, so a contact's server does not see your relay's address or your
+  session, and your server does not see which queue they go to. As in the apps, this is used for
+  servers you do not use, with direct sending only when your IP address is hidden (adjustable).
+- **Address changes**: you can change the address you receive a contact's messages at (a new
+  queue, on another of your servers if you have one), and Duplex follows the contact's changes.
 - **Incognito connections**: a 1-time link or a connection can share a new random profile (named
   like those of the apps) instead of yours.
 - **Security codes**: compare a contact's code (or scan its QR code in the apps) to check that nobody
   is in the middle of the connection; the code is the same one the SimpleX Chat apps show.
-- **End-to-end encrypted** with the double ratchet (X448, AES-256-GCM, header encryption), per-queue
-  NaCl boxes, and TLS 1.3 to servers that are pinned to the fingerprint in their address.
+- **End-to-end encrypted** with the double ratchet (X448 and sntrup761, AES-256-GCM, header
+  encryption), per-queue NaCl boxes, and TLS 1.3 to servers that are pinned to the fingerprint in
+  their address.
 - **Encrypted at rest.** Everything stored in the browser (IndexedDB) is encrypted with
   XChaCha20-Poly1305 under a random key, which is encrypted with a key derived from your passphrase
   (Argon2id, 64 MiB). Record names are keyed hashes and sizes are padded, so the storage does not show
@@ -47,8 +58,9 @@ Browsers cannot open the TCP connections that SimpleX servers need, so Duplex as
 [Wisp](https://github.com/MercuryWorkshop/wisp-protocol) relay (TCP streams over a WebSocket) for a
 connection and runs its own TLS 1.3 inside it (`src/core/net/tls13.ts`), checking the server's
 certificate chain against the fingerprint in the server address. On top of that it implements the
-SimpleX Messaging Protocol, the SMP agent protocol (fast duplex handshake, short links, contact
-addresses, message integrity, receipts) and the chat protocol, following
+SimpleX Messaging Protocol (with private message routing), the SMP agent protocol (fast duplex
+handshake, short links, contact addresses, message integrity, receipts, the post-quantum double
+ratchet, queue rotation) and the chat protocol, following
 [simplexmq](https://github.com/simplex-chat/simplexmq) and
 [simplex-chat](https://github.com/simplex-chat/simplex-chat).
 
@@ -65,7 +77,8 @@ it works without installing anything.
 | | can see | cannot see |
 |---|---|---|
 | the Wisp relay | your IP address, which SimpleX servers you connect to, when and how much (fixed-size blocks) | messages, contacts, profile, queue IDs (all inside TLS) |
-| SimpleX servers | the relay's IP address, the queues you use on that server and when messages pass through them (encrypted fixed-size blocks) | your IP address, messages and profile; there are no accounts or user IDs |
+| your SimpleX servers | the relay's IP address, the queues you use on that server and when messages pass through them (encrypted fixed-size blocks); when forwarding your messages, which server they go to | your IP address, messages and profile; there are no accounts or user IDs; the queues on other servers that your messages go to |
+| your contacts' servers | with private routing, only the address of the server that forwards your messages | your IP address, the relay's address, messages and profile |
 | file servers (XFTP) | the relay's IP address, encrypted chunks of 64 KB to 4 MB and when they are uploaded and downloaded | the file, its name and real size, who sent it and to whom |
 | your contacts | the profile you share and your messages | your IP address and your other contacts |
 | Codeberg Pages | that the page was loaded, from which IP address | everything after that |
@@ -77,12 +90,10 @@ use on it belong to the same client.
 
 ### Limitations
 
-- No groups or channels or calls (they are shown as unsupported). Voice messages can be played
-  but not recorded.
+- No groups or channels or calls (they are shown as unsupported).
 - Files are kept in the encrypted storage of this browser, which browsers limit in size; large files
   should be saved to disk.
-- No post-quantum key exchange, private message routing, per-connection transport isolation or
-  queue rotation.
+- No per-connection transport isolation (one connection per server, see above).
 - No push notifications: messages arrive while the page is open (it can show notifications while it
   is in a background tab). One tab at a time, no syncing between devices.
 - The data lives only in this browser: clearing the site data or forgetting the passphrase loses it.
@@ -116,9 +127,9 @@ Tests:
 
 | command | what |
 |---|---|
-| `npm test` | unit tests: crypto against libsodium and OpenSSL vectors, links of the official client, certificate pinning, compressed messages, the encrypted storage, HTTP/2 header compression (RFC 7541 examples), file descriptions against the fixture of simplexmq |
-| `SMP_SERVER=smp://…@localhost:7001 npm run test:local` | two agents connecting through a local `smp-server`: invitations, short links, addresses, receipts |
-| `SMP_SERVER=… XFTP_SERVER=xftp://…@localhost:7002 SIMPLEX_CHAT_BIN=… npm run test:interop` | the chat client against the official SimpleX Chat CLI, with files through a local `xftp-server` |
+| `npm test` | unit tests: crypto against libsodium and OpenSSL vectors, sntrup761 against the C code of simplexmq, the post-quantum ratchet, links of the official client, certificate pinning, zstd compression, the encrypted storage, HTTP/2 header compression (RFC 7541 examples), file descriptions against the fixture of simplexmq, voice formats (with `FFMPEG_DIR`, against ffmpeg) |
+| `SMP_SERVER=smp://…@localhost:7001 SMP_SERVER2=smp://…@localhost:7003 npm run test:local` | two agents connecting through local `smp-server`s: invitations, short links, addresses, receipts, private message routing and address changes between the two |
+| `SMP_SERVER=… SMP_SERVER2=… XFTP_SERVER=xftp://…@localhost:7002 SIMPLEX_CHAT_BIN=… npm run test:interop` | the chat client against the official SimpleX Chat CLI (on the second router, so that Duplex sends to it with private routing): post-quantum encryption, address changes both ways, files through a local `xftp-server` |
 | `CHROME_PATH=… SIMPLEX_CHAT_BIN=… npm run e2e` | the production build in headless Chrome on the real SimpleX network, chatting with the official CLI (run `npm run build` and `npm run relay` first, or set `APP_URL` to the published page; without `CHROME_PATH`, it uses a browser installed with `npx playwright install chromium`) |
 
 `npm run check-server -- smp://… [wss://relay/]` connects to a server (directly or through a relay)
@@ -129,8 +140,8 @@ and makes a queue.
 | `src/core/net` | TLS 1.3 client, Wisp client, X.509, HTTP/2 client |
 | `src/core/xftp` | XFTP: file encryption, chunks, file descriptions, the file server client |
 | `src/core/smp` | SMP client: handshake, block encryption, commands |
-| `src/core/crypto` | primitives (noble), double ratchet |
-| `src/core/agent` | SMP agent: connections, short links, addresses, delivery |
+| `src/core/crypto` | primitives (noble), sntrup761, the double ratchet |
+| `src/core/agent` | SMP agent: connections, short links, addresses, delivery, private routing, queue rotation |
 | `src/core/chat` | chat protocol messages |
 | `src/app` | chat client, file transfers, encrypted vault, session and relays |
 | `src/ui` | the Preact interface |

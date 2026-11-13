@@ -307,6 +307,19 @@ test('voice messages are recorded in the browser and played from the official CL
   await shot('12-voice');
 });
 
+test('the receiving address can be changed, and the official CLI follows', async () => {
+  await openPeer();
+  await page.getByLabel('Contact info').click();
+  await page.getByRole('button', { name: 'Change receiving address' }).click();
+  await page.getByRole('button', { name: 'Change', exact: true }).click();
+  await page.locator('.address-change', { hasText: 'Changing the receiving address' }).waitFor({ timeout: NET });
+  await cli.waitType('contactSwitch', NET, (e) => e.switchProgress?.queueDirection === 'snd' && e.switchProgress?.switchPhase === 'completed');
+  await page.getByLabel('Close').click();
+  await page.locator('.messages .event', { hasText: 'you changed address' }).waitFor({ timeout: NET });
+  await cli.cmd(`@${ME} to your new address`);
+  await page.locator('.msg.rcv', { hasText: 'to your new address' }).waitFor({ timeout: NET });
+});
+
 test('another tab can take over, and this one disconnects', async () => {
   const page2 = await page.context().newPage();
   await page2.goto(APP);
