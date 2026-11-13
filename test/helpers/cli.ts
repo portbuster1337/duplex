@@ -35,7 +35,10 @@ export class Cli {
     fs.mkdirSync(dir, { recursive: true });
     const c = new Cli(name, port, dir);
     const net = server ? ['-s', server, '--smp-proxy', 'never', '--smp-web-port-servers', 'off'] : [];
-    const args = ['-d', path.join(dir, 'db'), '-p', String(port), '--user-display-name', name, ...net, ...extra];
+    // received files are moved from the temporary folder, which must be on the same file system
+    const tmp = path.join(dir, 'tmp');
+    fs.mkdirSync(tmp, { recursive: true });
+    const args = ['-d', path.join(dir, 'db'), '-p', String(port), '--user-display-name', name, '--temp-folder', tmp, ...net, ...extra];
     c.proc = spawn(CLI_BIN, args, { stdio: ['ignore', 'pipe', 'pipe'] });
     c.proc.stdout!.on('data', (d) => c.log.push(String(d)));
     c.proc.stderr!.on('data', (d) => c.log.push(String(d)));

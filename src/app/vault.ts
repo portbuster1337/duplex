@@ -216,6 +216,24 @@ export class Vault {
     await this.backend.del(this.recordKey(name));
   }
 
+  /** binary records (file content), without the JSON encoding of put */
+  async putBytes(name: string, data: Bytes): Promise<void> {
+    const key = this.recordKey('bytes:' + name);
+    const nonce = randomBytes(24);
+    const ct = xchacha20poly1305(this.key(), nonce, this.aad('bytes:' + name)).encrypt(padRecord(data));
+    await this.backend.put(key, concat(nonce, ct));
+  }
+
+  async getBytes(name: string): Promise<Bytes | undefined> {
+    const raw = await this.backend.get(this.recordKey('bytes:' + name));
+    if (!raw) return undefined;
+    return unpadRecord(xchacha20poly1305(this.key(), raw.subarray(0, 24), this.aad('bytes:' + name)).decrypt(raw.subarray(24))).slice();
+  }
+
+  async delBytes(name: string): Promise<void> {
+    await this.backend.del(this.recordKey('bytes:' + name));
+  }
+
   /** deletes everything, including the KDF parameters */
   async wipe(): Promise<void> {
     this.lock();

@@ -2,8 +2,12 @@
 // SimpleX Chat protocol with the official apps.
 import { Agent, type AgentEvent, type MsgResult } from '../core/agent/agent';
 import type { Connector } from '../core/smp/client';
-import type { ProtocolServer } from '../core/smp/server';
+import { parseServer, type ProtocolServer, type ServerWithAuth } from '../core/smp/server';
 import { fromUtf8Lossy, type Bytes } from '../core/util/bytes';
+import { DEFAULT_XFTP_SERVERS, FLUX_XFTP_SERVERS } from '../core/agent/presets';
+import { decodeFileDescription, encodeFileDescription } from '../core/xftp/description';
+import { deleteUploadedFile, downloadFile, uploadFile } from '../core/xftp/file';
+import { GB, MB, XFTPError } from '../core/xftp/protocol';
 import { isShortLink, parseShortLink } from '../core/agent/shortlink';
 import {
   CHAT_VERSIONS,
@@ -16,17 +20,39 @@ import {
   parseShortLinkData,
   xContact,
   xDirectDel,
+  xFileCancel,
   xInfo,
   xMsgDel,
+  xMsgFileDescr,
   xMsgNew,
   xMsgReact,
   xMsgUpdate,
   type ChatMessage,
+  type FileInvitation,
   type MsgContainer,
   type MsgContent,
   type Profile,
 } from '../core/chat/protocol';
 import { ADJECTIVES, NOUNS } from '../core/chat/names';
+import { deletePieces, PieceWriter, piecesFor, storedSource } from './filestore';
+import {
+  AUTO_RECEIVE_IMAGE_SIZE,
+  AUTO_RECEIVE_VIDEO_SIZE,
+  cancelReason,
+  checkDescription,
+  FileManager,
+  FIXED_IMAGE_PREVIEW,
+  MAX_DESCR_LENGTH,
+  MAX_DESCR_PARTS,
+  MAX_FILE_SIZE,
+  safeFileName,
+  sniffType,
+  splitFileDescr,
+  unknownServers,
+  type ChatFile,
+  type FileMeta,
+  type OutgoingFile,
+} from './files';
 import { ItemStore, VaultAgentStore } from './store';
 import type { Vault } from './vault';
 
@@ -96,7 +122,7 @@ export interface ChatItem {
   deleteAt?: number;
   /** a received disappearing message: its TTL in seconds, counted from when it is read */
   ttl?: number;
-  file?: { name: string; size: number };
+  file?: ChatFile;
   error?: string;
   integrity?: string;
 }
@@ -113,6 +139,12 @@ export interface ChatSettings {
   servers: string[];
   sendReceipts: boolean;
   shortLinks: boolean;
+  /** file servers (XFTP) for sending files; empty for the presets */
+  xftpServers?: string[];
+  /** download received images, videos and voice messages up to the sizes the apps download */
+  autoReceiveImages?: boolean;
+  /** the version of our preferences that the contacts were told about */
+  prefsVersion?: number;
 }
 
 interface ChatState {
@@ -120,6 +152,8 @@ interface ChatState {
   requests: Record<string, ContactRequest>;
   invitations: Record<string, PendingInvitation>;
   address?: Address;
+  /** files being uploaded or downloaded, to continue after a reload */
+  pendingFiles?: Record<string, { contactId: string; itemId: string }>;
 }
 
 export type ChatEvent =
@@ -129,6 +163,7 @@ export type ChatEvent =
   | { type: 'request'; request: ContactRequest }
   | { type: 'connected'; contactId: string }
   | { type: 'network' }
+  | { type: 'fileProgress'; fileId: string }
   | { type: 'error'; message: string };
 
 function localId(): string {
@@ -139,13 +174,17 @@ const DEFAULT_PREFERENCES = {
   timedMessages: { allow: 'yes' as const },
   fullDelete: { allow: 'no' as const },
   reactions: { allow: 'yes' as const },
-  voice: { allow: 'no' as const },
-  files: { allow: 'no' as const },
+  voice: { allow: 'yes' as const },
+  files: { allow: 'always' as const },
   calls: { allow: 'no' as const },
 };
 
+/** 1: files and voice messages not allowed; 2: allowed */
+export const PREFS_VERSION = 2;
+
 export function withDefaultPreferences(p: Profile): Profile {
-  return { ...p, preferences: { ...DEFAULT_PREFERENCES, ...(p.preferences ?? {}), voice: { allow: 'no' }, files: { allow: 'no' }, calls: { allow: 'no' } } };
+  // calls are not supported
+  return { ...p, preferences: { ...DEFAULT_PREFERENCES, ...(p.preferences ?? {}), calls: { allow: 'no' } } };
 }
 
 function randomIndex(n: number): number {
@@ -190,6 +229,43 @@ export function contentText(c: MsgContent): string {
 
 export class ChatError extends Error {}
 
+/** the file is on servers that the user does not use: it is downloaded after the user agrees, as in the apps */
+export class FileApprovalError extends ChatError {
+  constructor(readonly servers: string[]) {
+    super(`the file is on a server you do not use: ${servers.join(', ')}`);
+    this.name = 'FileApprovalError';
+  }
+}
+
+/** the text of an item, or the name of its file */
+export function itemText(it: ChatItem): string {
+  return contentText(it.content) || it.file?.name || '';
+}
+
+/** quoteContent of simplex-chat: what a reply with this content quotes of an item */
+function quoteContent(mc: MsgContent, q: ChatItem): MsgContent {
+  const text = itemText(q);
+  // replies with large content quote only the text
+  if (!['text', 'file', 'voice', 'report'].includes(mc.type)) return { type: 'text', text };
+  const image = (q.content as { image?: unknown }).image;
+  if (q.content.type === 'image' && typeof image === 'string') return { type: 'image', text, image };
+  if (q.content.type === 'file') return { type: 'file', text };
+  return q.content;
+}
+
+function fileErrorText(e: unknown): string {
+  if (e instanceof XFTPError) {
+    if (e.gone) return 'the file was deleted from the server or has expired';
+    if (e.code === 'QUOTA') return 'the file server is full';
+    if (e.code === 'DIGEST' || e.code === 'CRYPTO') return 'the file is damaged';
+    if (e.code === 'SIZE') return 'the file has a different size';
+  }
+  return e instanceof Error ? e.message : String(e);
+}
+
+/** errors after which trying again does not help */
+const permanentFileError = (e: unknown): boolean => e instanceof XFTPError && (e.gone || ['DIGEST', 'CRYPTO', 'SIZE', 'DESCRIPTION'].includes(e.code));
+
 export class ChatClient {
   readonly agent: Agent;
   state: ChatState = { contacts: {}, requests: {}, invitations: {} };
@@ -201,6 +277,8 @@ export class ChatClient {
   private ttlTimer: ReturnType<typeof setInterval> | undefined;
   network: { connected: number; total: number; errors: string[] } = { connected: 0, total: 0, errors: [] };
   private up = new Set<string>();
+  /** file transfers and the local copies of files */
+  readonly files: FileManager;
 
   constructor(
     private vault: Vault,
@@ -211,6 +289,7 @@ export class ChatClient {
     this.agent = new Agent(new VaultAgentStore(vault), connector, { servers, shortLinks: settings.shortLinks });
     this.agent.onEvent = (e) => this.onAgentEvent(e);
     this.itemStore = new ItemStore<ChatItem>(vault);
+    this.files = new FileManager(vault, () => this.agent.network.connector);
   }
 
   on(f: (e: ChatEvent) => void): () => void {
@@ -236,19 +315,23 @@ export class ChatClient {
 
   async start(): Promise<void> {
     const s = await this.vault.get<ChatState>('chat');
-    if (s) this.state = { contacts: s.contacts ?? {}, requests: s.requests ?? {}, invitations: s.invitations ?? {}, address: s.address };
+    if (s) this.state = { contacts: s.contacts ?? {}, requests: s.requests ?? {}, invitations: s.invitations ?? {}, address: s.address, pendingFiles: s.pendingFiles ?? {} };
     for (const c of Object.values(this.state.contacts)) this.connToContact.set(c.connId, c.id);
     await this.agent.start();
     this.ttlTimer = setInterval(() => this.expireItems(), 10000);
+    void this.resumeTransfers().catch((e) => console.warn('resuming file transfers failed', e));
+    void this.announcePreferences().catch((e) => console.warn('sending the preferences failed', e));
   }
 
   stop(): void {
     clearInterval(this.ttlTimer);
+    this.files.stop();
     this.agent.stop();
   }
 
   /** after stop: resolves when the event handlers and writes that were running have finished */
   async idle(): Promise<void> {
+    await this.files.idle();
     await this.agent.idle();
     await this.stateWrite;
     await this.itemStore.idle();
@@ -281,6 +364,10 @@ export class ChatClient {
       const loaded = await this.itemStore.load(contactId);
       const now = Date.now();
       it = loaded.filter((i) => !i.deleteAt || i.deleteAt > now);
+      // files received before files were supported have no description
+      for (const i of it) {
+        if (i.file && !i.file.status) i.file = { id: localId(), name: safeFileName(i.file.name), size: Number(i.file.size) || 0, status: 'rcvError', error: 'received before Duplex supported files', permanent: true };
+      }
       this.items.set(contactId, it);
       if (it.length !== loaded.length) await this.itemStore.save(contactId, it, 0);
     }
@@ -463,32 +550,78 @@ export class ChatClient {
   }
 
   async sendText(contactId: string, text: string, quoteItemId?: string): Promise<ChatItem> {
+    return this.sendContent(contactId, { type: 'text', text }, quoteItemId);
+  }
+
+  /**
+   * sends a file, an image or a video with an optional caption: the message goes first, and the file
+   * is stored in this browser and uploaded in the background
+   */
+  async sendFile(contactId: string, out: OutgoingFile, text = '', quoteItemId?: string): Promise<ChatItem> {
+    const c = this.activeContact(contactId);
+    if (!this.peerAllowsFiles(c)) throw new ChatError('the contact does not allow files and media');
+    const size = out.blob.size;
+    if (!size) throw new ChatError('the file is empty');
+    if (size > MAX_FILE_SIZE) throw new ChatError(`the file is too large: files can be up to ${MAX_FILE_SIZE / GB} GB`);
+    const id = localId();
+    const file: ChatFile = { id, name: safeFileName(out.name), size, status: 'sndStored' };
+    try {
+      file.mime = sniffType(new Uint8Array(await out.blob.slice(0, 64).arrayBuffer()));
+      file.pieces = await this.files.store(id, out.blob);
+    } catch (e) {
+      await this.files.deleteLocal({ ...file, pieces: piecesFor(size) }).catch(() => {});
+      throw new ChatError(`the file could not be stored in this browser: ${(e as Error).message}`);
+    }
+    const content: MsgContent =
+      out.kind === 'image'
+        ? { type: 'image', text, image: out.preview || FIXED_IMAGE_PREVIEW }
+        : out.kind === 'video'
+          ? { type: 'video', text, image: out.preview || FIXED_IMAGE_PREVIEW, duration: Math.max(0, Math.round(out.duration ?? 0)) }
+          : { type: 'file', text };
+    return this.sendContent(contactId, content, quoteItemId, file);
+  }
+
+  private async sendContent(contactId: string, content: MsgContent, quoteItemId?: string, file?: ChatFile): Promise<ChatItem> {
     const c = this.activeContact(contactId);
     const sharedMsgId = newSharedMsgId();
-    const content: MsgContent = { type: 'text', text };
     const mc: MsgContainer = { content };
     let quote: ChatItem['quote'];
     if (quoteItemId) {
       const q = (await this.chatItems(contactId)).find((i) => i.id === quoteItemId);
       if (q && q.sharedMsgId) {
-        mc.quote = { msgRef: { msgId: q.sharedMsgId, sentAt: new Date(q.brokerTs ?? q.ts).toISOString(), sent: q.dir === 'snd' }, content: q.content };
-        quote = { sharedMsgId: q.sharedMsgId, text: contentText(q.content), sent: q.dir === 'snd' };
+        mc.quote = { msgRef: { msgId: q.sharedMsgId, sentAt: new Date(q.brokerTs ?? q.ts).toISOString(), sent: q.dir === 'snd' }, content: quoteContent(content, q) };
+        quote = { sharedMsgId: q.sharedMsgId, text: itemText(q), sent: q.dir === 'snd' };
       }
     }
+    // XFTP files: the description follows in x.msg.file.descr messages
+    if (file) mc.file = { fileName: file.name, fileSize: file.size, fileDescr: { fileDescrText: '', fileDescrPartNo: 0, fileDescrComplete: false } };
     const ttl = this.sendTtl(c);
     if (ttl) mc.ttl = ttl;
+    const tooLarge = () => encodeChatMessage(xMsgNew(sharedMsgId, mc)).length > MAX_ENCODED_MSG_LENGTH;
+    // a quoted image may not fit with the message: then only its text is quoted
+    if (mc.quote && quote && tooLarge()) mc.quote.content = { type: 'text', text: quote.text };
+    // nor a preview with a long caption: then the small preview of the apps is used
+    if (typeof (content as { image?: unknown }).image === 'string' && tooLarge()) (content as { image: string }).image = FIXED_IMAGE_PREVIEW;
     const now = Date.now();
-    const item: ChatItem = { id: localId(), dir: 'snd', sharedMsgId, content, ts: now, status: 'sending', quote, deleteAt: ttl ? now + ttl * 1000 : undefined };
+    const item: ChatItem = { id: localId(), dir: 'snd', sharedMsgId, content, ts: now, status: 'sending', quote, deleteAt: ttl ? now + ttl * 1000 : undefined, file };
     await this.addItem(contactId, item);
+    if (file) this.trackTransfer(file.id, contactId, item.id);
     try {
       item.agentMsgId = await this.send(c, xMsgNew(sharedMsgId, mc));
     } catch (e) {
       item.status = 'error';
       item.error = (e as Error).message;
+      if (file) {
+        file.status = 'sndError';
+        file.error = 'the message was not sent';
+        file.permanent = true;
+        this.untrackTransfer(file.id);
+      }
     }
     await this.updateItem(contactId, item);
     c.lastActivity = now;
     await this.saveState();
+    if (file && item.status !== 'error') this.startUpload(contactId, item.id, file.id);
     return item;
   }
 
@@ -512,13 +645,19 @@ export class ChatClient {
     if (forEveryone && item.dir === 'snd' && item.sharedMsgId && !item.deleted) {
       const c = this.activeContact(contactId);
       await this.send(c, xMsgDel(newSharedMsgId(), item.sharedMsgId));
+      // a sent file is deleted from the file servers too
+      await this.dropFile(item, true);
       item.deleted = true;
       item.content = { type: 'text', text: '' };
+      item.file = undefined;
       await this.updateItem(contactId, item);
       return;
     }
-    items.splice(i, 1);
-    await this.itemStore.save(contactId, items, i);
+    await this.dropFile(item, false);
+    const j = items.indexOf(item);
+    if (j < 0) return;
+    items.splice(j, 1);
+    await this.itemStore.save(contactId, items, j);
     this.emit({ type: 'items', contactId });
   }
 
@@ -555,14 +694,18 @@ export class ChatClient {
   }
 
   async clearChat(contactId: string): Promise<void> {
+    const items = await this.chatItems(contactId);
     this.items.set(contactId, []);
     await this.itemStore.delete(contactId);
     this.emit({ type: 'items', contactId });
+    for (const it of items) await this.dropFile(it, false);
   }
 
   async deleteContact(contactId: string, notify = true): Promise<void> {
     const c = this.state.contacts[contactId];
     if (!c) return;
+    const items = await this.chatItems(contactId);
+    for (const it of items) await this.dropFile(it, false);
     if (notify && c.status === 'active') await this.send(c, xDirectDel(newSharedMsgId())).catch(() => {});
     delete this.state.contacts[contactId];
     this.connToContact.delete(c.connId);
@@ -665,6 +808,350 @@ export class ChatClient {
     return !!c.verifiedCode && c.verifiedCode === this.agent.securityCode(c.connId);
   }
 
+  // ---- files
+
+  /** whether the contact accepts files and media (the preference in its profile) */
+  peerAllowsFiles(c: Contact): boolean {
+    return c.profile.preferences?.files?.allow !== 'no';
+  }
+
+  /** the file servers for sending files: the configured ones, or the presets */
+  xftpServers(): ServerWithAuth[] {
+    const out: ServerWithAuth[] = [];
+    for (const s of this.settings.xftpServers ?? []) {
+      try {
+        const p = parseServer(s);
+        if (p.server.scheme === 'xftp') out.push(p);
+      } catch {
+        // ignored
+      }
+    }
+    return out.length ? out : DEFAULT_XFTP_SERVERS.map((server) => ({ server }));
+  }
+
+  /** the file servers that files are downloaded from without asking */
+  private knownXftpServers(): ProtocolServer[] {
+    return [...this.xftpServers().map((s) => s.server), ...DEFAULT_XFTP_SERVERS, ...FLUX_XFTP_SERVERS];
+  }
+
+  /**
+   * whether file servers see another IP address than the user's (a relay elsewhere, or Tor): then, as
+   * in the apps, files are downloaded from unknown servers without asking
+   */
+  private ipProtected(): boolean {
+    return !!this.agent.network.connector.ipProtected;
+  }
+
+  /** contacts made by earlier versions were told that files are not allowed */
+  private async announcePreferences(): Promise<void> {
+    if ((this.settings.prefsVersion ?? 1) >= PREFS_VERSION) return;
+    for (const c of Object.values(this.state.contacts)) {
+      if (c.status === 'active') await this.send(c, xInfo(this.ourProfile(c))).catch(() => {});
+    }
+    await this.saveSettings({ prefsVersion: PREFS_VERSION });
+  }
+
+  /** the stored content of a file; inline: with its type, to show images, videos and audio in the page */
+  fileBlob(f: ChatFile, inline = false): Promise<Blob> {
+    return this.files.blob(f, inline);
+  }
+
+  private fileProgress(fileId: string, done: number, total: number): void {
+    if (this.files.setProgress(fileId, done, total)) this.emit({ type: 'fileProgress', fileId });
+  }
+
+  private trackTransfer(fileId: string, contactId: string, itemId: string): void {
+    (this.state.pendingFiles ??= {})[fileId] = { contactId, itemId };
+    void this.saveState();
+  }
+
+  private untrackTransfer(fileId: string): void {
+    if (!this.state.pendingFiles?.[fileId]) return;
+    delete this.state.pendingFiles[fileId];
+    void this.saveState();
+  }
+
+  /** changes the file of an item (undefined values remove the fields) and saves the item */
+  private async setFile(contactId: string, item: ChatItem, patch: Partial<ChatFile>): Promise<void> {
+    const f = item.file;
+    if (!f) return;
+    Object.assign(f, patch);
+    for (const [k, v] of Object.entries(patch)) if (v === undefined) delete (f as unknown as Record<string, unknown>)[k];
+    await this.updateItem(contactId, item);
+  }
+
+  private async fileItem(contactId: string, itemId: string, fileId: string): Promise<ChatItem | undefined> {
+    if (!this.state.contacts[contactId]) return undefined;
+    const it = (await this.chatItems(contactId)).find((i) => i.id === itemId);
+    return it?.file?.id === fileId ? it : undefined;
+  }
+
+  private async findFile(contactId: string, itemId: string): Promise<{ it: ChatItem; f: ChatFile }> {
+    const it = (await this.chatItems(contactId)).find((i) => i.id === itemId);
+    if (!it?.file) throw new ChatError('the file was not found');
+    return { it, f: it.file };
+  }
+
+  private startUpload(contactId: string, itemId: string, fileId: string): void {
+    this.files.run(fileId, (signal) => this.runUpload(contactId, itemId, fileId, signal));
+  }
+
+  private startDownload(contactId: string, itemId: string, fileId: string): void {
+    this.files.run(fileId, (signal) => this.runDownload(contactId, itemId, fileId, signal));
+  }
+
+  /** continues the transfers that a reload or locking interrupted */
+  private async resumeTransfers(): Promise<void> {
+    for (const [fileId, t] of Object.entries(this.state.pendingFiles ?? {})) {
+      const s = (await this.fileItem(t.contactId, t.itemId, fileId))?.file?.status;
+      if (s === 'sndStored' || s === 'sndUploading') this.startUpload(t.contactId, t.itemId, fileId);
+      else if (s === 'rcvAccepted' || s === 'rcvTransfer') this.startDownload(t.contactId, t.itemId, fileId);
+      else this.untrackTransfer(fileId);
+    }
+  }
+
+  /** uploads a sent file to a file server, then sends its description to the contact */
+  private async runUpload(contactId: string, itemId: string, fileId: string, signal: AbortSignal): Promise<void> {
+    const item = await this.fileItem(contactId, itemId, fileId);
+    const f = item?.file;
+    const sharedMsgId = item?.sharedMsgId;
+    if (!item || !f || !sharedMsgId) return this.untrackTransfer(fileId);
+    try {
+      signal.throwIfAborted();
+      const meta: FileMeta = (await this.files.getMeta(fileId)) ?? {};
+      if (!meta.rcvDescr) {
+        if (f.pieces === undefined) throw new ChatError('the file is not stored in this browser');
+        await this.setFile(contactId, item, { status: 'sndUploading', error: undefined });
+        const servers = this.xftpServers();
+        const srv = servers[randomIndex(servers.length)];
+        const up = await uploadFile(this.files.pool, srv.server, storedSource(this.vault, fileId, f.size), f.name, {
+          signal,
+          basicAuth: srv.basicAuth,
+          onProgress: (done, total) => this.fileProgress(fileId, done, total),
+        });
+        Object.assign(meta, { sndDescr: encodeFileDescription(up.snd), rcvDescr: encodeFileDescription(up.rcv), sentParts: 0, expiresAt: up.expiresAt });
+        await this.files.putMeta(fileId, meta);
+      }
+      const c = this.activeContact(contactId);
+      const fileExpires = meta.expiresAt ? new Date(meta.expiresAt * 1000).toISOString() : undefined;
+      const parts = splitFileDescr(meta.rcvDescr!);
+      for (let i = meta.sentParts ?? 0; i < parts.length; i++) {
+        signal.throwIfAborted();
+        await this.send(c, xMsgFileDescr(newSharedMsgId(), sharedMsgId, parts[i], fileExpires));
+        meta.sentParts = i + 1;
+        await this.files.putMeta(fileId, meta);
+      }
+      this.untrackTransfer(fileId);
+      await this.setFile(contactId, item, { status: 'sndComplete', expiresAt: meta.expiresAt ? meta.expiresAt * 1000 : undefined });
+    } catch (e) {
+      const reason = cancelReason(e);
+      // after locking, the upload continues when the profile is unlocked
+      if (reason === 'stopped' || this.files.isStopped) return;
+      this.untrackTransfer(fileId);
+      if (reason === 'deleted') return;
+      if (reason) await this.setFile(contactId, item, { status: 'sndCancelled' });
+      else await this.setFile(contactId, item, { status: 'sndError', error: fileErrorText(e) });
+    }
+  }
+
+  /** downloads a received file into the vault, once its description is complete */
+  private async runDownload(contactId: string, itemId: string, fileId: string, signal: AbortSignal): Promise<void> {
+    const item = await this.fileItem(contactId, itemId, fileId);
+    const f = item?.file;
+    if (!item || !f) return this.untrackTransfer(fileId);
+    const meta = await this.files.getMeta(fileId);
+    // it starts again when the last part of the description arrives
+    if (!meta?.descrComplete || meta.descrText === undefined) return;
+    let writer: PieceWriter | undefined;
+    try {
+      signal.throwIfAborted();
+      const fd = checkDescription(meta.descrText, f.size);
+      const unknown = unknownServers(fd, this.knownXftpServers());
+      if (unknown.length && !meta.approved && !this.ipProtected()) {
+        // as in the apps: the user is asked before files are downloaded from servers they do not use
+        this.untrackTransfer(fileId);
+        await this.setFile(contactId, item, { status: 'rcvInvitation', accepted: undefined, unknownServers: unknown.map((s) => s.hosts[0]) });
+        return;
+      }
+      // an interrupted download may have left pieces
+      if (f.status === 'rcvTransfer') await deletePieces(this.vault, fileId, piecesFor(f.size + 10 * MB));
+      await this.setFile(contactId, item, { status: 'rcvTransfer', error: undefined });
+      const w = (writer = new PieceWriter(this.vault, fileId));
+      let head: Bytes | undefined;
+      const r = await downloadFile(
+        this.files.pool,
+        fd,
+        async (piece) => {
+          head ??= piece.slice(0, 64);
+          await w.write(piece);
+        },
+        { signal, maxSize: f.size + 10 * MB, onProgress: (done, total) => this.fileProgress(fileId, done, total) },
+      );
+      const pieces = await w.end();
+      this.untrackTransfer(fileId);
+      await this.setFile(contactId, item, { status: 'rcvComplete', pieces, size: r.size, mime: head ? sniffType(head) : undefined, unknownServers: undefined });
+    } catch (e) {
+      const reason = cancelReason(e);
+      // after locking, the download starts again when the profile is unlocked
+      if (reason === 'stopped' || this.files.isStopped) return;
+      if (writer) await deletePieces(this.vault, fileId, writer.pieces + 1).catch(() => {});
+      this.untrackTransfer(fileId);
+      if (reason === 'deleted') return;
+      if (reason === 'sender') await this.setFile(contactId, item, { status: 'rcvCancelled', accepted: undefined });
+      else if (reason) await this.setFile(contactId, item, { status: 'rcvInvitation', accepted: undefined });
+      else await this.setFile(contactId, item, { status: 'rcvError', accepted: undefined, error: fileErrorText(e), permanent: permanentFileError(e) || undefined });
+    }
+  }
+
+  /** the file of a received message, and whether it is downloaded without asking */
+  private async newRcvFile(item: ChatItem, inv: FileInvitation): Promise<void> {
+    const id = localId();
+    const name = safeFileName(inv.fileName);
+    const size = Number(inv.fileSize);
+    const d = inv.fileDescr;
+    const fail = (error: string) => {
+      item.file = { id, name, size: Number.isSafeInteger(size) && size > 0 ? size : 0, status: 'rcvError', error, permanent: true };
+    };
+    if (!Number.isSafeInteger(size) || size <= 0) return fail('the file has no size');
+    // files sent over SMP connections are not used by the apps anymore
+    if (!d || typeof d !== 'object') return fail('this file was sent in a way that Duplex does not support');
+    if (d.fileDescrPartNo !== 0 || typeof d.fileDescrText !== 'string' || d.fileDescrText.length > MAX_DESCR_LENGTH) return fail('the file description is invalid');
+    await this.files.putMeta(id, { descrText: d.fileDescrText, descrPartNo: 0, descrComplete: d.fileDescrComplete === true });
+    item.file = { id, name, size, status: 'rcvInvitation' };
+    const t = item.content.type;
+    const auto = (t === 'image' && size <= AUTO_RECEIVE_IMAGE_SIZE) || (t === 'video' && size <= AUTO_RECEIVE_VIDEO_SIZE) || (t === 'voice' && size <= AUTO_RECEIVE_IMAGE_SIZE);
+    if (auto && this.settings.autoReceiveImages !== false) Object.assign(item.file, { status: 'rcvAccepted', accepted: true });
+  }
+
+  /** appendRcvFD of simplex-chat: the parts are numbered from 1 and the description has size limits */
+  private async addFileDescrPart(contactId: string, it: ChatItem, part: Record<string, unknown>, fileExpires: unknown): Promise<void> {
+    const f = it.file!;
+    const meta = await this.files.getMeta(f.id);
+    if (!meta || meta.descrComplete || f.status === 'rcvCancelled' || f.status === 'rcvComplete' || f.status === 'rcvError') return;
+    const partNo = part.fileDescrPartNo;
+    const text = (meta.descrText ?? '') + (typeof part.fileDescrText === 'string' ? part.fileDescrText : '');
+    if (typeof part.fileDescrText !== 'string' || typeof partNo !== 'number' || partNo !== (meta.descrPartNo ?? 0) + 1 || partNo > MAX_DESCR_PARTS || text.length > MAX_DESCR_LENGTH) {
+      await this.files.delMeta(f.id);
+      this.untrackTransfer(f.id);
+      return this.setFile(contactId, it, { status: 'rcvError', accepted: undefined, error: 'the file description is invalid', permanent: true });
+    }
+    Object.assign(meta, { descrText: text, descrPartNo: partNo, descrComplete: part.fileDescrComplete === true });
+    await this.files.putMeta(f.id, meta);
+    const expires = typeof fileExpires === 'string' ? Date.parse(fileExpires) : NaN;
+    if (!Number.isNaN(expires)) f.expiresAt = expires;
+    if (meta.descrComplete) {
+      try {
+        const unknown = unknownServers(checkDescription(text, f.size), this.knownXftpServers());
+        f.unknownServers = unknown.length ? unknown.map((s) => s.hosts[0]) : undefined;
+      } catch (e) {
+        this.untrackTransfer(f.id);
+        return this.setFile(contactId, it, { status: 'rcvError', accepted: undefined, error: `the file cannot be received: ${(e as Error).message}`, permanent: true });
+      }
+    }
+    await this.updateItem(contactId, it);
+    if (meta.descrComplete && f.accepted) this.startDownload(contactId, it.id, f.id);
+  }
+
+  private async fileCancelledBySender(contactId: string, it: ChatItem): Promise<void> {
+    const f = it.file!;
+    if (f.status === 'rcvComplete' || f.status === 'rcvCancelled') return;
+    if (this.files.isActive(f.id)) {
+      this.files.cancel(f.id, 'sender');
+      await this.files.settled(f.id);
+    }
+    await this.files.delMeta(f.id).catch(() => {});
+    this.untrackTransfer(f.id);
+    await this.setFile(contactId, it, { status: 'rcvCancelled', accepted: undefined });
+  }
+
+  /**
+   * downloads a received file; approve: the user agreed to download it from file servers they do
+   * not use (otherwise FileApprovalError is thrown for such files)
+   */
+  async receiveFile(contactId: string, itemId: string, approve = false): Promise<void> {
+    const { it, f } = await this.findFile(contactId, itemId);
+    if (it.dir !== 'rcv') throw new ChatError('the file was not received');
+    if (f.status === 'rcvCancelled') throw new ChatError('the sender deleted the file');
+    if (f.status === 'rcvError' && f.permanent) throw new ChatError(f.error ?? 'the file cannot be received');
+    if (f.status !== 'rcvInvitation' && f.status !== 'rcvError') return;
+    const meta = await this.files.getMeta(f.id);
+    if (!meta) throw new ChatError('the file description is missing');
+    if (meta.descrComplete && meta.descrText !== undefined) {
+      let unknown: ProtocolServer[];
+      try {
+        unknown = unknownServers(checkDescription(meta.descrText, f.size), this.knownXftpServers());
+      } catch (e) {
+        await this.setFile(contactId, it, { status: 'rcvError', error: `the file cannot be received: ${(e as Error).message}`, permanent: true });
+        throw e;
+      }
+      if (unknown.length && !meta.approved && !this.ipProtected() && !approve) throw new FileApprovalError(unknown.map((s) => s.hosts[0]));
+    }
+    if (approve && !meta.approved) await this.files.putMeta(f.id, { ...meta, approved: true });
+    await this.setFile(contactId, it, { status: 'rcvAccepted', accepted: true, error: undefined });
+    this.trackTransfer(f.id, contactId, it.id);
+    this.startDownload(contactId, it.id, f.id);
+  }
+
+  /** stops downloading a file; it can be downloaded again */
+  async cancelDownload(contactId: string, itemId: string): Promise<void> {
+    const { it, f } = await this.findFile(contactId, itemId);
+    if (it.dir !== 'rcv') return;
+    if (this.files.isActive(f.id)) {
+      this.files.cancel(f.id, 'cancelled');
+      await this.files.settled(f.id);
+    }
+    if (f.status === 'rcvAccepted' || f.status === 'rcvTransfer') {
+      this.untrackTransfer(f.id);
+      await this.setFile(contactId, it, { status: 'rcvInvitation', accepted: undefined });
+    }
+  }
+
+  /** deletes a sent file from the file servers (or stops uploading it) and tells the contact; the local copy stays */
+  async revokeFile(contactId: string, itemId: string): Promise<void> {
+    const { it, f } = await this.findFile(contactId, itemId);
+    if (it.dir !== 'snd' || f.status === 'sndCancelled') return;
+    if (this.files.isActive(f.id)) {
+      this.files.cancel(f.id, 'revoked');
+      await this.files.settled(f.id);
+    }
+    const meta = await this.files.getMeta(f.id);
+    if (meta?.sndDescr) await deleteUploadedFile(this.files.pool, decodeFileDescription(meta.sndDescr)).catch((e) => console.warn('deleting the file from the server failed', e));
+    await this.files.delMeta(f.id);
+    const c = this.state.contacts[contactId];
+    if (c?.status === 'active' && it.sharedMsgId) await this.send(c, xFileCancel(newSharedMsgId(), it.sharedMsgId)).catch(() => {});
+    this.untrackTransfer(f.id);
+    await this.setFile(contactId, it, { status: 'sndCancelled', error: undefined });
+  }
+
+  /** tries a failed upload or download again */
+  async retryFile(contactId: string, itemId: string): Promise<void> {
+    const { it, f } = await this.findFile(contactId, itemId);
+    if (it.dir === 'rcv') return this.receiveFile(contactId, itemId);
+    if (f.status !== 'sndError' || f.permanent) return;
+    await this.setFile(contactId, it, { status: 'sndStored', error: undefined });
+    this.trackTransfer(f.id, contactId, it.id);
+    this.startUpload(contactId, it.id, f.id);
+  }
+
+  /** cancels the transfer of a file and deletes its local copy; with revoke, a sent file is also deleted from the servers */
+  private async dropFile(item: ChatItem, revoke: boolean): Promise<void> {
+    const f = item.file;
+    if (!f) return;
+    if (this.files.isActive(f.id)) {
+      this.files.cancel(f.id, 'deleted');
+      await this.files.settled(f.id);
+    }
+    if (revoke && item.dir === 'snd') {
+      const meta = await this.files.getMeta(f.id).catch(() => undefined);
+      if (meta?.sndDescr) {
+        const fd = decodeFileDescription(meta.sndDescr);
+        void deleteUploadedFile(this.files.pool, fd).catch(() => {});
+      }
+    }
+    await this.files.deleteLocal(f).catch(() => {});
+    this.untrackTransfer(f.id);
+  }
+
   private async addEvent(contactId: string, text: string): Promise<void> {
     await this.addItem(contactId, { id: localId(), dir: 'event', content: { type: 'text', text }, ts: Date.now(), status: 'read' });
   }
@@ -677,6 +1164,7 @@ export class ChatClient {
         this.items.set(contactId, keep);
         await this.itemStore.save(contactId, keep, 0);
         this.emit({ type: 'items', contactId });
+        for (const it of items) if (!keep.includes(it)) await this.dropFile(it, false);
       }
     }
   }
@@ -836,13 +1324,17 @@ export class ChatClient {
         const item: ChatItem = { id: localId(), dir: 'rcv', sharedMsgId: m.msgId, content, ts: Date.now(), brokerTs, status: 'received', integrity: e.integrity };
         if (mc.quote) {
           const q = bySharedId(mc.quote.msgRef?.msgId, mc.quote.msgRef?.sent ? 'rcv' : 'snd');
-          item.quote = { sharedMsgId: mc.quote.msgRef?.msgId, text: q ? contentText(q.content) : contentText(mc.quote.content ?? { type: 'text', text: '' }), sent: !mc.quote.msgRef?.sent };
+          item.quote = { sharedMsgId: mc.quote.msgRef?.msgId, text: q ? itemText(q) : contentText(mc.quote.content ?? { type: 'text', text: '' }), sent: !mc.quote.msgRef?.sent };
         }
         if (mc.forward) item.forwarded = true;
-        if (mc.file) item.file = { name: mc.file.fileName, size: mc.file.fileSize };
+        if (mc.file && typeof mc.file === 'object') await this.newRcvFile(item, mc.file);
         if (typeof mc.ttl === 'number' && mc.ttl > 0) item.ttl = mc.ttl;
         c.unread++;
         await this.addItem(c.id, item);
+        if (item.file?.status === 'rcvAccepted') {
+          this.trackTransfer(item.file.id, c.id, item.id);
+          this.startDownload(c.id, item.id, item.file.id);
+        }
         return true;
       }
       case 'x.msg.update': {
@@ -858,6 +1350,10 @@ export class ChatClient {
         if (!it) return false;
         it.deleted = true;
         it.content = { type: 'text', text: '' };
+        if (it.file) {
+          await this.dropFile(it, false);
+          it.file = undefined;
+        }
         await this.updateItem(c.id, it);
         return false;
       }
@@ -901,9 +1397,19 @@ export class ChatClient {
       case 'x.call.extra':
       case 'x.call.end':
         return false;
-      case 'x.file.cancel':
-      case 'x.msg.file.descr':
+      case 'x.msg.file.descr': {
+        const it = bySharedId(m.params.msgId, 'rcv');
+        const part = m.params.fileDescr;
+        if (it?.file && part && typeof part === 'object') await this.addFileDescrPart(c.id, it, part, m.params.fileExpires);
+        return false;
+      }
+      case 'x.file.cancel': {
+        const it = bySharedId(m.params.msgId, 'rcv');
+        if (it?.file) await this.fileCancelledBySender(c.id, it);
+        return false;
+      }
       case 'x.file.acpt.inv':
+        // files sent over SMP connections (not used by the apps anymore)
         return false;
       default:
         await this.addEvent(c.id, `unsupported message: ${m.event}`);

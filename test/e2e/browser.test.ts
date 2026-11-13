@@ -7,6 +7,8 @@
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import path from 'node:path';
+import zlib from 'node:zlib';
 import { chromium, type Browser, type Page } from 'playwright-core';
 import { Cli, itemTexts } from '../helpers/cli';
 
@@ -46,6 +48,52 @@ after(async () => {
 
 async function shot(name: string) {
   await page.screenshot({ path: `${OUT}/${name}.png` });
+}
+
+/** an RGB PNG with a gradient and a text chunk that must not be sent */
+function png(w: number, h: number): Buffer {
+  const raw = Buffer.alloc((w * 3 + 1) * h);
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      const o = y * (w * 3 + 1) + 1 + x * 3;
+      raw[o] = Math.floor((x * 255) / w);
+      raw[o + 1] = Math.floor((y * 255) / h);
+      raw[o + 2] = (x ^ y) & 0xff;
+    }
+  }
+  const chunk = (type: string, data: Buffer) => {
+    const td = Buffer.concat([Buffer.from(type), data]);
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(data.length);
+    const crc = Buffer.alloc(4);
+    crc.writeUInt32BE(zlib.crc32(td));
+    return Buffer.concat([len, td, crc]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(w, 0);
+  ihdr.writeUInt32BE(h, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 2;
+  return Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), chunk('IHDR', ihdr), chunk('tEXt', Buffer.from('Comment\0secret location 51.5N 0.1W')), chunk('IDAT', zlib.deflateSync(raw)), chunk('IEND', Buffer.alloc(0))]);
+}
+
+const fileOf = (e: any) => e?.chatItems?.[0]?.chatItem?.file;
+
+/** opens the chat with the CLI's first contact (not the incognito one) */
+async function openPeer() {
+  await page.locator('.chat-list .row', { hasText: PEER }).filter({ hasNot: page.locator('.incog') }).first().click();
+  await page.locator('.chat-head .chat-name', { hasText: PEER }).waitFor({ timeout: 30000 });
+}
+
+/** the CLI downloads a file and returns its content */
+async function cliReceive(fileId: number): Promise<Buffer> {
+  const dir = path.join(cli.dir, `received-${fileId}`);
+  fs.mkdirSync(dir, { recursive: true });
+  const r = await cli.cmd(`/fr ${fileId} approved_relays=on ${dir}`);
+  assert.equal(r.type, 'rcvFileAccepted', JSON.stringify(r).slice(0, 300));
+  const done = await cli.waitType('rcvFileComplete', NET, (e) => e.chatItem?.chatItem?.file?.fileId === fileId);
+  const p = done.chatItem.chatItem.file.fileSource.filePath as string;
+  return fs.readFileSync(path.isAbsolute(p) ? p : path.join(dir, p));
 }
 
 test('create a profile', async () => {
@@ -152,6 +200,63 @@ test('an incognito 1-time link shares a random profile', async () => {
   assert.equal(r.type, 'sentConfirmation');
   const con = await cli.waitType('contactConnected', NET);
   assert.equal(con.contact.profile.displayName, name);
+});
+
+test('an image and a file sent from the browser reach the official CLI', async () => {
+  await openPeer();
+  const input = page.locator('.composer input[type=file]');
+  await input.setInputFiles({ name: 'holiday.png', mimeType: 'image/png', buffer: png(1600, 1000) });
+  await page.locator('.attachments .att img').waitFor({ timeout: 30000 });
+  await page.getByLabel('Message', { exact: true }).fill('A picture from Duplex');
+  await shot('9-attachment');
+  await page.getByLabel('Send', { exact: true }).click();
+  const got = await cli.waitType('newChatItems', NET, (e) => fileOf(e) && itemTexts(e).includes('A picture from Duplex'));
+  const ci = got.chatItems[0].chatItem;
+  assert.equal(ci.content.msgContent.type, 'image');
+  assert.match(ci.content.msgContent.image, /^data:image\/jpg;base64,/);
+  assert.ok(ci.content.msgContent.image.length <= 14000);
+  assert.match(ci.file.fileName, /^IMG_\d{8}_\d{6}\.jpg$/);
+  // the image was resized and re-encoded in the page: a JPEG without the text of the original
+  const img = await cliReceive(ci.file.fileId);
+  assert.equal(img.length, ci.file.fileSize);
+  assert.ok(img[0] === 0xff && img[1] === 0xd8 && img.length <= 261120, `a JPEG of at most 255 KB, got ${img.length} bytes`);
+  assert.ok(!img.includes('secret location'));
+  await page.locator('.msg.snd .media img.msg-img[src^="blob:"]').last().waitFor({ timeout: NET });
+  // a file of two chunks
+  const data = Buffer.from(Array.from({ length: 300_000 }, (_, i) => (i * 7919) & 0xff));
+  await input.setInputFiles({ name: 'notes.bin', mimeType: 'application/octet-stream', buffer: data });
+  await page.locator('.attachments .att', { hasText: 'notes.bin' }).waitFor({ timeout: 30000 });
+  await page.getByLabel('Send', { exact: true }).click();
+  const gotFile = await cli.waitType('newChatItems', NET, (e) => fileOf(e)?.fileName === 'notes.bin');
+  assert.equal(gotFile.chatItems[0].chatItem.content.msgContent.type, 'file');
+  assert.deepEqual(await cliReceive(fileOf(gotFile).fileId), data);
+  await shot('10-sent-files');
+});
+
+test('images from the official CLI are shown, and files can be downloaded and saved', async () => {
+  await openPeer();
+  const imgPath = path.join(cli.dir, 'from-cli.png');
+  fs.writeFileSync(imgPath, png(400, 300));
+  await cli.cmd(`/img @${ME} ${imgPath}`);
+  // images are downloaded automatically, like in the apps
+  await page.locator('.msg.rcv .media img.msg-img[src^="blob:"]').last().waitFor({ timeout: NET });
+  const data = Buffer.from(Array.from({ length: 200_000 }, (_, i) => (i * 104729) & 0xff));
+  const filePath = path.join(cli.dir, 'report.pdf');
+  fs.writeFileSync(filePath, data);
+  await cli.cmd(`/f @${ME} ${filePath}`);
+  const row = page.locator('.msg.rcv .file-row', { hasText: 'report.pdf' });
+  await row.waitFor({ timeout: NET });
+  // other files only when the user asks
+  await row.getByLabel('Download').click();
+  await row.getByLabel('Save').waitFor({ timeout: NET });
+  const [download] = await Promise.all([page.waitForEvent('download'), row.getByLabel('Save').click()]);
+  assert.equal(download.suggestedFilename(), 'report.pdf');
+  assert.deepEqual(fs.readFileSync((await download.path())!), data);
+  await shot('11-received-files');
+  assert.deepEqual(
+    pageErrors.filter((e) => !/WebSocket connection to .* failed/.test(e)),
+    [],
+  );
 });
 
 test('another tab can take over, and this one disconnects', async () => {

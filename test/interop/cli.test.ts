@@ -1,14 +1,20 @@
-// Interoperability with the official SimpleX Chat CLI over a local SMP router:
-//   SMP_SERVER=smp://<fingerprint>@localhost:7001 npm run test:interop
+// Interoperability with the official SimpleX Chat CLI over a local SMP router, and for files a local
+// XFTP server:
+//   SMP_SERVER=smp://<fingerprint>@localhost:7001 XFTP_SERVER=xftp://<fingerprint>@localhost:7002 npm run test:interop
 import { test, before, beforeEach, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { ChatClient, type ChatEvent } from '../../src/app/chat';
+import fs from 'node:fs';
+import path from 'node:path';
+import { ChatClient, type ChatEvent, type ChatItem } from '../../src/app/chat';
+import { FIXED_IMAGE_PREVIEW } from '../../src/app/files';
+import { fromB64, randomBytes } from '../../src/core/util/bytes';
 import { MemoryBackend, Vault } from '../../src/app/vault';
 import { parseServer } from '../../src/core/smp/server';
 import { tcpConnector } from '../helpers/tcp';
 import { Cli, itemTexts } from '../helpers/cli';
 
 const SERVER = process.env.SMP_SERVER;
+const XFTP = process.env.XFTP_SERVER;
 let cli: Cli;
 let chat: ChatClient;
 const events: ChatEvent[] = [];
@@ -24,9 +30,14 @@ async function until<T>(f: () => T | undefined | false, ms = 30000, label = 'con
 
 before(async () => {
   if (!SERVER) return;
-  cli = await Cli.start('carol', 5310, SERVER);
+  cli = await Cli.start('carol', 5310, SERVER, XFTP ? ['--xftp-server', XFTP] : []);
   const vault = await Vault.create(new MemoryBackend(), 'test', { t: 1, m: 256, p: 1 });
-  chat = new ChatClient(vault, { profile: { displayName: 'dave', fullName: 'Dave Duplex' }, servers: [SERVER], sendReceipts: true, shortLinks: true }, tcpConnector, [parseServer(SERVER).server]);
+  chat = new ChatClient(
+    vault,
+    { profile: { displayName: 'dave', fullName: 'Dave Duplex' }, servers: [SERVER], sendReceipts: true, shortLinks: true, xftpServers: XFTP ? [XFTP] : undefined },
+    tcpConnector,
+    [parseServer(SERVER).server],
+  );
   chat.on((e) => events.push(e));
   await chat.start();
 });
@@ -184,4 +195,121 @@ test('disappearing messages work both ways', { skip: !SERVER }, async () => {
   const got2 = await cli.waitType('newChatItems', 30000, (e) => itemTexts(e).includes('this one stays'));
   assert.equal(got2.chatItems[0].chatItem.meta.itemTimed, undefined);
   await assert.rejects(chat.setDisappearing(contact.id, 300), /does not allow/);
+});
+
+async function untilAsync<T>(f: () => Promise<T | undefined | false>, ms = 30000, label = 'condition'): Promise<T> {
+  for (let i = 0; i < ms / 100; i++) {
+    const v = await f();
+    if (v) return v;
+    await new Promise((r) => setTimeout(r, 100));
+  }
+  throw new Error(`timeout waiting for ${label}`);
+}
+
+const fileOf = (e: any) => e?.chatItems?.[0]?.chatItem?.file;
+const blobOf = (b: Uint8Array) => new Blob([b as BlobPart]);
+const PNG = fromB64(FIXED_IMAGE_PREVIEW.split(',')[1]);
+
+/** the CLI downloads a file into its folder and returns the content */
+async function cliReceive(fileId: number): Promise<Uint8Array> {
+  const dir = path.join(cli.dir, `received-${fileId}`);
+  fs.mkdirSync(dir, { recursive: true });
+  const r = await cli.cmd(`/fr ${fileId} approved_relays=on ${dir}`);
+  assert.equal(r.type, 'rcvFileAccepted', JSON.stringify(r).slice(0, 300));
+  const done = await cli.waitType('rcvFileComplete', 60000, (e) => e.chatItem?.chatItem?.file?.fileId === fileId);
+  const p = done.chatItem.chatItem.file.fileSource.filePath as string;
+  return new Uint8Array(fs.readFileSync(path.isAbsolute(p) ? p : path.join(dir, p)));
+}
+
+async function rcvItem(contactId: string, pred: (i: ChatItem) => boolean, label: string): Promise<ChatItem> {
+  return until(() => itemsOf(contactId).find((i) => i.dir === 'rcv' && pred(i)), 30000, label);
+}
+
+test('files: Duplex sends a file and an image, the CLI receives them', { skip: !SERVER || !XFTP }, async () => {
+  const { contact } = await newPair();
+  // two chunks of different sizes
+  const data = randomBytes(300_000);
+  const sent = await chat.sendFile(contact.id, { blob: blobOf(data), name: 'report 1.bin', kind: 'file' }, 'the report');
+  const got = await cli.waitType('newChatItems', 30000, (e) => fileOf(e)?.fileName === 'report 1.bin');
+  const ci = got.chatItems[0].chatItem;
+  assert.equal(ci.content.msgContent.type, 'file');
+  assert.equal(ci.content.msgContent.text, 'the report');
+  assert.equal(ci.file.fileSize, data.length);
+  assert.deepEqual(await cliReceive(ci.file.fileId), data);
+  await until(() => itemsOf(contact.id).find((i) => i.id === sent.id)?.file?.status === 'sndComplete', 30000, 'upload complete');
+  // an image with a preview, received automatically by the apps
+  await chat.sendFile(contact.id, { blob: blobOf(PNG), name: 'IMG_20261113_120000.png', kind: 'image', preview: FIXED_IMAGE_PREVIEW });
+  const gotImg = await cli.waitType('newChatItems', 30000, (e) => fileOf(e)?.fileName === 'IMG_20261113_120000.png');
+  const img = gotImg.chatItems[0].chatItem;
+  assert.equal(img.content.msgContent.type, 'image');
+  assert.equal(img.content.msgContent.image, FIXED_IMAGE_PREVIEW);
+  assert.deepEqual(await cliReceive(img.file.fileId), PNG);
+});
+
+test('files: the CLI sends a file and an image, Duplex receives them', { skip: !SERVER || !XFTP }, async () => {
+  const { contact, cliName } = await newPair();
+  const data = randomBytes(1_200_000);
+  const src = path.join(cli.dir, 'from cli.bin');
+  fs.writeFileSync(src, data);
+  await cli.cmd(`/f @${cliName} ${src}`);
+  const it = await rcvItem(contact.id, (i) => i.file?.name === 'from cli.bin', 'file from the CLI');
+  assert.equal(it.file!.size, data.length);
+  assert.equal(it.file!.status, 'rcvInvitation');
+  // files are not downloaded without asking
+  await untilAsync(async () => (await chat.files.getMeta(it.file!.id))?.descrComplete, 60000, 'file description');
+  assert.equal(it.file!.status, 'rcvInvitation');
+  await chat.receiveFile(contact.id, it.id);
+  await until(() => it.file!.status === 'rcvComplete' || it.file!.status === 'rcvError', 60000, 'download');
+  assert.equal(it.file!.status, 'rcvComplete', it.file!.error);
+  assert.deepEqual(new Uint8Array(await (await chat.fileBlob(it.file!)).arrayBuffer()), data);
+  // images are downloaded automatically, like in the apps
+  const imgPath = path.join(cli.dir, 'picture.png');
+  fs.writeFileSync(imgPath, PNG);
+  await cli.cmd(`/img @${cliName} ${imgPath}`);
+  const img = await rcvItem(contact.id, (i) => i.content.type === 'image', 'image from the CLI');
+  await until(() => img.file?.status === 'rcvComplete' || img.file?.status === 'rcvError', 60000, 'image download');
+  assert.equal(img.file!.status, 'rcvComplete', img.file!.error);
+  assert.equal(img.file!.mime, 'image/png');
+  assert.deepEqual(new Uint8Array(await (await chat.fileBlob(img.file!, true)).arrayBuffer()), PNG);
+  assert.equal((await chat.fileBlob(img.file!, true)).type, 'image/png');
+});
+
+test('files: cancelled and revoked files', { skip: !SERVER || !XFTP }, async () => {
+  const { contact, cliName } = await newPair();
+  // Duplex revokes a sent file before the CLI downloads it
+  const sent = await chat.sendFile(contact.id, { blob: blobOf(randomBytes(100_000)), name: 'revoked.bin', kind: 'file' });
+  const got = await cli.waitType('newChatItems', 30000, (e) => fileOf(e)?.fileName === 'revoked.bin');
+  await until(() => itemsOf(contact.id).find((i) => i.id === sent.id)?.file?.status === 'sndComplete', 30000, 'upload complete');
+  await chat.revokeFile(contact.id, sent.id);
+  assert.equal(itemsOf(contact.id).find((i) => i.id === sent.id)?.file?.status, 'sndCancelled');
+  await cli.waitType('rcvFileSndCancelled', 30000, (e) => e.chatItem?.chatItem?.file?.fileId === fileOf(got).fileId);
+  // the CLI cancels a file it sent
+  const src = path.join(cli.dir, 'cancelled.bin');
+  fs.writeFileSync(src, randomBytes(50_000));
+  const r = await cli.cmd(`/f @${cliName} ${src}`);
+  const cliFileId = fileOf(r)?.fileId;
+  assert.ok(cliFileId, JSON.stringify(r).slice(0, 300));
+  const it = await rcvItem(contact.id, (i) => i.file?.name === 'cancelled.bin', 'file to be cancelled');
+  await cli.waitType('sndFileCompleteXFTP', 60000);
+  await cli.cmd(`/fc ${cliFileId}`);
+  await until(() => it.file?.status === 'rcvCancelled', 30000, 'file cancelled by the sender');
+  await assert.rejects(chat.receiveFile(contact.id, it.id), /deleted the file/);
+});
+
+test('files: a message with a file deleted for everyone', { skip: !SERVER || !XFTP }, async () => {
+  const { contact } = await newPair();
+  const sent = await chat.sendFile(contact.id, { blob: blobOf(randomBytes(70_000)), name: 'deleted.bin', kind: 'file' });
+  const got = await cli.waitType('newChatItems', 30000, (e) => fileOf(e)?.fileName === 'deleted.bin');
+  await until(() => itemsOf(contact.id).find((i) => i.id === sent.id)?.file?.status === 'sndComplete', 30000, 'upload complete');
+  const fileId = sent.file!.id;
+  assert.ok((await chat.files.getMeta(fileId))?.sndDescr);
+  await chat.deleteItem(contact.id, sent.id, true);
+  await cli.wait((e) => e.type === 'chatItemsDeleted' || e.type === 'chatItemDeleted', 30000, 'deletion');
+  // the keys and the local copy are gone, and the CLI cannot download the file anymore
+  assert.equal(await chat.files.getMeta(fileId), undefined);
+  assert.equal(itemsOf(contact.id).find((i) => i.id === sent.id)?.file, undefined);
+  const dir = path.join(cli.dir, 'deleted');
+  fs.mkdirSync(dir, { recursive: true });
+  const r = await cli.cmd(`/fr ${got.chatItems[0].chatItem.file.fileId} approved_relays=on ${dir}`);
+  if (r.type === 'rcvFileAccepted') await cli.wait((e) => e.type === 'rcvFileError' || e.type === 'chatError' || e.type === 'rcvFileWarning', 60000, 'download error');
 });

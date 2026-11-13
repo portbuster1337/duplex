@@ -3,7 +3,8 @@ import type { JSX } from 'preact';
 import { useState } from 'preact/hooks';
 import { defaultRelays, effectiveRelays, relayName, testRelay, type AppSettings, type Session } from '../app/session';
 import { parseServer } from '../core/smp/server';
-import { DEFAULT_SMP_SERVERS } from '../core/agent/presets';
+import { DEFAULT_SMP_SERVERS, DEFAULT_XFTP_SERVERS } from '../core/agent/presets';
+import { XFTP_VERSIONS } from '../core/xftp/protocol';
 import { serverString } from '../core/smp/server';
 import { CHAT_VERSIONS } from '../core/chat/protocol';
 import { AGENT_VERSIONS } from '../core/agent/protocol';
@@ -109,6 +110,12 @@ function PrivacyTab({ session }: { session: Session }): JSX.Element {
   return (
     <div class="form">
       <Toggle checked={s.sendReceipts} onChange={(v) => upd({ sendReceipts: v })} label="Send delivery receipts" hint="Contacts see when their messages reach you. You can change it for each contact." />
+      <Toggle
+        checked={s.autoReceiveImages !== false}
+        onChange={(v) => upd({ autoReceiveImages: v })}
+        label="Download images automatically"
+        hint="Images up to 510 KB, short videos and voice messages, like the SimpleX Chat apps. Other files are downloaded only when you choose, and files on servers you do not use are downloaded only after you agree."
+      />
       <label>
         Notifications
         <select
@@ -144,6 +151,7 @@ function NetworkTab({ session }: { session: Session }): JSX.Element {
   const st = session.settings;
   const [relays, setRelays] = useState(effectiveRelays(st.network).join('\n'));
   const [servers, setServers] = useState(st.servers.join('\n'));
+  const [xftp, setXftp] = useState((st.xftpServers?.length ? st.xftpServers : DEFAULT_XFTP_SERVERS.map((s) => serverString(s))).join('\n'));
   const [onion, setOnion] = useState(st.network.onion);
   const [tests, setTests] = useState<Record<string, string>>({});
   const status = session.chat.agent.network.status();
@@ -161,9 +169,18 @@ function NetworkTab({ session }: { session: Session }): JSX.Element {
       }
     }
     if (!sv.length) return toast('Add at least one SMP server', 'error');
-    // the default relays are not stored, so that new versions can update them
+    const xs = xftp.split(/\s+/).filter(Boolean);
+    for (const s of xs) {
+      try {
+        if (parseServer(s).server.scheme !== 'xftp') throw new Error();
+      } catch {
+        return toast(`Invalid file server address: ${s}`, 'error');
+      }
+    }
+    // the default relays and file servers are not stored, so that new versions can update them
     const isDefault = rl.join('\n') === defaultRelays().join('\n');
-    await session.saveSettings({ network: { relays: isDefault ? [] : rl, onion }, servers: sv });
+    const xftpDefault = !xs.length || xs.join('\n') === DEFAULT_XFTP_SERVERS.map((s) => serverString(s)).join('\n');
+    await session.saveSettings({ network: { relays: isDefault ? [] : rl, onion }, servers: sv, xftpServers: xftpDefault ? [] : xs });
     toast('Network settings saved');
   };
   const test = async () => {
@@ -212,6 +229,14 @@ function NetworkTab({ session }: { session: Session }): JSX.Element {
       </label>
       <div class="row wrap">
         <button onClick={() => setServers(DEFAULT_SMP_SERVERS.map((s) => serverString(s)).join('\n'))}>Preset servers</button>
+      </div>
+      <label>
+        File servers (XFTP) for sending files
+        <textarea rows={4} value={xftp} spellcheck={false} onInput={(e) => setXftp((e.target as HTMLTextAreaElement).value)} />
+        <span class="hint">Each file is encrypted in this page and uploaded to one of these servers, which delete it after about 2 days. They never see what is in it or who it is for.</span>
+      </label>
+      <div class="row wrap">
+        <button onClick={() => setXftp(DEFAULT_XFTP_SERVERS.map((s) => serverString(s)).join('\n'))}>Preset file servers</button>
       </div>
       <button class="primary" onClick={save}>
         Save
@@ -326,10 +351,14 @@ function About(): JSX.Element {
         <span>
           v{CHAT_VERSIONS.min}–{CHAT_VERSIONS.max}
         </span>
+        <span>File protocol</span>
+        <span>
+          XFTP v{XFTP_VERSIONS.min}–{XFTP_VERSIONS.max} over HTTP/2
+        </span>
         <span>Encryption</span>
-        <span>double ratchet with X448, AES-256-GCM; NaCl boxes per queue; TLS 1.3 with server fingerprint pinning</span>
+        <span>double ratchet with X448, AES-256-GCM; NaCl boxes per queue; files with XSalsa20-Poly1305; TLS 1.3 with server fingerprint pinning</span>
       </div>
-      <p class="hint">Not supported yet: groups, files and voice messages, calls, post-quantum key exchange, queue rotation.</p>
+      <p class="hint">Not supported yet: groups, recording voice messages, calls, post-quantum key exchange, queue rotation.</p>
       <p>
         Browsers cannot open TCP connections, so Duplex tunnels its own TLS connections to the SimpleX servers through a Wisp relay — by default a public one. To use your own, run <code>npm run relay</code> in the source code (Node.js, no dependencies; add <code>-- --tor</code> to connect through Tor) and choose “Relay on this computer” in the network settings.
       </p>

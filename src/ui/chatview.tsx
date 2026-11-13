@@ -2,9 +2,11 @@
 import type { JSX } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { Session } from '../app/session';
-import { contentText, profileName, TTL_CHOICES, ttlText, type ChatItem, type Contact } from '../app/chat';
+import { contentText, itemText, profileName, TTL_CHOICES, ttlText, type ChatItem, type Contact } from '../app/chat';
+import { hasContent } from '../app/files';
+import { AttachmentStrip, FileContent, saveFile, useAttachments } from './files';
 import { REACTIONS } from '../core/chat/protocol';
-import { Avatar, fmtClock, fmtDay, fmtSize, isSimplexLink, Markdown, plainText, QRCode, safeImage } from './util';
+import { Avatar, fmtClock, fmtDay, isSimplexLink, Markdown, plainText, QRCode, safeImage } from './util';
 import { Icon } from './icons';
 import { errorText, Modal, toast, Toggle } from './components';
 import { useChatUpdates } from './layout';
@@ -24,7 +26,10 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
   const [openLink, setOpenLink] = useState<string>();
   const listRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
   const stick = useRef(true);
+  const { atts, add: addFiles, remove: removeFile, clear: clearFiles, ready: filesReady } = useAttachments();
+  const [dragging, setDragging] = useState(false);
 
   const reload = async () => setItems([...(await chat.chatItems(contact.id))]);
 
@@ -58,6 +63,25 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
 
   const send = async () => {
     const t = text.trim();
+    if (atts.length && !editing) {
+      if (!filesReady) return toast('The files are still being prepared');
+      const list = atts.filter((a) => a.prepared);
+      const quoteId = reply?.id;
+      clearFiles();
+      setText('');
+      setReply(undefined);
+      stick.current = true;
+      // the caption goes with the last file, as in the apps
+      for (let i = 0; i < list.length; i++) {
+        try {
+          await chat.sendFile(contact.id, list[i].prepared!, i === list.length - 1 ? t : '', i === 0 ? quoteId : undefined);
+        } catch (e) {
+          toast(`${list[i].file.name}: ${errorText(e)}`, 'error');
+        }
+      }
+      inputRef.current?.focus();
+      return;
+    }
     if (!t) return;
     try {
       if (editing) {
@@ -90,13 +114,34 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
 
   const shownItems = items.filter((i) => !i.deleteAt || i.deleteAt > Date.now()).slice(-limit);
   const canSend = contact.status === 'active';
+  const canAttach = canSend && !editing && chat.peerAllowsFiles(contact);
+  const dropFiles = (files: FileList | null | undefined) => {
+    if (!files?.length) return;
+    if (!canAttach) return toast(canSend ? 'The contact does not allow files and media' : 'The contact is not connected', 'error');
+    addFiles(files);
+  };
   const name = contact.localAlias || profileName(contact.profile);
   const ttl = chat.disappearingTtl(contact);
   const verified = chat.isVerified(contact);
   let lastDay = '';
 
   return (
-    <div class="chat">
+    <div
+      class={`chat ${dragging ? 'dragging' : ''}`}
+      onDragOver={(e) => {
+        if (e.dataTransfer?.types.includes('Files')) {
+          e.preventDefault();
+          setDragging(true);
+        }
+      }}
+      onDragLeave={(e) => e.currentTarget === e.target && setDragging(false)}
+      onDrop={(e) => {
+        if (!e.dataTransfer?.files.length) return;
+        e.preventDefault();
+        setDragging(false);
+        dropFiles(e.dataTransfer.files);
+      }}
+    >
       <header class="chat-head">
         <button class="icon-btn back" onClick={onBack} aria-label="Back">
           <Icon name="back" />
@@ -143,6 +188,8 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
               ) : (
                 <Bubble
                   key={it.id}
+                  session={session}
+                  contactId={contact.id}
                   it={it}
                   onMenu={(x, y) => setMenu({ item: it, x, y })}
                   onLink={(u) => (isSimplexLink(u) ? setOpenLink(u) : window.open(u, '_blank', 'noopener,noreferrer'))}
@@ -157,7 +204,7 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
         {(reply || editing) && (
           <div class="compose-ctx">
             <Icon name={editing ? 'edit' : 'reply'} size={16} />
-            <span class="ctx-text">{editing ? 'Editing message' : `Reply to: ${plainText(contentText(reply!.content)).slice(0, 120)}`}</span>
+            <span class="ctx-text">{editing ? 'Editing message' : `Reply to: ${plainText(itemText(reply!)).slice(0, 120)}`}</span>
             <button
               class="icon-btn small"
               onClick={() => {
@@ -171,7 +218,28 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
             </button>
           </div>
         )}
+        <AttachmentStrip atts={atts} onRemove={removeFile} />
         <div class="compose-row">
+          <input
+            ref={fileRef}
+            type="file"
+            multiple
+            hidden
+            onChange={(e) => {
+              const el = e.target as HTMLInputElement;
+              dropFiles(el.files);
+              el.value = '';
+            }}
+          />
+          <button
+            class="icon-btn attach"
+            onClick={() => fileRef.current?.click()}
+            disabled={!canAttach}
+            aria-label="Attach files"
+            title={canSend && !chat.peerAllowsFiles(contact) ? 'The contact does not allow files and media' : 'Attach files or images'}
+          >
+            <Icon name="paperclip" />
+          </button>
           <textarea
             ref={inputRef}
             rows={1}
@@ -185,9 +253,16 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
               ta.style.height = Math.min(ta.scrollHeight, 160) + 'px';
             }}
             onKeyDown={onKey}
+            onPaste={(e) => {
+              const files = e.clipboardData?.files;
+              if (files?.length && canAttach) {
+                e.preventDefault();
+                dropFiles(files);
+              }
+            }}
             aria-label="Message"
           />
-          <button class="send" onClick={send} disabled={!canSend || !text.trim()} aria-label="Send" title="Send">
+          <button class="send" onClick={send} disabled={!canSend || (!text.trim() && !(atts.length && !editing))} aria-label="Send" title="Send">
             <Icon name={editing ? 'check' : 'send'} />
           </button>
         </div>
@@ -210,6 +285,16 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
           }}
           onDelete={(everyone) => chat.deleteItem(contact.id, menu.item.id, everyone).catch((e) => toast(errorText(e), 'error'))}
           onReact={(emoji) => chat.react(contact.id, menu.item.id, emoji, !menu.item.reactions?.[emoji]?.me).catch((e) => toast(errorText(e), 'error'))}
+          onSave={menu.item.file && hasContent(menu.item.file) ? () => saveFile(session, menu.item.file!).catch((e) => toast(errorText(e), 'error')) : undefined}
+          onRevoke={
+            menu.item.dir === 'snd' && menu.item.file && !['sndCancelled', 'sndError'].includes(menu.item.file.status)
+              ? () =>
+                  chat
+                    .revokeFile(contact.id, menu.item.id)
+                    .then(() => toast('The file was deleted from the server'))
+                    .catch((e) => toast(errorText(e), 'error'))
+              : undefined
+          }
         />
       )}
       {info && <ContactInfo session={session} contact={contact} onClose={() => setInfo(false)} onDeleted={onDeleted} />}
@@ -234,9 +319,24 @@ function StatusIcon({ it }: { it: ChatItem }): JSX.Element | null {
   }
 }
 
-function Bubble({ it, onMenu, onLink, onReact }: { it: ChatItem; onMenu: (x: number, y: number) => void; onLink: (u: string) => void; onReact: (emoji: string, add: boolean) => void }): JSX.Element {
+function Bubble({
+  session,
+  contactId,
+  it,
+  onMenu,
+  onLink,
+  onReact,
+}: {
+  session: Session;
+  contactId: string;
+  it: ChatItem;
+  onMenu: (x: number, y: number) => void;
+  onLink: (u: string) => void;
+  onReact: (emoji: string, add: boolean) => void;
+}): JSX.Element {
   const c = it.content;
-  const img = c.type === 'image' || c.type === 'video' ? safeImage((c as { image?: string }).image) : undefined;
+  // images and videos with files are shown by FileContent
+  const img = !it.file && (c.type === 'image' || c.type === 'video') ? safeImage((c as { image?: string }).image) : undefined;
   const preview = c.type === 'link' ? (c as { preview?: { uri: string; title: string; description: string; image: string } }).preview : undefined;
   const text = contentText(c);
   const open = (e: MouseEvent) => {
@@ -245,7 +345,7 @@ function Bubble({ it, onMenu, onLink, onReact }: { it: ChatItem; onMenu: (x: num
   };
   return (
     <div class={`msg ${it.dir}`}>
-      <div class={`bubble ${it.deleted ? 'deleted' : ''}`} onContextMenu={open}>
+      <div class={`bubble ${it.deleted ? 'deleted' : ''} ${it.file && (c.type === 'image' || c.type === 'video') ? 'has-media' : ''}`} onContextMenu={open}>
         {it.forwarded && <div class="fwd">forwarded</div>}
         {it.quote && (
           <div class="quote">
@@ -267,13 +367,8 @@ function Bubble({ it, onMenu, onLink, onReact }: { it: ChatItem; onMenu: (x: num
                 </div>
               </div>
             )}
-            {it.file && (
-              <div class="file">
-                <Icon name="file" size={18} /> {it.file.name} <span class="muted">{fmtSize(it.file.size)}</span>
-                <div class="hint">Files are not supported in Duplex yet</div>
-              </div>
-            )}
-            {c.type === 'voice' && <div class="hint">voice message — not supported in Duplex yet</div>}
+            {it.file && <FileContent session={session} contactId={contactId} it={it} />}
+            {c.type === 'voice' && !it.file && <div class="hint">voice message</div>}
             {text && (
               <div class="text">
                 <Markdown text={text} onLink={onLink} />
@@ -316,6 +411,8 @@ function ItemMenu({
   onEdit,
   onDelete,
   onReact,
+  onSave,
+  onRevoke,
 }: {
   item: ChatItem;
   x: number;
@@ -326,6 +423,8 @@ function ItemMenu({
   onEdit: () => void;
   onDelete: (everyone: boolean) => void;
   onReact: (emoji: string) => void;
+  onSave?: () => void;
+  onRevoke?: () => void;
 }): JSX.Element {
   const style = { left: `${Math.min(x, window.innerWidth - 230)}px`, top: `${Math.min(y, window.innerHeight - 280)}px` };
   const act = (f: () => void) => () => {
@@ -355,9 +454,19 @@ function ItemMenu({
             <Icon name="copy" size={16} /> Copy
           </button>
         )}
-        {canAct && item.dir === 'snd' && !item.deleted && item.sharedMsgId && item.content.type === 'text' && (
+        {onSave && (
+          <button onClick={act(onSave)} role="menuitem">
+            <Icon name="download" size={16} /> Save file
+          </button>
+        )}
+        {canAct && item.dir === 'snd' && !item.deleted && item.sharedMsgId && ['text', 'image', 'video', 'file'].includes(item.content.type) && (
           <button onClick={act(onEdit)} role="menuitem">
-            <Icon name="edit" size={16} /> Edit
+            <Icon name="edit" size={16} /> {item.content.type === 'text' ? 'Edit' : 'Edit caption'}
+          </button>
+        )}
+        {onRevoke && (
+          <button onClick={act(onRevoke)} role="menuitem" class="danger">
+            <Icon name="close" size={16} /> Delete file from server
           </button>
         )}
         {canAct && item.dir === 'snd' && !item.deleted && item.sharedMsgId && (

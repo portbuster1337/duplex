@@ -1,5 +1,5 @@
 // The app session in the browser: the encrypted vault, the relay connector and the chat client.
-import { ChatClient, type ChatSettings } from './chat';
+import { ChatClient, PREFS_VERSION, type ChatSettings } from './chat';
 import { IdbBackend, Vault, WrongPassphraseError, type KvBackend } from './vault';
 import { WispConnection } from '../core/net/wisp';
 import { timeout, type Stream } from '../core/net/stream';
@@ -137,6 +137,14 @@ export class RelayConnector implements Connector {
     };
   }
 
+  /**
+   * whether servers see an IP address that is not linked to the user: Tor, or one of the public
+   * relays (a relay of the user's own, on this computer or a server, shows the user's address)
+   */
+  get ipProtected(): boolean {
+    return this.onion || (this.relays.length > 0 && this.relays.every((r) => PUBLIC_RELAYS.includes(r)));
+  }
+
   /** the relays with an open WebSocket */
   connected(): string[] {
     return [...this.conns.entries()].filter(([, w]) => !w.isClosed).map(([u]) => u);
@@ -174,6 +182,7 @@ export function defaultSettings(displayName: string): AppSettings {
     network: { relays: [], onion: false },
     autoLockMinutes: 0,
     notifications: 'hidden',
+    prefsVersion: PREFS_VERSION,
   };
 }
 
@@ -244,6 +253,7 @@ export class Session {
       this.connector.relays = effectiveRelays(patch.network);
       this.connector.onion = patch.network.onion;
       this.chat.agent.network.connector = this.connector;
+      this.chat.files.pool.reset();
       this.chat.agent.retryAll();
     }
     if (patch.servers) this.chat.agent.config.servers = parseServers(patch.servers);

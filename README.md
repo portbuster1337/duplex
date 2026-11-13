@@ -16,6 +16,13 @@ Chat are trademarks of SimpleX Chat Ltd.
 - **Works with the SimpleX Chat apps**: text with SimpleX markdown, replies, edits, deletion (for
   everyone or for you), reactions, delivery receipts, disappearing messages (set by either side),
   profile pictures, contact addresses with automatic or manual acceptance of requests.
+- **Files, images and videos** (up to 1 GB) over XFTP, the SimpleX file protocol, to and from the
+  apps: each file is encrypted in the page and uploaded in chunks to a file server, and only its key
+  and locations go to the contact, inside the chat. Photos are resized and re-encoded before sending,
+  which removes their location and camera metadata. Received images, short videos and voice
+  messages are downloaded automatically like in the apps (this can be turned off); other files when
+  you choose; files on servers you do not use only after you agree. Sent files can be deleted from
+  the server at any time.
 - **Incognito connections**: a 1-time link or a connection can share a new random profile (named
   like those of the apps) instead of yours.
 - **Security codes**: compare a contact's code (or scan its QR code in the apps) to check that nobody
@@ -59,6 +66,7 @@ it works without installing anything.
 |---|---|---|
 | the Wisp relay | your IP address, which SimpleX servers you connect to, when and how much (fixed-size blocks) | messages, contacts, profile, queue IDs (all inside TLS) |
 | SimpleX servers | the relay's IP address, the queues you use on that server and when messages pass through them (encrypted fixed-size blocks) | your IP address, messages and profile; there are no accounts or user IDs |
+| file servers (XFTP) | the relay's IP address, encrypted chunks of 64 KB to 4 MB and when they are uploaded and downloaded | the file, its name and real size, who sent it and to whom |
 | your contacts | the profile you share and your messages | your IP address and your other contacts |
 | Codeberg Pages | that the page was loaded, from which IP address | everything after that |
 | someone with this browser | that Duplex was used, the number and rough size of stored records | anything else, without the passphrase |
@@ -69,7 +77,10 @@ use on it belong to the same client.
 
 ### Limitations
 
-- No groups or channels, files, voice or video messages, calls (they are shown as unsupported).
+- No groups or channels or calls (they are shown as unsupported). Voice messages can be played
+  but not recorded.
+- Files are kept in the encrypted storage of this browser, which browsers limit in size; large files
+  should be saved to disk.
 - No post-quantum key exchange, private message routing, per-connection transport isolation or
   queue rotation.
 - No push notifications: messages arrive while the page is open (it can show notifications while it
@@ -105,9 +116,9 @@ Tests:
 
 | command | what |
 |---|---|
-| `npm test` | unit tests: crypto against libsodium and OpenSSL vectors, links of the official client, certificate pinning, compressed messages, the encrypted storage |
+| `npm test` | unit tests: crypto against libsodium and OpenSSL vectors, links of the official client, certificate pinning, compressed messages, the encrypted storage, HTTP/2 header compression (RFC 7541 examples), file descriptions against the fixture of simplexmq |
 | `SMP_SERVER=smp://…@localhost:7001 npm run test:local` | two agents connecting through a local `smp-server`: invitations, short links, addresses, receipts |
-| `SMP_SERVER=… SIMPLEX_CHAT_BIN=… npm run test:interop` | the chat client against the official SimpleX Chat CLI |
+| `SMP_SERVER=… XFTP_SERVER=xftp://…@localhost:7002 SIMPLEX_CHAT_BIN=… npm run test:interop` | the chat client against the official SimpleX Chat CLI, with files through a local `xftp-server` |
 | `CHROME_PATH=… SIMPLEX_CHAT_BIN=… npm run e2e` | the production build in headless Chrome on the real SimpleX network, chatting with the official CLI (run `npm run build` and `npm run relay` first, or set `APP_URL` to the published page; without `CHROME_PATH`, it uses a browser installed with `npx playwright install chromium`) |
 
 `npm run check-server -- smp://… [wss://relay/]` connects to a server (directly or through a relay)
@@ -115,12 +126,13 @@ and makes a queue.
 
 | path | |
 |---|---|
-| `src/core/net` | TLS 1.3 client, Wisp client, X.509 |
+| `src/core/net` | TLS 1.3 client, Wisp client, X.509, HTTP/2 client |
+| `src/core/xftp` | XFTP: file encryption, chunks, file descriptions, the file server client |
 | `src/core/smp` | SMP client: handshake, block encryption, commands |
 | `src/core/crypto` | primitives (noble), double ratchet |
 | `src/core/agent` | SMP agent: connections, short links, addresses, delivery |
 | `src/core/chat` | chat protocol messages |
-| `src/app` | chat client, encrypted vault, session and relays |
+| `src/app` | chat client, file transfers, encrypted vault, session and relays |
 | `src/ui` | the Preact interface |
 | `relay` | the optional Wisp relay |
 | `site` | the about page, `404.html`, and `_headers` (Content Security Policy) for Codeberg Pages |

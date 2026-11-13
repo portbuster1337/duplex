@@ -61,6 +61,10 @@
             <p>Text with formatting, replies, edits, deletion, reactions, delivery receipts, disappearing messages, profile pictures, contact addresses and requests, and the same security codes to verify a contact.</p>
           </div>
           <div class="feature">
+            <h3>Files, images and videos</h3>
+            <p>Up to 1 GB, encrypted in the page and sent through SimpleX file servers, which only ever see encrypted chunks. Photos lose their location and camera metadata before they are sent.</p>
+          </div>
+          <div class="feature">
             <h3>Encrypted at rest</h3>
             <p>Everything stored in the browser is encrypted with a key derived from your passphrase (Argon2id). Record names are hashed and sizes are padded, so the storage does not reveal your contacts or how much you chat.</p>
           </div>
@@ -116,6 +120,11 @@
               <td>Your IP address, your messages and profile — there are no accounts or user IDs</td>
             </tr>
             <tr>
+              <th scope="row">SimpleX file servers</th>
+              <td>The relay's IP address, encrypted chunks of 64 KB to 4 MB, and when they are uploaded and downloaded</td>
+              <td>The files, their names and real sizes, who sent them and to whom</td>
+            </tr>
+            <tr>
               <th scope="row">Your contacts</th>
               <td>The profile you choose to share (a name, optionally a picture) and your messages</td>
               <td>Your IP address and your other contacts</td>
@@ -140,7 +149,8 @@
       <section id="limits">
         <h2>Limitations</h2>
         <ul>
-          <li>Groups and channels, files, voice and video messages, and calls are not supported yet.</li>
+          <li>Groups and channels and calls are not supported yet. Voice messages can be played but not recorded.</li>
+          <li>Files are kept in the encrypted storage of this browser, which browsers limit in size: save large files to disk.</li>
           <li>Connections use the double ratchet without the post-quantum key exchange that the apps can add.</li>
           <li>No private message routing through other servers, no per-connection transport isolation, and no queue rotation.</li>
           <li>No push notifications: messages arrive while the page is open (notifications can be shown while it is in a background tab).</li>

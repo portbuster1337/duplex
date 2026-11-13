@@ -270,6 +270,16 @@ export const xMsgReact = (msgId: string, refMsgId: string, emoji: string, add: b
 
 export const xDirectDel = (msgId: string): ChatMessage => ({ msgId, event: 'x.direct.del', params: {} });
 
+/** a part of the description of a file sent with the message refMsgId */
+export const xMsgFileDescr = (msgId: string, refMsgId: string, fileDescr: { fileDescrText: string; fileDescrPartNo: number; fileDescrComplete: boolean }, fileExpires?: string): ChatMessage => ({
+  msgId,
+  event: 'x.msg.file.descr',
+  params: { msgId: refMsgId, fileDescr, ...(fileExpires ? { fileExpires } : {}) },
+});
+
+/** the file of the message refMsgId was cancelled (deleted from the file servers) */
+export const xFileCancel = (msgId: string, refMsgId: string): ChatMessage => ({ msgId, event: 'x.file.cancel', params: { msgId: refMsgId } });
+
 export const xOk = (): ChatMessage => ({ event: 'x.ok', params: {} });
 
 /** reactions allowed by the official clients */

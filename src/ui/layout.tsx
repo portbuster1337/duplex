@@ -19,12 +19,24 @@ export function useChatUpdates(session: Session): number {
   return n;
 }
 
+function mediaLabel(it: ChatItem): string {
+  switch (it.content.type) {
+    case 'image':
+      return '🖼 image';
+    case 'video':
+      return '🎬 video';
+    case 'voice':
+      return '🎤 voice message';
+  }
+  return it.file ? `📎 ${it.file.name}` : it.content.type;
+}
+
 function lastItemPreview(items: ChatItem[] | undefined): { text: string; ts?: number } {
   if (!items?.length) return { text: '' };
   for (let i = items.length - 1; i >= 0; i--) {
     const it = items[i];
     if (it.dir === 'event') return { text: contentText(it.content), ts: it.ts };
-    const t = it.deleted ? 'message deleted' : plainText(contentText(it.content)) || (it.content.type === 'image' ? '🖼 image' : it.file ? `📎 ${it.file.name}` : it.content.type);
+    const t = it.deleted ? 'message deleted' : plainText(contentText(it.content)) || mediaLabel(it);
     return { text: (it.dir === 'snd' ? 'you: ' : '') + t, ts: it.brokerTs ?? it.ts };
   }
   return { text: '' };
@@ -239,7 +251,7 @@ function notify(session: Session, contactId: string, item: ChatItem): void {
   const c = session.chat.contact(contactId);
   if (c?.muted) return;
   const title = mode === 'full' && c ? c.localAlias || profileName(c.profile) : 'Duplex';
-  const body = mode === 'full' ? plainText(contentText(item.content)) || 'new message' : 'New message';
+  const body = mode === 'full' ? plainText(contentText(item.content)) || (item.file ? mediaLabel(item) : 'new message') : 'New message';
   try {
     new Notification(title, { body, silent: false, tag: mode === 'full' ? contactId : 'duplex' });
   } catch {
