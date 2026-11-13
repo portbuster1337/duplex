@@ -528,6 +528,11 @@ export class ChatClient {
     return { kind: resolved.connReq.mode === 'invitation' ? 'invitation' : 'contact', resolved };
   }
 
+  /** creates a channel, served by these chat relays (their addresses), with us as the owner */
+  createChannel(p: { displayName: string; description?: string; image?: string }, relays: string[], incognito = false): Promise<Group> {
+    return this.groups.createChannel(p, relays, incognito ? randomProfile() : undefined);
+  }
+
   /** creates a group, with us as the owner; incognito: members see a random profile */
   createGroup(p: { displayName: string; fullName?: string; description?: string; image?: string }, incognito = false): Promise<Group> {
     return this.groups.create(p, incognito ? randomProfile() : undefined);
@@ -741,6 +746,8 @@ export class ChatClient {
     const sharedMsgId = newSharedMsgId();
     const mc: MsgContainer = { content };
     if (sc) mc.scope = memberScope(sc.memberId);
+    // the owners of a channel post as the channel
+    if (g?.channel && g.role === 'owner' && !sc) mc.asGroup = true;
     let quote: ChatItem['quote'];
     if (quoteItemId) {
       const q = (await this.chatItems(contactId)).find((i) => i.id === quoteItemId);
@@ -794,7 +801,10 @@ export class ChatClient {
     const item = items.find((i) => i.id === itemId);
     if (!item || item.dir !== 'snd' || !item.sharedMsgId || item.deleted) throw new ChatError('cannot edit this message');
     const content: MsgContent = { ...item.content, text } as MsgContent;
-    await this.sendToChat(contactId, xMsgUpdate(newSharedMsgId(), item.sharedMsgId, content));
+    const upd = xMsgUpdate(newSharedMsgId(), item.sharedMsgId, content);
+    const g = this.groupOf(contactId);
+    if (g?.channel && g.role === 'owner') upd.params.asGroup = true;
+    await this.sendToChat(contactId, upd);
     item.content = content;
     item.edited = true;
     await this.updateItem(contactId, item);
@@ -815,7 +825,8 @@ export class ChatClient {
       return;
     }
     if (forEveryone && item.dir === 'snd' && item.sharedMsgId && !item.deleted) {
-      await this.sendToChat(contactId, xMsgDel(newSharedMsgId(), item.sharedMsgId, g ? g.memberId : undefined));
+      // posts of a channel are the channel's
+      await this.sendToChat(contactId, xMsgDel(newSharedMsgId(), item.sharedMsgId, g && !g.channel ? g.memberId : undefined));
       // a sent file is deleted from the file servers too
       await this.dropFile(item, true);
       item.deleted = true;

@@ -1593,6 +1593,22 @@ button.small {
   padding: 5px 12px;
 }
 
+fieldset.relay-choice {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0;
+  padding: 8px 12px 12px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+
+fieldset.relay-choice legend {
+  padding: 0 4px;
+  font-size: 14px;
+  color: var(--muted);
+}
+
 /* above the messages: a member waiting to be accepted, or members waiting for a review */
 .chat-banner {
   display: flex;

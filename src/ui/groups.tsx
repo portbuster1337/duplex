@@ -7,6 +7,7 @@ import { profileName, type Contact } from '../app/chat';
 import { groupActive, groupName, HISTORY_ITEMS, isModerator, memberGone, memberName, reviewsMembers, supportChatId, type Group, type GroupMember } from '../app/groups';
 import { groupPrefOn, roleRank, type GroupMemberRole } from '../core/chat/groups';
 import type { Profile } from '../core/chat/protocol';
+import { PRESET_CHAT_RELAYS } from '../core/agent/presets';
 import { Avatar, resizeImage } from './util';
 import { errorText, Modal, Spinner, toast, Toggle } from './components';
 import { Icon } from './icons';
@@ -96,6 +97,63 @@ export function NewGroup({ session, onCreated }: { session: Session; onCreated: 
   );
 }
 
+/** a new channel: its profile, and the chat relays that serve it to the subscribers */
+export function NewChannel({ session, onCreated }: { session: Session; onCreated: (g: Group) => void }): JSX.Element {
+  const [name, setName] = useState('');
+  const [description, setDescription] = useState('');
+  const [image, setImage] = useState<string>();
+  const [incognito, setIncognito] = useState(false);
+  const [chosen, setChosen] = useState<string[]>(PRESET_CHAT_RELAYS.map((r) => r.address));
+  const [custom, setCustom] = useState('');
+  const [busy, setBusy] = useState(false);
+  const relays = [...chosen, ...custom.split(/\s+/).filter(Boolean)];
+  return (
+    <div class="form">
+      <PictureInput image={image} name={name} onChange={setImage} />
+      <label>
+        Channel name
+        <input value={name} maxLength={50} onInput={(e) => setName((e.target as HTMLInputElement).value)} placeholder="e.g. Town news" />
+      </label>
+      <label>
+        Description (optional)
+        <textarea rows={3} value={description} maxLength={1000} onInput={(e) => setDescription((e.target as HTMLTextAreaElement).value)} />
+      </label>
+      <fieldset class="relay-choice">
+        <legend>Chat relays</legend>
+        {PRESET_CHAT_RELAYS.map((r) => (
+          <label class="pick-row">
+            <input type="checkbox" checked={chosen.includes(r.address)} onChange={(e) => setChosen((e.target as HTMLInputElement).checked ? [...chosen, r.address] : chosen.filter((a) => a !== r.address))} />
+            <span>{r.name}</span>
+          </label>
+        ))}
+        <label>
+          Other relays (their addresses)
+          <textarea rows={2} value={custom} spellcheck={false} placeholder="https://…/r#…" onInput={(e) => setCustom((e.target as HTMLTextAreaElement).value)} />
+        </label>
+      </fieldset>
+      <Toggle checked={incognito} onChange={setIncognito} label="Incognito" hint="The relays and subscribers see a new random profile as the owner, not yours" />
+      <p class="hint">
+        The relays forward your posts to the subscribers, who connect to them and not to you, so they do not see your IP address or each other. What you change in the channel is signed with your key; posts are forwarded as they are. A relay serves the channel while it runs: choose more than one.
+      </p>
+      <button
+        class="primary"
+        disabled={busy || !name.trim() || !relays.length}
+        onClick={async () => {
+          setBusy(true);
+          try {
+            onCreated(await session.chat.createChannel({ displayName: name, description, image }, relays, incognito));
+          } catch (e) {
+            toast(errorText(e), 'error');
+            setBusy(false);
+          }
+        }}
+      >
+        {busy ? <Spinner label="Asking the relays…" /> : 'Create channel'}
+      </button>
+    </div>
+  );
+}
+
 export function GroupInfo({ session, group, onClose, onDeleted, onOpenChat }: { session: Session; group: Group; onClose: () => void; onDeleted: () => void; onOpenChat?: (chatId: string) => void }): JSX.Element {
   if (group.channel) return <ChannelInfo session={session} group={group} onClose={onClose} onDeleted={onDeleted} />;
   return <GroupPanel session={session} group={group} onClose={onClose} onDeleted={onDeleted} onOpenChat={onOpenChat} />;
@@ -109,8 +167,11 @@ function ChannelInfo({ session, group, onClose, onDeleted }: { session: Session;
   const [alias, setAlias] = useState(g.localAlias ?? '');
   const [confirm, setConfirm] = useState<'leave' | 'delete'>();
   const [busy, setBusy] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const owner = g.role === 'owner' && g.status === 'active';
   const relays = chat.groups.members(g).filter((m) => m.role === 'relay');
-  const owners = chat.groups.members(g).filter((m) => m.role === 'owner');
+  const owners = [...(owner ? [chat.groups.ourProfile(g).displayName + ' (you)'] : []), ...chat.groups.members(g).filter((m) => m.role === 'owner').map((m) => memberName(m))];
+  const relayState = (m: GroupMember) => (memberGone(m) ? 'left' : m.status === 'connected' ? (owner ? 'serving' : 'connected') : m.status === 'invited' ? 'invited' : 'connecting…');
   const run = async (f: () => Promise<void>, done?: () => void) => {
     setBusy(true);
     try {
@@ -131,17 +192,17 @@ function ChannelInfo({ session, group, onClose, onDeleted }: { session: Session;
         {g.profile.fullName && <p class="muted">{g.profile.fullName}</p>}
         {g.profile.description && <p class="welcome">{g.profile.description}</p>}
       </div>
+      {owner && !editing && <button onClick={() => setEditing(true)}>Edit channel profile</button>}
+      {editing && <EditGroup session={session} g={g} onDone={() => setEditing(false)} />}
       <div class="kv">
         <span>Subscribers</span>
         <span>{g.channel!.subscribers ?? 'unknown'}</span>
         <span>Your role</span>
         <span>{g.role}</span>
         <span>Owners</span>
-        <span>{owners.map((m) => memberName(m)).join(', ') || 'unknown'}</span>
+        <span>{owners.join(', ') || 'unknown'}</span>
         <span>Relays</span>
-        <span>
-          {relays.map((m) => `${memberName(m)} (${m.status === 'connected' ? 'connected' : memberGone(m) ? 'left' : 'connecting…'})`).join(', ') || 'none'}
-        </span>
+        <span>{relays.map((m) => `${memberName(m)} (${relayState(m)})`).join(', ') || 'none'}</span>
       </div>
       <p class="hint">The posts come through the chat relays of the channel, which forward them to each subscriber; what changes the channel is signed by its owners, so a relay cannot change it. The relays and the owners see the profile you joined with, other subscribers do not.</p>
       <h4 class="members-head">Channel link</h4>
@@ -159,7 +220,7 @@ function ChannelInfo({ session, group, onClose, onDeleted }: { session: Session;
       )}
       <div class="row">
         <button onClick={() => chat.clearChat(g.id)}>Clear chat</button>
-        {groupActive(g) && !confirm && (
+        {groupActive(g) && !owner && !confirm && (
           <button class="danger" onClick={() => setConfirm('leave')}>
             Leave channel
           </button>
@@ -172,7 +233,13 @@ function ChannelInfo({ session, group, onClose, onDeleted }: { session: Session;
       </div>
       {confirm && (
         <div class="confirm">
-          <p>{confirm === 'leave' ? 'You will stop receiving the posts of this channel. They stay until you delete the chat.' : 'The channel and its posts are deleted from this browser.'}</p>
+          <p>
+            {confirm === 'leave'
+              ? 'You will stop receiving the posts of this channel. They stay until you delete the chat.'
+              : owner
+                ? 'The channel is deleted for all subscribers, and its posts from this browser.'
+                : 'The channel and its posts are deleted from this browser.'}
+          </p>
           <div class="row">
             <button onClick={() => setConfirm(undefined)}>Cancel</button>
             <button

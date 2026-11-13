@@ -68,6 +68,7 @@ import {
   strShortLink,
   type ConnLinkData,
   type FixedLinkData,
+  type OwnerAuth,
   type ShortLink,
 } from './shortlink';
 import { DEFAULT_ROUTING, Network, type ProxyFallback, type ProxyMode } from './network';
@@ -96,6 +97,10 @@ export interface ShortLinkCreds {
   rootPub: PublicKey<'ed25519'>;
   encFixedData: Bytes;
   link: string;
+  /** the link data of channels: their owners and relays, kept when the user data changes */
+  owners?: OwnerAuth[];
+  relays?: ShortLink[];
+  direct?: boolean;
 }
 
 export interface SndQueue {
@@ -754,31 +759,48 @@ export class Agent {
   // ---- contact addresses
 
   /** a contact address; group links have client data (the group link ID) and the short link type 'G' */
-  async createAddress(opts: { userData?: Bytes; clientData?: string; linkType?: 'A' | 'G' } = {}): Promise<{ connId: string; link: string; fullLink: string }> {
+  /**
+   * a contact address with a short link. Channels: the link has the root key the channel ID is
+   * derived from (linkEntityId), the owners it authorises, and the relays; the user data can be made
+   * from the link itself (the channel profile names its link)
+   */
+  async createAddress(
+    opts: {
+      userData?: Bytes | ((link: string) => Bytes);
+      clientData?: string;
+      linkType?: 'A' | 'G' | 'C';
+      root?: KeyPair<'ed25519'>;
+      linkEntityId?: Bytes;
+      owners?: OwnerAuth[];
+      direct?: boolean;
+    } = {},
+  ): Promise<{ connId: string; link: string; fullLink: string }> {
     const c = this.newConn('contact', 'address');
     const srv = this.nextServer();
-    const root = generateKeyPair('ed25519');
+    const root = opts.root ?? generateKeyPair('ed25519');
+    const owners = opts.owners ?? [];
+    const direct = opts.direct ?? true;
     let connReq!: ConnectionRequest;
     let linkKey!: Bytes;
     let encFixed!: Bytes;
+    let link!: string;
     const { rq } = await this.newRcvQueue(srv, 'C', SMP_CLIENT_VERSIONS.max, (sndId, e2ePub) => {
       connReq = {
         mode: 'contact',
         data: { scheme: 'simplex', agentVersions: AGENT_VERSIONS, queues: [{ versions: SMP_CLIENT_VERSIONS, addr: { server: srv, senderId: sndId, dhPublicKey: e2ePub, queueMode: 'C' } }], ...(opts.clientData !== undefined ? { clientData: opts.clientData } : {}) },
       };
-      const s = encodeSignLinkData(
-        root,
-        { agentVersions: AGENT_VERSIONS, rootKey: root.pub, connReq },
-        { mode: 'contact', agentVersions: AGENT_VERSIONS, data: { direct: true, owners: [], relays: [], userData: opts.userData ?? new Uint8Array(0) } },
-      );
-      linkKey = s.linkKey;
-      const k = contactShortLinkKdf(linkKey);
+      const fixed: FixedLinkData = { agentVersions: AGENT_VERSIONS, rootKey: root.pub, connReq, ...(opts.linkEntityId ? { linkEntityId: opts.linkEntityId } : {}) };
+      // the link key is the hash of the fixed data, which does not depend on the user data
+      linkKey = encodeSignLinkData(root, fixed, { mode: 'contact', agentVersions: AGENT_VERSIONS, data: { direct, owners, relays: [], userData: new Uint8Array(0) } }).linkKey;
+      link = strShortLink({ mode: 'contact', scheme: 'server', type: opts.linkType ?? 'A', server: srv, linkKey });
+      const userData = typeof opts.userData === 'function' ? opts.userData(link) : (opts.userData ?? new Uint8Array(0));
+      const s = encodeSignLinkData(root, fixed, { mode: 'contact', agentVersions: AGENT_VERSIONS, data: { direct, owners, relays: [], userData } });
+      const k = contactShortLinkKdf(s.linkKey);
       const data = encryptLinkData(k.key, s.fixed, s.user);
       encFixed = data.fixedData;
       return { linkId: k.linkId, data };
     });
-    const link = strShortLink({ mode: 'contact', scheme: 'server', type: opts.linkType ?? 'A', server: srv, linkKey });
-    rq.shortLink = { linkId: contactShortLinkKdf(linkKey).linkId, linkKey, rootPriv: root.priv, rootPub: root.pub, encFixedData: encFixed, link };
+    rq.shortLink = { linkId: contactShortLinkKdf(linkKey).linkId, linkKey, rootPriv: root.priv, rootPub: root.pub, encFixedData: encFixed, link, ...(opts.owners ? { owners, relays: [], direct } : {}) };
     c.rcv = rq;
     c.link = link;
     c.requests = {};
@@ -788,19 +810,24 @@ export class Agent {
 
   /**
    * updates the user data (e.g. the profile) stored with the short link of an address, or of a 1-time
-   * invitation that was not used yet (the router refuses it once the joining party has the link)
+   * invitation that was not used yet (the router refuses it once the joining party has the link);
+   * the relays of a channel too
    */
-  async updateLinkData(connId: string, userData: Bytes): Promise<void> {
+  async updateLinkData(connId: string, userData: Bytes, relays?: ShortLink[]): Promise<void> {
     await this.withLock(connId, async () => {
       const c = this.mustConn(connId);
       const sl = c.rcv?.shortLink;
       if (!c.rcv || !sl) throw new AgentError('the connection has no short link');
+      if (relays) sl.relays = relays;
       const ld: ConnLinkData =
-        c.mode === 'contact' ? { mode: 'contact', agentVersions: AGENT_VERSIONS, data: { direct: true, owners: [], relays: [], userData } } : { mode: 'invitation', agentVersions: AGENT_VERSIONS, userData };
+        c.mode === 'contact'
+          ? { mode: 'contact', agentVersions: AGENT_VERSIONS, data: { direct: sl.direct ?? true, owners: sl.owners ?? [], relays: sl.relays ?? [], userData } }
+          : { mode: 'invitation', agentVersions: AGENT_VERSIONS, userData };
       const lb = encodeLinkData(ld);
       const signed = new Encoder().bytes(sign(sl.rootPriv, lb)).raw(lb).finish();
       const key = c.mode === 'contact' ? contactShortLinkKdf(sl.linkKey).key : invShortLinkKdf(sl.linkKey);
       await this.network.send(c.rcv.server, c.rcv.rcvId, { tag: 'LSET', linkId: sl.linkId, data: { fixedData: sl.encFixedData, userData: encryptUserData(key, signed) } }, c.rcv.rcvPrivKey);
+      if (relays) await this.save(c);
     });
   }
 

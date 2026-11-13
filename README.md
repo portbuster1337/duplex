@@ -31,10 +31,11 @@ Chat are trademarks of SimpleX Chat Ltd.
   the last 100 like the apps, or as many as that admin chooses, up to all of them. A group can
   review who joins via its link: until a moderator accepts them, they only chat privately with the
   moderators, as in the apps; any member can also chat privately with the moderators.
-- **Channels**: subscribe via a channel link and read the posts, which come through the channel's
-  chat relays (with the history the relays keep); what changes the channel (its profile, deletion,
-  removing you) is accepted only when signed by an owner, whose keys come from the channel link, so a
-  relay cannot make it up. What Duplex sends to the relays is signed with its own member key.
+- **Channels**: create channels, served by the chat relays of SimpleX Chat or your own, and post
+  to the subscribers, who connect to the relays rather than to you; or subscribe via a channel link
+  and read the posts, with the history the relays keep. What changes a channel (its profile,
+  deletion, removals) is signed by an owner, whose key the channel link authorises, so a relay
+  cannot make it up; Duplex signs what it sends with its member key and checks what it receives.
 - **Audio and video calls** with the apps, over WebRTC: the call page of the apps is followed
   closely (the media frames are encrypted end to end with the key agreed in the chat), and calls go
   through the TURN server of SimpleX Chat by default, so contacts do not see your IP address. You
@@ -115,8 +116,9 @@ use on it belong to the same client.
 
 ### Limitations
 
-- Channels: Duplex subscribes to channels but cannot create them or act as a relay, and it does not
-  read the signed roster of a channel, so only the owners (not admins or moderators) are recognised.
+- Channels: Duplex does not run as a chat relay, and it neither reads nor sends the signed roster
+  of a channel, so only its owners (not admins or moderators) are recognised; a channel created in
+  Duplex has one owner.
 - Calls: no group calls (SimpleX has none); calls ring only while the page is open. Tor Browser
   disables WebRTC, so calls do not work there.
 - Files are kept in the encrypted storage of this browser, which browsers limit in size; large files

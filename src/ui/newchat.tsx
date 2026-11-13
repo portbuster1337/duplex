@@ -1,5 +1,6 @@
-// Adding contacts and groups: 1-time links, connecting via a link (or joining a group), the contact
-// address, and new groups, as options listed in the window (the chosen one opens under its title).
+// Adding contacts, groups and channels: 1-time links, connecting via a link (or joining a group or a
+// channel), the contact address, new groups and channels, as options listed in the window (the chosen
+// one opens under its title).
 import type { JSX } from 'preact';
 import { useEffect, useState } from 'preact/hooks';
 import type { Session } from '../app/session';
@@ -9,7 +10,7 @@ import { Avatar, copyText, QRCode } from './util';
 import { errorText, Modal, OptionSections, Spinner, toast, Toggle } from './components';
 import { Icon } from './icons';
 import type { Selection } from './layout';
-import { NewGroup } from './groups';
+import { NewChannel, NewGroup } from './groups';
 
 export function NewChat({ session, onClose, onOpen }: { session: Session; onClose: () => void; onOpen: (s: Selection) => void }): JSX.Element {
   // the 1-time link is made when that option is first opened, and kept while others are opened
@@ -22,6 +23,7 @@ export function NewChat({ session, onClose, onOpen }: { session: Session; onClos
           { id: 'connect', icon: 'link', title: 'Connect via a link', hint: 'Paste a 1-time link, a contact address or a group link', body: () => <Connect session={session} onOpen={onOpen} /> },
           { id: 'address', icon: 'mail', title: 'Your contact address', hint: 'A long-term link that people can send contact requests to', body: () => <AddressTab session={session} /> },
           { id: 'group', icon: 'users', title: 'Create a group', hint: 'Add your contacts, or share a link to the group', body: () => <NewGroup session={session} onCreated={(g) => onOpen({ kind: 'group', id: g.id })} /> },
+          { id: 'channel', icon: 'megaphone', title: 'Create a channel', hint: 'Post to subscribers, through chat relays', body: () => <NewChannel session={session} onCreated={(g) => onOpen({ kind: 'group', id: g.id })} /> },
         ]}
       />
     </Modal>

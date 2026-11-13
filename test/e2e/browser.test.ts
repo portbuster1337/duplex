@@ -444,6 +444,33 @@ test('the browser subscribes to a channel of the CLI, served by a CLI chat relay
     await page.getByLabel('Channel info').click();
     await page.locator('.kv', { hasText: 'connected' }).waitFor({ timeout: 30000 });
     await page.getByLabel('Close').click();
+    // the browser's own channel, served by the same relay, and the CLI subscribes to it
+    await page.getByLabel('New chat').first().click();
+    await page.getByRole('button', { name: /^Create a channel/ }).click();
+    await page.getByLabel('Channel name').fill('browser news');
+    for (const r of await page.locator('.relay-choice input[type=checkbox]').all()) await r.uncheck();
+    await page.getByLabel('Other relays (their addresses)').fill(rl?.connShortLink ?? rl?.connFullLink);
+    await page.getByRole('button', { name: 'Create channel' }).click();
+    await page.locator('.chat-head .chat-name', { hasText: 'browser news' }).waitFor({ timeout: NET });
+    await page.locator('.messages .event', { hasText: 'serves the channel' }).waitFor({ timeout: NET });
+    await page.locator('.composer textarea').fill('Hello from the browser channel');
+    await page.keyboard.press('Enter');
+    await page.getByLabel('Channel info').click();
+    const own = (await page.locator('.modal .link-box .mono').textContent())!.trim();
+    await page.getByLabel('Close').click();
+    let joined: any;
+    for (let i = 0; i < 30 && !joined; i++) {
+      const plan = await cli.cmd(`/_connect plan 1 ${own}`);
+      if (plan.connectionPlan?.groupLinkPlan?.type === 'ok') joined = await cli.cmd(`/c ${own}`);
+      else await new Promise((r) => setTimeout(r, 1000));
+    }
+    assert.equal(joined?.type, 'startedConnectionToGroup', JSON.stringify(joined).slice(0, 300));
+    const text = (e: any) => e?.chatItems?.[0]?.chatItem?.content?.msgContent?.text;
+    await cli.waitType('newChatItems', NET, (e) => text(e) === 'Hello from the browser channel');
+    await page.locator('.composer textarea').fill('A second post');
+    await page.keyboard.press('Enter');
+    await cli.waitType('newChatItems', NET, (e) => text(e) === 'A second post');
+    await shot('20-own-channel');
   } finally {
     relay.stop();
   }

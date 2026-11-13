@@ -62,3 +62,10 @@ export const FLUX_XFTP_SERVERS: ProtocolServer[] = parse([
   'xftp://Rh19D5e4Eez37DEE9hAlXDB3gZa1BdFYJTPgJWPO9OI=@xftp5.simplexonflux.com,q7itltdn32hjmgcqwhow4tay5ijetng3ur32bolssw32fvc5jrwvozad.onion',
   'xftp://0AznwoyfX8Od9T_acp1QeeKtxUi676IBIiQjXVwbdyU=@xftp6.simplexonflux.com,upvzf23ou6nrmaf3qgnhd6cn3d74tvivlmz3p7wdfwq6fhthjrjiiqid.onion',
 ]);
+
+/** the chat relays of SimpleX Chat, which serve channels (simplexChatRelays of the apps) */
+export const PRESET_CHAT_RELAYS: ReadonlyArray<{ name: string; address: string }> = [
+  { name: 'SimpleX Chat Relay 1', address: 'https://smp5.simplex.im/r#Fp5RWXkiRFg-hgcDwC2v-MWnPfvEf42RgCqREntW0mw' },
+  { name: 'SimpleX Chat Relay 2', address: 'https://smp6.simplex.im/r#_qlQfogHGDJ8MAF2wKmkglRBM-xHR142gDJstKiGRQQ' },
+  { name: 'SimpleX Chat Relay 3', address: 'https://smp4.simplex.im/r#yxNOMJcry5jMTRPEBVtGBATYaKeoRIsZRBPIDLx7x6M' },
+];

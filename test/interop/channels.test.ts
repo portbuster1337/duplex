@@ -97,3 +97,40 @@ test('Duplex leaves the channel', { skip: !SERVER }, async () => {
   assert.equal(chat.group(g.id)!.status, 'left');
   await owner.waitType('leftMember', NET, (e) => e.member?.memberProfile?.displayName === 'dave');
 });
+
+test('Duplex creates a channel served by the CLI relay; a CLI subscribes, and gets its posts and changes', { skip: !SERVER }, async () => {
+  const sub = await Cli.start('sub', 5342, SERVER);
+  try {
+    const sa = await relay.cmd('/sa');
+    const rl = sa.contactLink?.connLinkContact;
+    const g = await chat.createChannel({ displayName: 'dnews', description: 'news from Duplex' }, [rl?.connShortLink ?? rl?.connFullLink]);
+    const relayMember = () => Object.values(chat.group(g.id)!.members).find((m) => m.role === 'relay');
+    await until(() => relayMember()?.status === 'connected', NET, 'the relay serves the channel');
+    await chat.sendText(g.id, 'the first post from Duplex');
+    const dlink = chat.group(g.id)!.channel!.link;
+    assert.match(dlink, /\/c#/);
+    // the relay joins its own link in the channel link once it sees it there
+    let joined: any;
+    for (let i = 0; i < 20 && !joined; i++) {
+      const plan = await sub.cmd(`/_connect plan 1 ${dlink}`);
+      if (plan.connectionPlan?.groupLinkPlan?.type === 'ok') joined = await sub.cmd(`/c ${dlink}`);
+      else await new Promise((r) => setTimeout(r, 1000));
+    }
+    assert.equal(joined?.type, 'startedConnectionToGroup', JSON.stringify(joined).slice(0, 300));
+    await sub.waitType('userJoinedGroup', NET, (e) => e.groupInfo?.groupProfile?.displayName === 'dnews');
+    const groupText = (e: any, text: string) => (e?.chatItems ?? []).some((ci: any) => ci?.chatInfo?.groupInfo?.groupProfile?.displayName === 'dnews' && ci.chatItem?.content?.msgContent?.text === text);
+    await sub.waitType('newChatItems', NET, (e) => groupText(e, 'the first post from Duplex'));
+    const p2 = await chat.sendText(g.id, 'a second post');
+    await sub.waitType('newChatItems', NET, (e) => groupText(e, 'a second post'));
+    await until(() => (chat.group(g.id)!.channel!.subscribers ?? 0) >= 1, NET, 'the subscriber counted');
+    // signed by the owner: the CLI checks the signature with the key from the channel link
+    await chat.groups.updateProfile(g.id, { description: 'the news, updated' });
+    await sub.waitType('groupUpdated', NET, (e) => e.toGroup?.groupProfile?.description === 'the news, updated');
+    await chat.editItem(g.id, p2.id, 'a second post, edited');
+    await sub.waitType('chatItemUpdated', NET, (e) => e.chatItem?.chatItem?.content?.msgContent?.text === 'a second post, edited');
+    await chat.deleteItem(g.id, p2.id, true);
+    await sub.waitType('chatItemsDeleted', NET);
+  } finally {
+    sub.stop();
+  }
+});

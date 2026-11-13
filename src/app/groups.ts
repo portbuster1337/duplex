@@ -4,6 +4,7 @@
 import type { AgentEvent, MsgResult, ResolvedLink } from '../core/agent/agent';
 import {
   ACCEPTED_TO_GROUP_MESSAGE,
+  channelShortLinkData,
   DEFAULT_GROUP_PREFERENCES,
   fwdMemberName,
   GROUP_KNOCKING_VERSION,
@@ -60,14 +61,15 @@ import {
   xInfo,
   xMsgFileDescr,
   xMsgNew,
+  xOk,
   type ChatMessage,
   type MsgContainer,
   type ParsedChatMsg,
   type Profile,
 } from '../core/chat/protocol';
-import { encodePubKey, generateKeyPair, type PublicKey } from '../core/crypto/crypto';
-import { strShortLink } from '../core/agent/shortlink';
-import { b64, b64url, fromB64, type Bytes } from '../core/util/bytes';
+import { encodePubKey, generateKeyPair, sha256, sign, type PublicKey } from '../core/crypto/crypto';
+import { parseShortLink, strShortLink } from '../core/agent/shortlink';
+import { b64, b64url, concat, fromB64, type Bytes } from '../core/util/bytes';
 import { parseVR, type VersionRange } from '../core/util/version';
 import { ChatError, localId, profileName } from './common';
 import { FIXED_IMAGE_PREVIEW } from './files';
@@ -119,6 +121,8 @@ export interface GroupMember {
   key?: string;
   /** channels: the link of a chat relay */
   relayLink?: string;
+  /** channels, as the owner: the address of a chat relay we invited */
+  relayAddress?: string;
   blocked?: boolean;
   /** messages kept until the connection is ready (base64) */
   pending?: string[];
@@ -135,6 +139,8 @@ export interface ChannelInfo {
   memberKey: { pub: string; priv: string };
   /** the number of subscribers, as the link data or a relay says */
   subscribers?: number;
+  /** as the owner: the connection of the channel link, whose data lists the relays that serve it */
+  linkConnId?: string;
 }
 
 export interface Group {
@@ -645,9 +651,9 @@ export class GroupManager {
     return signedElement(binding, { alg: 'ed25519', key: fromB64(g.channel!.memberKey.priv) }, encodeChatMessage(msg));
   }
 
-  /** to the relays of a channel */
+  /** to the relays of a channel; what changes the channel is signed, posts are not (as in the apps) */
   private async sendChannel(g: Group, msg: ChatMessage): Promise<number> {
-    const body = this.channelSigned(g, msg);
+    const body = CHANNEL_SIGNED.has(msg.event) ? this.channelSigned(g, msg) : encodeChatMessage(msg);
     let n = 0;
     for (const m of this.relays(g)) {
       if (m.connId && m.status === 'connected') {
@@ -663,6 +669,7 @@ export class GroupManager {
   }
 
   private async onChannelEvent(g: Group, m: GroupMember, e: AgentEvent): Promise<MsgResult | void> {
+    if (g.role === 'owner' && m.category === 'invitee') return this.onOwnedRelayEvent(g, m, e);
     switch (e.type) {
       case 'CONF': {
         // the relay accepts us: x.grp.link.inv, about this channel and our member ID
@@ -825,6 +832,156 @@ export class GroupManager {
       default:
         return;
     }
+  }
+
+  // ---- channels (as the owner)
+
+  /**
+   * creates a channel (APINewPublicGroup of the apps): its ID is the hash of a new root key, which
+   * authorises our member key as the owner's in the link. The relays are invited; each serves the
+   * channel once it accepts and is in the link
+   */
+  async createChannel(p: { displayName: string; description?: string; image?: string }, relayAddresses: string[], incognito?: Profile): Promise<Group> {
+    const displayName = p.displayName.trim();
+    if (!displayName) throw new ChatError('the channel needs a name');
+    if (!relayAddresses.length) throw new ChatError('choose at least one chat relay');
+    const root = generateKeyPair('ed25519');
+    const entityId = sha256(root.pub.key);
+    const publicGroupId = b64url(entityId);
+    const memberId = newMemberId();
+    const memberKey = generateKeyPair('ed25519');
+    const ownerId = fromB64(memberId);
+    const ownerAuth = { ownerId, ownerKey: memberKey.pub, sig: sign(root.priv, concat(ownerId, encodePubKey(memberKey.pub))) };
+    const base: GroupProfile = {
+      displayName,
+      fullName: '',
+      ...(p.description?.trim() ? { description: p.description.trim() } : {}),
+      ...(p.image ? { image: p.image } : {}),
+      groupPreferences: { ...DEFAULT_GROUP_PREFERENCES, history: { enable: 'on' } },
+    };
+    let profile = base;
+    const r = await this.chat.agent.createAddress({
+      root,
+      linkEntityId: entityId,
+      owners: [ownerAuth],
+      direct: false,
+      linkType: 'C',
+      clientData: groupLinkClientData(newGroupLinkId()),
+      // the profile names the link
+      userData: (link) => channelShortLinkData((profile = { ...base, publicGroup: { groupType: 'channel', groupLink: link, publicGroupId } }), 1),
+    });
+    const now = Date.now();
+    const g: Group = {
+      id: localId(),
+      profile,
+      memberId,
+      role: 'owner',
+      status: 'active',
+      incognito,
+      members: {},
+      createdAt: now,
+      lastActivity: now,
+      unread: 0,
+      channel: { publicGroupId, link: r.link, memberKey: { pub: b64url(memberKey.pub.key), priv: b64url(memberKey.priv.key) }, subscribers: 0, linkConnId: r.connId },
+    };
+    this.groups[g.id] = g;
+    await this.save(g);
+    await this.event(g, 'you created the channel: it can be joined once a relay serves it');
+    const rs = await Promise.allSettled(relayAddresses.map((a) => this.inviteRelay(g, a)));
+    const failed = rs.find((x): x is PromiseRejectedResult => x.status === 'rejected');
+    if (failed && rs.every((x) => x.status === 'rejected')) {
+      await this.remove(g);
+      throw failed.reason;
+    }
+    await this.save(g);
+    return g;
+  }
+
+  /** a chat relay is asked to serve the channel (x.grp.relay.inv, signed): it checks the link, and makes its own link for it */
+  private async inviteRelay(g: Group, address: string): Promise<void> {
+    const r = await this.chat.agent.resolveLink(address);
+    if (r.connReq.mode !== 'contact') throw new ChatError('this is not the address of a chat relay');
+    const d = parseShortLinkData(r.userData) as { profile?: Profile; relayProfile?: Profile };
+    const rp = d.relayProfile ?? d.profile;
+    const id = newMemberId();
+    const m: GroupMember = { memberId: id, role: 'relay', profile: memberProfile(rp?.displayName ? rp : { displayName: 'relay', fullName: '' }), category: 'invitee', status: 'invited', relayAddress: address, createdAt: Date.now() };
+    g.members[id] = m;
+    const inv = { fromMember: { memberId: g.memberId, memberRole: 'owner' }, fromMemberProfile: this.ourProfile(g), relayMemberId: id, groupLink: g.channel!.link, publicGroupId: g.channel!.publicGroupId, fromMemberKey: this.channelKey(g) };
+    const connInfo = compressToLimit(MAX_CONN_INFO_LENGTH, this.channelSigned(g, { event: 'x.grp.relay.inv', params: { groupRelayInvitation: inv } }));
+    if (!connInfo) throw new ChatError('the profile is too large (try a smaller picture)');
+    const connId = await this.chat.agent.joinConnection(r, connInfo, { pq: false });
+    this.setConn(g, m, connId);
+  }
+
+  /** the relays of our channel */
+  private async onOwnedRelayEvent(g: Group, m: GroupMember, e: AgentEvent): Promise<MsgResult | void> {
+    switch (e.type) {
+      case 'CONF': {
+        const msg = this.chat.parseInfo(e.connInfo);
+        if (msg?.event === 'x.grp.relay.reject') {
+          m.status = 'left';
+          await this.event(g, `the relay ${memberName(m)} declined to serve the channel`);
+          return { allow: this.chat.encodeInfo(xOk(), false) };
+        }
+        if (msg?.event !== 'x.grp.relay.acpt' || typeof msg.params.relayLink !== 'string') return void console.warn('unexpected confirmation of a relay', msg?.event);
+        // the link the relay made for the channel: its entity is the member ID we gave the relay
+        const rl = await this.chat.agent.resolveLink(msg.params.relayLink);
+        if (!rl.linkData?.fixed.linkEntityId || b64url(rl.linkData.fixed.linkEntityId) !== m.memberId) return void console.warn('the link of the relay is for another member');
+        const rp = (parseShortLinkData(rl.userData) as { relayProfile?: Profile }).relayProfile;
+        if (rp?.displayName) m.profile = memberProfile(rp);
+        if (msg.v) m.v = msg.v;
+        m.relayLink = msg.params.relayLink;
+        m.key = b64url(rl.linkData.fixed.rootKey.key);
+        m.status = 'accepted';
+        await this.save(g);
+        return { allow: this.chat.encodeInfo(xOk(), false) };
+      }
+      case 'CON':
+        m.status = 'connected';
+        this.sendPending(m);
+        await this.save(g);
+        await this.publishRelays(g);
+        await this.event(g, `the relay ${memberName(m)} serves the channel`);
+        return;
+      case 'MSG': {
+        for (const pm of parseChatMessages(e.body)) {
+          const msg = pm.msg;
+          if (!msg) continue;
+          if (DEBUG) console.log(`[channel ${groupName(g)}] from relay ${memberName(m)}: ${pm.forward ? 'forwarded ' : ''}${msg.event}`, JSON.stringify(msg.params).slice(0, 200));
+          // the relays tell the owners who subscribed, and who left
+          if (msg.event === 'x.grp.mem.new' && !pm.forward) {
+            const mi = msg.params.memberInfo as MemberInfo | undefined;
+            const id = normMemberId(mi?.memberId);
+            if (mi?.profile && id && id !== g.memberId && !g.members[id]) {
+              g.members[id] = { memberId: id, role: mi.memberRole, profile: memberProfile(mi.profile), category: 'post', status: 'announced', invitedBy: m.memberId, createdAt: Date.now() };
+              g.channel!.subscribers = (g.channel!.subscribers ?? 0) + 1;
+            }
+          } else if (msg.event === 'x.grp.leave' && pm.forward) {
+            const s = g.members[normMemberId(pm.forward.memberId) ?? ''];
+            if (s && !memberGone(s) && s.role !== 'relay') {
+              s.status = 'left';
+              g.channel!.subscribers = Math.max(0, (g.channel!.subscribers ?? 1) - 1);
+            }
+          } else if (msg.event === 'x.grp.leave' && !pm.forward) {
+            m.status = 'left';
+            await this.event(g, `the relay ${memberName(m)} left the channel`);
+            await this.publishRelays(g);
+          }
+        }
+        await this.save(g);
+        return {};
+      }
+      default:
+        return;
+    }
+  }
+
+  /** the link of our channel lists the relays that serve it: subscribers connect to them */
+  private async publishRelays(g: Group): Promise<void> {
+    const links = this.relays(g)
+      .filter((r) => r.relayLink && r.status === 'connected')
+      .map((r) => parseShortLink(r.relayLink!));
+    await this.chat.agent.updateLinkData(g.channel!.linkConnId!, channelShortLinkData(g.profile, Math.max(1, g.channel!.subscribers ?? 1)), links);
   }
 
   // ---- group links (as an admin)
@@ -1521,6 +1678,7 @@ export class GroupManager {
     if (!profile.displayName?.trim()) throw new ChatError('the group needs a name');
     g.profile = profile;
     await this.send(g, xGrpInfo(profile, newSharedMsgId()));
+    if (g.channel?.linkConnId) await this.publishRelays(g).catch((e) => console.warn('the channel link was not updated', e));
     if (g.link) await this.chat.agent.updateLinkData(g.link.connId, groupShortLinkData(profile)).catch(() => {});
     await this.event(g, 'you updated the group profile');
   }

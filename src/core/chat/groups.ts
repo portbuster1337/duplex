@@ -3,6 +3,7 @@
 // connected yet. Groups are peer-to-peer: each member has a connection with each other member.
 import { b64, b64url, fromB64, randomBytes, utf8 } from '../util/bytes';
 import { strVR, type VersionRange } from '../util/version';
+import { zstdCompress } from '../util/zstd';
 import { CHAT_VERSIONS, type ChatMessage, type MsgContent, type Profile } from './protocol';
 
 /** in the order of the official clients: an unknown role is the lowest */
@@ -126,6 +127,12 @@ export function groupLinkIdOf(clientData: string | undefined): string | undefine
 }
 
 export const groupShortLinkData = (groupProfile: GroupProfile): Bytes => utf8(JSON.stringify({ groupProfile }));
+
+/** the user data of a channel link (GroupShortLinkData): the profile, and the number of subscribers; compressed when large */
+export function channelShortLinkData(groupProfile: GroupProfile, publicMemberCount: number): Bytes {
+  const json = utf8(JSON.stringify({ groupProfile, publicGroupData: { publicMemberCount } }));
+  return json.length <= 2000 ? json : new Uint8Array([0x58, ...zstdCompress(json)]);
+}
 type Bytes = Uint8Array;
 
 export const strChatVR = (vr: VersionRange = CHAT_VERSIONS): string => strVR(vr);
