@@ -61,6 +61,10 @@
             <p>Text with formatting, replies, edits, deletion, reactions, delivery receipts, disappearing messages, voice messages, profile pictures, contact addresses and requests, address changes, and the same security codes to verify a contact.</p>
           </div>
           <div class="feature">
+            <h3>Groups</h3>
+            <p>Join groups by invitation or link, or create your own and add contacts. Each member has an end-to-end encrypted connection with each other member — there is no group server.</p>
+          </div>
+          <div class="feature">
             <h3>Files, images and videos</h3>
             <p>Up to 1 GB, encrypted in the page and sent through SimpleX file servers, which only ever see encrypted chunks. Photos lose their location and camera metadata before they are sent.</p>
           </div>
@@ -143,6 +147,11 @@
               <td>Your IP address and your other contacts</td>
             </tr>
             <tr>
+              <th scope="row">Group members</th>
+              <td>The profile you use in the group (it can be incognito), your messages there, and the other members</td>
+              <td>Your IP address, your contacts and your other groups</td>
+            </tr>
+            <tr>
               <th scope="row">Codeberg Pages</th>
               <td>That this page was loaded, from which IP address and browser</td>
               <td>Everything after that: the page does not talk to it again</td>
@@ -162,7 +171,7 @@
       <section id="limits">
         <h2>Limitations</h2>
         <ul>
-          <li>Groups and channels and calls are not supported yet.</li>
+          <li>Channels (groups with relays) and calls are not supported yet. Groups do not send their history to new members.</li>
           <li>Files are kept in the encrypted storage of this browser, which browsers limit in size: save large files to disk.</li>
           <li>No per-connection transport isolation: one connection per server.</li>
           <li>No push notifications: messages arrive while the page is open (notifications can be shown while it is in a background tab).</li>
