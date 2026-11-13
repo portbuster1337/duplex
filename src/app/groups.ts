@@ -6,6 +6,7 @@ import {
   DEFAULT_GROUP_PREFERENCES,
   fwdMemberName,
   groupLinkClientData,
+  groupPrefOn,
   groupShortLinkData,
   isForwardedGroupMsg,
   memberInfo,
@@ -35,10 +36,11 @@ import {
   type GroupProfile,
   type MemberInfo,
 } from '../core/chat/groups';
-import { COMPRESSION_CHAT_VERSION, compressToLimit, encodeChatMessage, MAX_ENCODED_MSG_LENGTH, newSharedMsgId, parseChatMessages, xContact, xInfo, type ChatMessage, type Profile } from '../core/chat/protocol';
+import { COMPRESSION_CHAT_VERSION, compressToLimit, encodeChatMessage, jsonBatches, MAX_ENCODED_MSG_LENGTH, newSharedMsgId, parseChatMessages, xContact, xInfo, xMsgFileDescr, xMsgNew, type ChatMessage, type MsgContainer, type Profile } from '../core/chat/protocol';
 import { b64, fromB64, type Bytes } from '../core/util/bytes';
 import { parseVR, type VersionRange } from '../core/util/version';
 import { ChatError, localId, profileName } from './common';
+import { FIXED_IMAGE_PREVIEW } from './files';
 import type { ChatClient, ChatItem, Contact } from './chat';
 
 /** host: the member who added us; invitee: members we added; pre/post: introduced members who joined before/after us */
@@ -74,6 +76,8 @@ export interface GroupMember {
   contactId?: string;
   /** joined via our group link */
   viaLink?: boolean;
+  /** joined via our group link, and the app showed the welcome message from the link already */
+  welcomeMsgId?: string;
   blocked?: boolean;
   /** messages kept until the connection is ready (base64) */
   pending?: string[];
@@ -110,6 +114,8 @@ const DEBUG = typeof process !== 'undefined' && !!process.env?.DEBUG_GROUPS;
 
 /** the host of a group joined via a link, until its member ID is known */
 const HOST_PLACEHOLDER = '?host';
+/** the number of recent messages sent to new members, as in the apps */
+const HISTORY_ITEMS = 100;
 const pairKey = (a: string, b: string) => (a < b ? `${a}|${b}` : `${b}|${a}`);
 export const memberGone = (m: GroupMember): boolean => m.status === 'left' || m.status === 'removed';
 export const memberName = (m?: GroupMember): string => profileName(m?.profile);
@@ -287,13 +293,14 @@ export class GroupManager {
 
   // ---- creating groups and inviting members
 
+  /** a new group; as in the apps, new members get its recent messages */
   async create(p: { displayName: string; fullName?: string; description?: string; image?: string }, incognito?: Profile): Promise<Group> {
     const displayName = p.displayName.trim();
     if (!displayName) throw new ChatError('the group needs a name');
     const now = Date.now();
     const g: Group = {
       id: localId(),
-      profile: { displayName, fullName: p.fullName?.trim() ?? '', ...(p.description?.trim() ? { description: p.description.trim() } : {}), ...(p.image ? { image: p.image } : {}), groupPreferences: { ...DEFAULT_GROUP_PREFERENCES } },
+      profile: { displayName, fullName: p.fullName?.trim() ?? '', ...(p.description?.trim() ? { description: p.description.trim() } : {}), ...(p.image ? { image: p.image } : {}), groupPreferences: { ...DEFAULT_GROUP_PREFERENCES, history: { enable: 'on' } } },
       memberId: newMemberId(),
       role: 'owner',
       status: 'active',
@@ -479,6 +486,7 @@ export class GroupManager {
       return;
     }
     const m: GroupMember = { memberId: newMemberId(), role: g.link.role, profile: memberProfile(profile), category: 'invitee', status: 'accepted', invitedBy: g.memberId, viaLink: true, v: msg?.v, createdAt: Date.now() };
+    if (typeof msg?.params.welcomeMsgId === 'string') m.welcomeMsgId = msg.params.welcomeMsgId;
     const gli: GroupLinkInvitation = {
       fromMember: { memberId: g.memberId, memberRole: g.role },
       fromMemberName: this.ourProfile(g).displayName,
@@ -518,6 +526,54 @@ export class GroupManager {
       }
     }
     await this.save(g);
+  }
+
+  /**
+   * the recent messages of the group, for a member who joined (sendHistory of the apps): forwarded
+   * with their authors and times, with the files that can still be downloaded, then the welcome
+   * message. Our messages sent after the member was added reached it directly.
+   */
+  private async sendHistory(g: Group, n: GroupMember): Promise<void> {
+    if (!n.connId) return;
+    const all = await this.chat.chatItems(g.id);
+    const items = all.filter((it) => it.sharedMsgId && (it.dir === 'rcv' || (it.dir === 'snd' && it.status !== 'error' && it.ts < n.createdAt)) && !it.deleted && it.content?.type !== 'report').slice(-HISTORY_ITEMS);
+    const bySharedId = new Map(all.map((it) => [it.sharedMsgId, it]));
+    const msgs: ChatMessage[] = [];
+    for (const it of items) {
+      const author = it.dir === 'snd' ? { memberId: g.memberId, name: this.ourProfile(g).displayName } : g.members[it.memberId ?? ''] && { memberId: it.memberId!, name: memberName(g.members[it.memberId!]) };
+      if (!author || (it.dir === 'rcv' && g.members[author.memberId].blocked)) continue;
+      const file = await this.chat.historyFile(it);
+      const text = (it.content as { text?: unknown }).text;
+      if (!file && !(typeof text === 'string' && text.trim())) continue;
+      const mc: MsgContainer = { content: it.content };
+      if (it.quote?.sharedMsgId) {
+        const quoted = it.quote.sent ? g.memberId : it.quote.memberId;
+        const q = bySharedId.get(it.quote.sharedMsgId);
+        mc.quote = {
+          msgRef: { msgId: it.quote.sharedMsgId, sentAt: new Date(q ? (q.brokerTs ?? q.ts) : (it.brokerTs ?? it.ts)).toISOString(), sent: quoted === g.memberId, ...(quoted ? { memberId: quoted } : {}) },
+          content: { type: 'text', text: it.quote.text },
+        };
+      }
+      if (file) mc.file = file.inv;
+      const ttl = it.ttl ?? (it.deleteAt ? Math.round((it.deleteAt - it.ts) / 1000) : 0);
+      if (ttl > 0) mc.ttl = ttl;
+      if (it.forwarded) mc.forward = true;
+      const ts = it.brokerTs ?? it.ts;
+      const fwd = (msg: ChatMessage) => xGrpMsgForward(author.memberId, fwdMemberName(author.name), ts, msg);
+      let m = fwd(xMsgNew(it.sharedMsgId!, mc));
+      // a preview with a long caption may not fit when forwarded: then the small preview of the apps
+      if (encodeChatMessage(m).length > MAX_ENCODED_MSG_LENGTH && typeof (mc.content as { image?: unknown }).image === 'string') {
+        m = fwd(xMsgNew(it.sharedMsgId!, { ...mc, content: { ...mc.content, image: FIXED_IMAGE_PREVIEW } }));
+      }
+      msgs.push(m);
+      for (const part of file?.parts ?? []) msgs.push(fwd(xMsgFileDescr(newSharedMsgId(), it.sharedMsgId!, part, file!.expires)));
+    }
+    const welcome = g.profile.description?.trim();
+    if (welcome && !n.welcomeMsgId) msgs.push(xMsgNew(newSharedMsgId(), { content: { type: 'text', text: g.profile.description! } }));
+    if (!msgs.length) return;
+    const { bodies, dropped } = jsonBatches(msgs.map(encodeChatMessage), MAX_ENCODED_MSG_LENGTH, (n.v?.max ?? COMPRESSION_CHAT_VERSION) >= COMPRESSION_CHAT_VERSION);
+    if (dropped) console.warn(`the history of the group: ${dropped} messages are too large`);
+    for (const body of bodies) await this.deliver(n.connId, body, false, false);
   }
 
   /** forwards a member's message to the members it is not connected to yet */
@@ -635,8 +691,9 @@ export class GroupManager {
         if (g.status === 'connecting') g.status = 'active';
         await this.save(g);
         await this.event(g, g.status === 'pending' ? `connected to ${memberName(m)} — waiting to be accepted` : 'you joined the group');
-        // the welcome message, from the admin who added us (as the apps show it)
-        if (g.profile.description?.trim()) {
+        // the welcome message, from the admin who added us (as the apps show it); with the history of
+        // the group, the admin sends it after the history
+        if (g.profile.description?.trim() && !groupPrefOn(g.profile, 'history')) {
           await this.chat.addItem(g.id, { id: localId(), dir: 'rcv', memberId: m.memberId, content: { type: 'text', text: g.profile.description }, ts: Date.now(), status: 'received' });
         }
         return;
@@ -644,6 +701,7 @@ export class GroupManager {
         await this.event(g, `${memberName(m)} joined`, m.memberId);
         if (m.viaLink) await this.sendTo(m, xGrpLinkMem(this.ourProfile(g), newSharedMsgId()));
         await this.introduceToAll(g, m);
+        if (groupPrefOn(g.profile, 'history')) await this.sendHistory(g, m).catch((e) => console.warn('sending the history failed', e));
         return;
       default: {
         await this.event(g, `${memberName(m)} connected`, m.memberId);
@@ -692,7 +750,7 @@ export class GroupManager {
       s = { memberId: id, role: 'member', profile: { displayName: fwd.memberName || 'member', fullName: '' }, category: 'post', status: 'unknown', invitedBy: by.memberId, createdAt: Date.now() };
       g.members[id] = s;
     }
-    await this.processEvent(g, s, msg, fwd.brokerTs || Date.now());
+    await this.processEvent(g, s, msg, fwd.brokerTs || Date.now(), true);
   }
 
   /** may this member introduce or announce a member with this role (checkHostRole) */
@@ -700,7 +758,7 @@ export class GroupManager {
     return roleRank(s.role) >= roleRank('admin') && roleRank(s.role) >= roleRank(role);
   }
 
-  private async processEvent(g: Group, s: GroupMember, msg: ChatMessage, brokerTs: number): Promise<void> {
+  private async processEvent(g: Group, s: GroupMember, msg: ChatMessage, brokerTs: number, forwarded = false): Promise<void> {
     const p = msg.params;
     switch (msg.event) {
       case 'x.msg.new':
@@ -710,7 +768,7 @@ export class GroupManager {
       case 'x.msg.file.descr':
       case 'x.file.cancel':
         if (s.blocked && msg.event === 'x.msg.new') return;
-        await this.chat.processContent({ chatId: g.id, group: g, sender: s }, msg, { brokerTs });
+        await this.chat.processContent({ chatId: g.id, group: g, sender: s }, msg, { brokerTs, forwarded });
         return;
       case 'x.info':
         if (p.profile) {

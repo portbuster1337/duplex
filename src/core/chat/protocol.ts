@@ -240,6 +240,51 @@ export function compressToLimit(maxLen: number, body: Bytes): Bytes | undefined 
   return c.length <= maxLen ? c : undefined;
 }
 
+/**
+ * encoded messages in as few bodies as possible: JSON batches of the official clients ([m1,m2,…]),
+ * each up to maxLen; a message too large alone is compressed when the recipient can decompress it,
+ * otherwise dropped
+ */
+export function jsonBatches(msgs: Bytes[], maxLen: number, compress: boolean): { bodies: Bytes[]; dropped: number } {
+  const bodies: Bytes[] = [];
+  let cur: Bytes[] = [];
+  let len = 0;
+  let dropped = 0;
+  const flush = () => {
+    if (cur.length === 1) bodies.push(cur[0]);
+    else if (cur.length) {
+      const out = new Uint8Array(len + 2);
+      out[0] = 0x5b; // [
+      let o = 1;
+      cur.forEach((m, i) => {
+        if (i) out[o++] = 0x2c; // ,
+        out.set(m, o);
+        o += m.length;
+      });
+      out[o] = 0x5d; // ]
+      bodies.push(out);
+    }
+    cur = [];
+    len = 0;
+  };
+  for (const m of msgs) {
+    if (m.length > maxLen) {
+      const c = compress ? compressToLimit(maxLen, m) : undefined;
+      if (!c) dropped++;
+      else {
+        flush();
+        bodies.push(c);
+      }
+      continue;
+    }
+    if (cur.length && len + 1 + m.length + 2 > maxLen) flush();
+    len += (cur.length ? 1 : 0) + m.length;
+    cur.push(m);
+  }
+  flush();
+  return { bodies, dropped };
+}
+
 /** parses an agent message body into chat messages */
 export function parseChatMessages(b: Bytes): ParsedChatMsg[] {
   if (!b.length) return [{ error: 'empty message' }];

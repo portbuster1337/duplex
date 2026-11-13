@@ -80,7 +80,7 @@ export interface GroupLinkInvitation {
   groupSize?: number;
 }
 
-/** the preferences of new groups in the apps (defaultGroupPrefs), with history on */
+/** the preferences of groups when not set (defaultGroupPrefs of the apps) */
 export const DEFAULT_GROUP_PREFERENCES: GroupPreferences = {
   timedMessages: { enable: 'off', ttl: 86400 },
   directMessages: { enable: 'off' },

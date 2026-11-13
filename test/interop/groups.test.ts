@@ -3,6 +3,9 @@
 //   SMP_SERVER=smp://<fingerprint>@localhost:7001 SIMPLEX_CHAT_BIN=… npm run test:interop
 import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { randomBytes } from 'node:crypto';
 import { ChatClient, type ChatItem, type Contact } from '../../src/app/chat';
 import type { Group, GroupMember } from '../../src/app/groups';
 import { MemoryBackend, Vault } from '../../src/app/vault';
@@ -11,6 +14,7 @@ import { tcpConnector } from '../helpers/tcp';
 import { Cli } from '../helpers/cli';
 
 const SERVER = process.env.SMP_SERVER;
+const XFTP = process.env.XFTP_SERVER;
 const NET = 60000;
 let carol: Cli;
 let eve: Cli;
@@ -67,7 +71,7 @@ before(async () => {
   carol = await Cli.start('carol', 5320, SERVER);
   eve = await Cli.start('eve', 5321, SERVER);
   const vault = await Vault.create(new MemoryBackend(), 'test', { t: 1, m: 256, p: 1 });
-  chat = new ChatClient(vault, { profile: { displayName: 'dave', fullName: '' }, servers: [SERVER], sendReceipts: true, shortLinks: true }, tcpConnector, [parseServer(SERVER).server]);
+  chat = new ChatClient(vault, { profile: { displayName: 'dave', fullName: '' }, servers: [SERVER], sendReceipts: true, shortLinks: true, xftpServers: XFTP ? [XFTP] : undefined }, tcpConnector, [parseServer(SERVER).server]);
   await chat.start();
   // carol and eve are contacts, and both are contacts of Duplex
   const r = await carol.cmd('/c');
@@ -186,6 +190,73 @@ test('group links: Duplex joins the link of the CLI, and the CLI joins the link 
   await until(() => member(dg, 'eve')?.status === 'connected', NET, 'eve joined via the link');
   await eve.cmd('#dlinked thanks for the link');
   await until(() => rcvText(dg, 'eve', 'thanks for the link'), NET, 'message from eve');
+});
+
+test('the history of a group reaches new members: from Duplex, and from the CLI to Duplex', { skip: !SERVER }, async () => {
+  // Duplex's group (history is on in new groups, as in the apps): eve joins after carol and dave talked
+  const g = await chat.groups.create({ displayName: 'hgroup', description: 'welcome to hgroup' });
+  await chat.groups.invite(g.id, carolC.id);
+  await cliJoins(carol, 'hgroup');
+  await until(() => member(g, 'carol')?.status === 'connected', NET, 'carol connected');
+  await carol.cmd('#hgroup first from carol');
+  await until(() => rcvText(g, 'carol', 'first from carol'), NET, 'message from carol');
+  const fromCarol = items(g.id).find((i) => i.content.text === 'first from carol')!;
+  await chat.sendText(g.id, 'a reply from dave', fromCarol.id);
+  // a file, which new members can still download
+  const data = new Uint8Array(randomBytes(120_000));
+  if (XFTP) {
+    const f = await chat.sendFile(g.id, { blob: new Blob([data as BlobPart]), name: 'notes.bin', kind: 'file' }, 'the notes');
+    await until(() => items(g.id).find((i) => i.id === f.id)?.file?.status === 'sndComplete', NET, 'upload complete');
+  }
+  // the times of the routers have seconds
+  await new Promise((r) => setTimeout(r, 1500));
+  await chat.groups.invite(g.id, eveC.id);
+  await cliJoins(eve, 'hgroup');
+  await until(() => member(g, 'eve')?.status === 'connected', NET, 'eve connected');
+  const welcome = await eve.waitType('newChatItems', NET, (e) => groupItem(e, 'hgroup', 'welcome to hgroup'));
+  assert.equal(welcome.chatItems[0].chatItem.chatDir.groupMember?.memberProfile?.displayName, 'dave');
+  const tail = await eve.cmd('/tail #hgroup 20');
+  const got = (tail.chatItems ?? []).map((ci: any) => [ci.chatItem.chatDir.groupMember?.memberProfile?.displayName, ci.chatItem.content?.msgContent?.text, ci.chatItem.quotedItem?.content?.text]).filter((x: any) => x[1]);
+  assert.deepEqual(
+    got,
+    [
+      ['carol', 'first from carol', undefined],
+      ['dave', 'a reply from dave', 'first from carol'],
+      ...(XFTP ? [['dave', 'the notes', undefined]] : []),
+      ['dave', 'welcome to hgroup', undefined],
+    ],
+    JSON.stringify(got),
+  );
+  if (XFTP) {
+    const fi = tail.chatItems.find((ci: any) => ci.chatItem.file?.fileName === 'notes.bin').chatItem.file;
+    const dir = path.join(eve.dir, 'history-file');
+    fs.mkdirSync(dir, { recursive: true });
+    const r = await eve.cmd(`/fr ${fi.fileId} approved_relays=on ${dir}`);
+    assert.equal(r.type, 'rcvFileAccepted', JSON.stringify(r).slice(0, 300));
+    const done = await eve.waitType('rcvFileComplete', NET, (e) => e.chatItem?.chatItem?.file?.fileId === fi.fileId);
+    const fp = done.chatItem.chatItem.file.fileSource.filePath as string;
+    assert.deepEqual(new Uint8Array(fs.readFileSync(path.isAbsolute(fp) ? fp : path.join(dir, fp))), data);
+  }
+
+  // a group of the CLI with history on: Duplex gets the messages of carol and eve, at their times
+  await carol.cmd('/g #chist');
+  await carol.cmd('/set history #chist on');
+  await carol.cmd('/a #chist @eve');
+  await cliJoins(eve, 'chist');
+  await carol.cmd('#chist old news from carol');
+  await eve.cmd('#chist old news from eve');
+  await carol.waitType('newChatItems', NET, (e) => groupItem(e, 'chist', 'old news from eve'));
+  await new Promise((r) => setTimeout(r, 1500));
+  await carol.cmd(`/a #chist @${daveAtCarol}`);
+  const h = await duplexJoins('chist');
+  await until(() => rcvText(h, 'eve', 'old news from eve') && rcvText(h, 'carol', 'old news from carol'), NET, 'the history');
+  const list = items(h.id);
+  const iEve = list.findIndex((i) => i.content.text === 'old news from eve');
+  const iCarol = list.findIndex((i) => i.content.text === 'old news from carol');
+  const iJoined = list.findIndex((i) => i.dir === 'event' && i.content.text === 'you joined the group');
+  assert.ok(iCarol < iEve && iEve < iJoined, `the history goes before joining: ${list.map((i) => i.content.text).join(' | ')}`);
+  assert.ok(list[iCarol].brokerTs! < list[iJoined].ts);
+  assert.equal(chat.group(h.id)!.unread, 0, 'the history is not unread');
 });
 
 test('leaving and removing members', { skip: !SERVER }, async () => {

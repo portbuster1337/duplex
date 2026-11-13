@@ -55,6 +55,7 @@ import {
   splitFileDescr,
   unknownServers,
   type ChatFile,
+  type FileDescrPart,
   type FileMeta,
   type OutgoingFile,
 } from './files';
@@ -416,6 +417,25 @@ export class ChatClient {
     items.push(item);
     await this.itemStore.save(contactId, items, items.length - 1);
     this.emit({ type: 'newItem', contactId, item });
+  }
+
+  /**
+   * @internal an item at its place in time (forwarded messages, and the history of a group sent to
+   * a new member); returns false when it is older than the last item
+   */
+  async insertItem(contactId: string, item: ChatItem): Promise<boolean> {
+    const items = await this.chatItems(contactId);
+    const t = item.brokerTs ?? item.ts;
+    let i = items.length;
+    while (i > 0 && (items[i - 1].brokerTs ?? items[i - 1].ts) > t) i--;
+    if (i === items.length) {
+      await this.addItem(contactId, item);
+      return true;
+    }
+    items.splice(i, 0, item);
+    await this.itemStore.save(contactId, items, i);
+    this.emit({ type: 'items', contactId });
+    return false;
   }
 
   /** @internal */
@@ -1160,6 +1180,25 @@ export class ChatClient {
     }
   }
 
+  /**
+   * @internal the file of a message, for the history of a group sent to a new member: the invitation
+   * and the description we have (of the file we sent, or received), while the servers keep the file
+   */
+  async historyFile(it: ChatItem): Promise<{ inv: FileInvitation; parts: FileDescrPart[]; expires?: string } | undefined> {
+    const f = it.file;
+    if (!f) return undefined;
+    const meta = await this.files.getMeta(f.id);
+    const usable = f.status === 'sndComplete' || (f.status.startsWith('rcv') && f.status !== 'rcvCancelled' && !(f.status === 'rcvError' && f.permanent));
+    const descr = !usable ? undefined : f.status === 'sndComplete' ? meta?.rcvDescr : meta?.descrComplete ? meta.descrText : undefined;
+    const expiresAt = f.expiresAt ?? (meta?.expiresAt ? meta.expiresAt * 1000 : undefined);
+    if (!descr || (expiresAt !== undefined && expiresAt < Date.now())) return undefined;
+    return {
+      inv: { fileName: f.name, fileSize: f.size, fileDescr: { fileDescrText: '', fileDescrPartNo: 0, fileDescrComplete: false } },
+      parts: splitFileDescr(descr),
+      ...(expiresAt ? { expires: new Date(expiresAt).toISOString() } : {}),
+    };
+  }
+
   /** the file of a received message, and whether it is downloaded without asking */
   private async newRcvFile(item: ChatItem, inv: FileInvitation): Promise<void> {
     const id = localId();
@@ -1507,7 +1546,7 @@ export class ChatClient {
    * @internal the content events of a contact or of a group member: new messages, edits, deletions,
    * reactions and files; returns true for messages that get delivery receipts
    */
-  async processContent(t: ChatTarget, m: ChatMessage, meta: { brokerTs: number; integrity?: string }): Promise<boolean> {
+  async processContent(t: ChatTarget, m: ChatMessage, meta: { brokerTs: number; integrity?: string; forwarded?: boolean }): Promise<boolean> {
     const chatId = t.chatId;
     const g = t.group;
     const items = await this.chatItems(chatId);
@@ -1532,8 +1571,10 @@ export class ChatClient {
         if (mc.file && typeof mc.file === 'object') await this.newRcvFile(item, mc.file);
         if (typeof mc.ttl === 'number' && mc.ttl > 0) item.ttl = mc.ttl;
         const chat = g ?? this.state.contacts[chatId];
-        if (chat) chat.unread++;
-        await this.addItem(chatId, item);
+        // forwarded by an admin, with the time it was sent: the history of the group goes before newer
+        // messages, and is not counted as unread
+        const latest = meta.forwarded ? await this.insertItem(chatId, item) : (await this.addItem(chatId, item), true);
+        if (chat && latest) chat.unread++;
         if (item.file?.status === 'rcvAccepted') {
           this.trackTransfer(item.file.id, chatId, item.id);
           this.startDownload(chatId, item.id, item.file.id);

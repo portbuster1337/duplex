@@ -5,7 +5,7 @@ import { useState } from 'preact/hooks';
 import type { Session } from '../app/session';
 import { profileName, type Contact } from '../app/chat';
 import { groupActive, groupName, memberGone, memberName, type Group, type GroupMember } from '../app/groups';
-import { roleRank, type GroupMemberRole } from '../core/chat/groups';
+import { groupPrefOn, roleRank, type GroupMemberRole } from '../core/chat/groups';
 import type { Profile } from '../core/chat/protocol';
 import { Avatar, resizeImage } from './util';
 import { errorText, Modal, Spinner, toast, Toggle } from './components';
@@ -131,6 +131,14 @@ export function GroupInfo({ session, group, onClose, onDeleted }: { session: Ses
       </div>
       {owner && panel !== 'edit' && <button onClick={() => setPanel('edit')}>Edit group profile</button>}
       {panel === 'edit' && <EditGroup session={session} g={g} onDone={() => setPanel(undefined)} />}
+      {owner && (
+        <Toggle
+          checked={groupPrefOn(g.profile, 'history')}
+          onChange={(v) => run(() => chat.groups.updateProfile(g.id, { groupPreferences: { ...g.profile.groupPreferences, history: { enable: v ? 'on' : 'off' } } }))}
+          label="Visible history"
+          hint="New members get the last 100 messages from the member who adds them."
+        />
+      )}
       <label>
         Local name (only you see it)
         <input value={alias} onInput={(e) => setAlias((e.target as HTMLInputElement).value)} onBlur={() => chat.groups.updateLocal(g.id, { localAlias: alias.trim() || undefined })} placeholder={g.profile.displayName} />
