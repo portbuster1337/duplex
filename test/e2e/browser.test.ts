@@ -459,6 +459,40 @@ test('a video call with the official CLI, whose media run in the call page of th
   }
 });
 
+test('themes and icon packs, kept after a reload and on the lock screen', async () => {
+  const theme = () => page.evaluate(() => document.documentElement.dataset.theme);
+  const iconBox = () => page.locator('.chat-head svg.icon').first().getAttribute('viewBox');
+  await openPeer();
+  assert.equal(await iconBox(), '0 0 24 24');
+  await page.getByTitle('Settings').first().click();
+  await page.getByRole('tab', { name: 'Appearance' }).click();
+  await page.locator('.theme-card', { hasText: /^SimpleX/ }).click();
+  assert.equal(await theme(), 'simplex');
+  await page.getByRole('radio', { name: 'Purple' }).click();
+  assert.equal(await page.evaluate(() => document.documentElement.dataset.accent), 'purple');
+  await page.locator('.pack-card', { hasText: /^PhosphorMIT/ }).click();
+  await page.keyboard.press('Escape');
+  // Phosphor draws on a 256 grid
+  await page.waitForFunction(() => document.querySelector('.chat-head svg.icon')?.getAttribute('viewBox') === '0 0 256 256', null, { timeout: 10000 });
+  await shot('17-theme-simplex');
+  await page.reload();
+  await page.locator('input[type=password]').waitFor({ timeout: 30000 });
+  assert.equal(await theme(), 'simplex');
+  await page.locator('input[type=password]').fill('a long test passphrase');
+  await page.getByText('Unlock', { exact: true }).click();
+  await openPeer();
+  assert.equal(await iconBox(), '0 0 256 256');
+  // back to the defaults
+  await page.getByTitle('Settings').first().click();
+  await page.getByRole('tab', { name: 'Appearance' }).click();
+  await page.locator('.theme-card', { hasText: /^System/ }).click();
+  await page.getByRole('radio', { name: 'Theme colour' }).click();
+  await page.locator('.pack-card', { hasText: /^LucideISC/ }).click();
+  await page.keyboard.press('Escape');
+  assert.equal(await iconBox(), '0 0 24 24');
+  assert.equal(await theme(), 'light');
+});
+
 test('another tab can take over, and this one disconnects', async () => {
   const page2 = await page.context().newPage();
   await page2.goto(APP);

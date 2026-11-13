@@ -1,6 +1,6 @@
 // Settings: profile, privacy, network, security, about.
 import type { JSX } from 'preact';
-import { useState } from 'preact/hooks';
+import { useEffect, useState } from 'preact/hooks';
 import { defaultRelays, effectiveRelays, relayName, testRelay, type AppSettings, type Session } from '../app/session';
 import { parseServer } from '../core/smp/server';
 import { DEFAULT_SMP_SERVERS, DEFAULT_XFTP_SERVERS } from '../core/agent/presets';
@@ -13,8 +13,10 @@ import { SMP_VERSIONS } from '../core/smp/protocol';
 import { Avatar, resizeImage } from './util';
 import { errorText, Modal, Spinner, toast, Toggle } from './components';
 import { DEFAULT_ICE_SERVERS, iceServerString, parseIceServer } from './webrtc';
+import { ACCENTS, appearance, ICON_PACKS, loadedIconPacks, loadIconPack, onAppearance, setAppearance, shownTheme, THEMES, type Appearance, type DarkThemeId, type ThemeId } from './appearance';
+import { Icon, PackIcon, type IconName } from './icons';
 
-type Tab = 'profile' | 'privacy' | 'network' | 'security' | 'about';
+type Tab = 'profile' | 'appearance' | 'privacy' | 'network' | 'security' | 'about';
 
 declare const __APP_VERSION__: string;
 
@@ -22,6 +24,7 @@ export function Settings({ session, onClose, onLock, onWiped }: { session: Sessi
   const [tab, setTab] = useState<Tab>('profile');
   const tabs: Array<[Tab, string]> = [
     ['profile', 'Profile'],
+    ['appearance', 'Appearance'],
     ['privacy', 'Privacy'],
     ['network', 'Network'],
     ['security', 'Security'],
@@ -37,6 +40,7 @@ export function Settings({ session, onClose, onLock, onWiped }: { session: Sessi
         ))}
       </div>
       {tab === 'profile' && <ProfileTab session={session} />}
+      {tab === 'appearance' && <AppearanceTab />}
       {tab === 'privacy' && <PrivacyTab session={session} />}
       {tab === 'network' && <NetworkTab session={session} />}
       {tab === 'security' && <SecurityTab session={session} onLock={onLock} onWiped={onWiped} />}
@@ -99,6 +103,115 @@ function ProfileTab({ session }: { session: Session }): JSX.Element {
       <button class="primary" disabled={busy} onClick={save}>
         {busy ? <Spinner label="Saving…" /> : 'Save profile'}
       </button>
+    </div>
+  );
+}
+
+function ThemePreview({ theme }: { theme: ThemeId }): JSX.Element {
+  return (
+    <span class="theme-preview" data-theme={theme}>
+      <span class="tp-list">
+        <i />
+        <i />
+        <i />
+      </span>
+      <span class="tp-chat">
+        <i class="tp-rcv" />
+        <i class="tp-snd" />
+        <i class="tp-accent" />
+      </span>
+    </span>
+  );
+}
+
+const SAMPLE_ICONS: IconName[] = ['send', 'phone', 'video', 'users', 'lock', 'smile', 'paperclip', 'settings'];
+
+function AppearanceTab(): JSX.Element {
+  const [a, setA] = useState(appearance);
+  const [packs, setPacks] = useState(loadedIconPacks);
+  useEffect(() => onAppearance(() => setA(appearance)), []);
+  // the previews of all packs
+  useEffect(() => {
+    let live = true;
+    for (const p of ICON_PACKS) {
+      loadIconPack(p.id)
+        .then((pack) => live && setPacks((s) => ({ ...s, [p.id]: pack })))
+        .catch(() => {});
+    }
+    return () => {
+      live = false;
+    };
+  }, []);
+  const upd = (patch: Partial<Appearance>) => setAppearance(patch).catch((e) => toast(errorText(e), 'error'));
+  const shown = shownTheme(a);
+  const scheme = THEMES.find((t) => t.id === shown)?.dark ? 'dark' : 'light';
+  return (
+    <div class="form appearance">
+      <h3>Theme</h3>
+      <div class="theme-grid" role="radiogroup" aria-label="Theme">
+        {[{ id: 'system' as const, name: 'System', note: 'light or dark, as your device is' }, ...THEMES].map((t) => (
+          <button role="radio" aria-checked={a.theme === t.id} class={`theme-card ${a.theme === t.id ? 'on' : ''}`} onClick={() => upd({ theme: t.id })}>
+            {t.id === 'system' ? (
+              <span class="theme-split">
+                <ThemePreview theme="light" />
+                <ThemePreview theme={a.dark} />
+              </span>
+            ) : (
+              <ThemePreview theme={t.id} />
+            )}
+            <span class="theme-name">{t.name}</span>
+            {t.note && <span class="hint">{t.note}</span>}
+          </button>
+        ))}
+      </div>
+      {a.theme === 'system' && (
+        <label>
+          Dark theme, when your device is dark
+          <select value={a.dark} onChange={(e) => upd({ dark: (e.target as HTMLSelectElement).value as DarkThemeId })}>
+            {THEMES.filter((t) => t.dark).map((t) => (
+              <option value={t.id}>{t.name}</option>
+            ))}
+          </select>
+        </label>
+      )}
+      <h3>Accent colour</h3>
+      <div class="swatches" role="radiogroup" aria-label="Accent colour">
+        {ACCENTS.map((c) => (
+          <button
+            role="radio"
+            aria-checked={a.accent === c.id}
+            aria-label={c.name}
+            title={c.name}
+            class={`swatch ${a.accent === c.id ? 'on' : ''}`}
+            data-scheme={scheme}
+            data-accent={c.id === 'theme' ? undefined : c.id}
+            data-theme={c.id === 'theme' ? shown : undefined}
+            onClick={() => upd({ accent: c.id })}
+          >
+            {a.accent === c.id && <Icon name="check" size={16} />}
+          </button>
+        ))}
+      </div>
+      <h3>Icons</h3>
+      <div class="pack-grid" role="radiogroup" aria-label="Icons">
+        {ICON_PACKS.map((p) => {
+          const pack = packs[p.id];
+          return (
+            <button role="radio" aria-checked={a.icons === p.id} class={`pack-card ${a.icons === p.id ? 'on' : ''}`} disabled={!pack} onClick={() => upd({ icons: p.id })}>
+              <span class="pack-icons">{pack ? SAMPLE_ICONS.map((n) => <PackIcon pack={pack} name={n} size={20} />) : <Spinner />}</span>
+              <span class="theme-name">{p.name}</span>
+              <span class="hint">{p.license}</span>
+            </button>
+          );
+        })}
+      </div>
+      <p class="hint">
+        These are kept in this browser outside your encrypted data, so that the lock screen uses them too. The icons come from open-source packs, included in Duplex (nothing is loaded from other sites):{' '}
+        <a href="./icon-licenses.txt" target="_blank" rel="noopener noreferrer">
+          their licenses
+        </a>
+        .
+      </p>
     </div>
   );
 }

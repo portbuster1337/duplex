@@ -5,6 +5,8 @@ import { Session } from '../app/session';
 import { Setup, Unlock } from './onboarding';
 import { Main } from './layout';
 import { Spinner, Toasts } from './components';
+import { iconPack, onAppearance, resetAppearance } from './appearance';
+import { IconContext } from './icons';
 
 type Phase = { p: 'loading' } | { p: 'otherTab' } | { p: 'setup' } | { p: 'locked' } | { p: 'ready'; session: Session };
 
@@ -39,8 +41,15 @@ function acquireTabLock(steal = false): Promise<boolean> {
 
 export function App(): JSX.Element {
   const [phase, setPhase] = useState<Phase>({ p: 'loading' });
+  const [pack, setPack] = useState(iconPack);
   const phaseRef = useRef(phase);
   phaseRef.current = phase;
+  useEffect(() => onAppearance(() => setPack(iconPack)), []);
+  // all data deleted: the appearance too
+  const wiped = () => {
+    resetAppearance();
+    setPhase({ p: 'setup' });
+  };
 
   const init = async (steal = false) => {
     let ok = await acquireTabLock(steal);
@@ -101,7 +110,7 @@ export function App(): JSX.Element {
       body = <Setup onReady={(session) => setPhase({ p: 'ready', session })} />;
       break;
     case 'locked':
-      body = <Unlock onReady={(session) => setPhase({ p: 'ready', session })} onWiped={() => setPhase({ p: 'setup' })} />;
+      body = <Unlock onReady={(session) => setPhase({ p: 'ready', session })} onWiped={wiped} />;
       break;
     case 'ready':
       body = (
@@ -111,15 +120,15 @@ export function App(): JSX.Element {
             await phase.session.lock();
             setPhase({ p: 'locked' });
           }}
-          onWiped={() => setPhase({ p: 'setup' })}
+          onWiped={wiped}
         />
       );
       break;
   }
   return (
-    <>
+    <IconContext.Provider value={pack}>
       {body}
       <Toasts />
-    </>
+    </IconContext.Provider>
   );
 }
