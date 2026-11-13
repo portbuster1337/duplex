@@ -12,7 +12,7 @@ import { parseServer, serverString } from '../../src/core/smp/server';
 import { sha256 } from '../../src/core/crypto/crypto';
 import { b64url, fromB64, toHex, utf8 } from '../../src/core/util/bytes';
 import { Decoder, Encoder, pad, unPad } from '../../src/core/util/encoding';
-import { compressedBatch, compressToLimit, encodeChatMessage, MAX_DECOMPRESSED_LENGTH, newSharedMsgId, parseChatMessages, xMsgNew, zstdContentSize } from '../../src/core/chat/protocol';
+import { compressedBatch as chatBatch, compressToLimit, encodeChatMessage, MAX_DECOMPRESSED_LENGTH, newSharedMsgId, parseChatMessages, xMsgNew, zstdContentSize } from '../../src/core/chat/protocol';
 import { zstdCompress } from '../../src/core/util/zstd';
 import { decompress } from 'fzstd';
 import { MemoryBackend, Vault, VaultLockedError, WrongPassphraseError } from '../../src/app/vault';
@@ -230,5 +230,5 @@ test('compressed chat messages for the smaller limits of post-quantum connection
   assert.equal(parsed[0].msg?.params.content.text, 'a long text with words '.repeat(700));
   // short bodies are not compressed
   assert.deepEqual(compressToLimit(100, utf8('{}')), utf8('{}'));
-  assert.equal(parseChatMessages(compressedBatch(utf8('{"event":"x.ok","params":{}}')))[0].msg?.event, 'x.ok');
+  assert.equal(parseChatMessages(chatBatch(utf8('{"event":"x.ok","params":{}}')))[0].msg?.event, 'x.ok');
 });
