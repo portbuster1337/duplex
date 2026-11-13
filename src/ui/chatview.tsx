@@ -4,10 +4,10 @@ import type { JSX } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { Session } from '../app/session';
 import { contentText, itemText, profileName, TTL_CHOICES, ttlText, type ChatItem, type Contact } from '../app/chat';
-import { groupName, memberName, type Group } from '../app/groups';
+import { groupName, isModerator, memberGone, memberName, supportChatId, type Group } from '../app/groups';
 import { groupPrefOn } from '../core/chat/groups';
 import type { Profile } from '../core/chat/protocol';
-import { GroupInfo } from './groups';
+import { GroupInfo, ReviewButtons } from './groups';
 import { startCall } from './callview';
 import { supportsCalls } from './webrtc';
 import { hasContent } from '../app/files';
@@ -31,7 +31,10 @@ export function ChatView({ session, chatId, onBack, onDeleted, onOpen }: { sessi
   const chat = session.chat;
   useChatUpdates(session);
   const contact = chat.contact(chatId);
-  const group = chat.group(chatId);
+  // a group chat, or the chat of a member with the moderators of the group
+  const support = chat.supportChat(chatId);
+  const group = chat.group(chatId) ?? support?.g;
+  const supportMember = support && group && support.memberId !== group.memberId ? group.members[support.memberId] : undefined;
   const [items, setItems] = useState<ChatItem[]>([]);
   const [limit, setLimit] = useState(PAGE);
   const [text, setText] = useState('');
@@ -210,7 +213,7 @@ export function ChatView({ session, chatId, onBack, onDeleted, onOpen }: { sessi
 
   if (!contact && !group) return <div class="placeholder" />;
   const shownItems = items.filter((i) => visibleItem(i, group)).slice(-limit);
-  const groupBlock = group ? chat.groups.canSend(group) : undefined;
+  const groupBlock = group ? (support ? chat.groups.canSendSupport(group, support.memberId) : chat.groups.canSend(group)) : undefined;
   const canSend = contact ? contact.status === 'active' : !groupBlock;
   const allowsFiles = contact ? chat.peerAllowsFiles(contact) : groupPrefOn(group!.profile, 'files');
   const allowsVoice = contact ? chat.peerAllowsVoice(contact) : groupPrefOn(group!.profile, 'voice');
@@ -221,10 +224,11 @@ export function ChatView({ session, chatId, onBack, onDeleted, onOpen }: { sessi
     if (!canAttach) return toast(canSend ? noFiles : contact ? 'The contact is not connected' : groupBlock!, 'error');
     addFiles(files);
   };
-  const name = contact ? contact.localAlias || profileName(contact.profile) : groupName(group);
+  const name = contact ? contact.localAlias || profileName(contact.profile) : support ? (supportMember ? memberName(supportMember) : 'Chat with the moderators') : groupName(group);
   const ttl = contact ? chat.disappearingTtl(contact) : chat.groupTtl(group!);
   const verified = contact ? chat.isVerified(contact) : false;
-  const members = group ? chat.groups.currentMembers(group).filter((m) => m.status === 'connected').length : 0;
+  const members = group ? chat.groups.activeMembers(group).filter((m) => m.status === 'connected').length : 0;
+  const waiting = group && !support && isModerator(group.role) && group.status === 'active' ? chat.groups.reviewMembers(group) : [];
   const sub = contact
     ? contact.status === 'active'
       ? [contact.incognito ? `incognito as ${contact.incognito.displayName}` : contact.profile.fullName || 'end-to-end encrypted', ttl ? `disappearing after ${ttlText(ttl)}` : ''].filter(Boolean).join(' · ')
@@ -233,7 +237,9 @@ export function ChatView({ session, chatId, onBack, onDeleted, onOpen }: { sessi
         : contact.status === 'requested'
           ? 'waiting for the contact to accept'
           : 'connecting…'
-    : groupStatusText(group!, members, ttl);
+    : support
+      ? `${groupName(group)} · ${supportMember?.review ? 'wants to join, waiting for review' : supportMember ? 'only this member and the moderators see this chat' : 'only you and the moderators see this chat'}`
+      : groupStatusText(group!, members, ttl);
   const placeholder = canSend
     ? ttl
       ? `Message (disappears after ${ttlText(ttl)})`
@@ -264,11 +270,11 @@ export function ChatView({ session, chatId, onBack, onDeleted, onOpen }: { sessi
       }}
     >
       <header class="chat-head">
-        <button class="icon-btn back" onClick={onBack} aria-label="Back">
+        <button class="icon-btn back" onClick={support ? () => onOpen?.(group!.id) : onBack} aria-label="Back">
           <Icon name="back" />
         </button>
         <button class="chat-title" onClick={() => setInfo(true)}>
-          <Avatar profile={contact ? contact.profile : (group!.profile as Profile)} size={36} />
+          <Avatar profile={contact ? contact.profile : supportMember ? supportMember.profile : (group!.profile as Profile)} size={36} />
           <span>
             <span class="chat-name">
               {name}
@@ -277,6 +283,7 @@ export function ChatView({ session, chatId, onBack, onDeleted, onOpen }: { sessi
             <span class="chat-sub">{sub}</span>
           </span>
         </button>
+        {supportMember?.review && !memberGone(supportMember) && isModerator(group!.role) && <ReviewButtons session={session} g={group!} m={supportMember} />}
         {contact && session.settings.calls !== false && chat.calls.allowed(contact) && supportsCalls() && (
           <>
             <button class="icon-btn" disabled={!!chat.calls.active} onClick={() => startCall(session, contact.id, 'audio')} aria-label="Audio call" title="Audio call">
@@ -291,6 +298,24 @@ export function ChatView({ session, chatId, onBack, onDeleted, onOpen }: { sessi
           <Icon name="info" />
         </button>
       </header>
+      {group && !support && group.status === 'pending' && (
+        <div class="chat-banner">
+          <span>The moderators review new members. Until they accept you, you can chat with them.</span>
+          <button class="small primary" onClick={() => onOpen?.(supportChatId(group.id, group.memberId))}>
+            Chat with the moderators
+          </button>
+        </div>
+      )}
+      {waiting.length > 0 && (
+        <div class="chat-banner">
+          <span>
+            {waiting.length === 1 ? `${memberName(waiting[0])} wants` : `${waiting.length} people want`} to join the group.
+          </span>
+          <button class="small primary" onClick={() => setInfo(true)}>
+            Review
+          </button>
+        </div>
+      )}
       <div class="messages" ref={listRef} onScroll={onScroll}>
         {items.length > limit && (
           <button class="load-more" onClick={() => setLimit((l) => l + PAGE)}>
@@ -465,7 +490,18 @@ export function ChatView({ session, chatId, onBack, onDeleted, onOpen }: { sessi
         />
       )}
       {info && contact && <ContactInfo session={session} contact={contact} onClose={() => setInfo(false)} onDeleted={onDeleted} />}
-      {info && group && <GroupInfo session={session} group={group} onClose={() => setInfo(false)} onDeleted={onDeleted} />}
+      {info && group && (
+        <GroupInfo
+          session={session}
+          group={group}
+          onClose={() => setInfo(false)}
+          onDeleted={onDeleted}
+          onOpenChat={(id) => {
+            setInfo(false);
+            onOpen?.(id);
+          }}
+        />
+      )}
       {openLink && <OpenLink session={session} link={openLink} onClose={() => setOpenLink(undefined)} onOpen={onOpen} />}
     </div>
   );

@@ -385,6 +385,36 @@ test('the browser creates a group, adds the CLI user and makes a group link', as
   await shot('14-group-chat');
 });
 
+test('the browser reviews who joins its group link, and chats with them first', async () => {
+  await page.getByLabel('New chat').first().click();
+  await page.getByRole('button', { name: /^Create a group/ }).click();
+  await page.getByLabel('Group name').fill('reviewed');
+  await page.getByRole('button', { name: 'Create group' }).click();
+  await page.locator('.chat-head .chat-name', { hasText: 'reviewed' }).waitFor({ timeout: 30000 });
+  await page.getByLabel('Group info').click();
+  await page.locator('.toggle-row', { hasText: 'Review new members' }).locator('input').check();
+  await page.getByRole('button', { name: 'Create group link' }).click();
+  const link = (await page.locator('.group-link .link-box .mono').textContent({ timeout: NET }))!.trim();
+  await page.getByLabel('Close').click();
+  await cli.cmd(`/c ${link}`);
+  // the page says who waits, and the moderators chat with them before accepting
+  await page.locator('.chat-banner', { hasText: `${PEER} wants to join` }).waitFor({ timeout: NET });
+  await page.locator('.chat-banner').getByRole('button', { name: 'Review' }).click();
+  await page.locator('.member', { hasText: PEER }).getByRole('button', { name: 'Chat' }).click();
+  await page.locator('.chat-head .chat-sub', { hasText: 'waiting for review' }).waitFor({ timeout: 30000 });
+  await page.locator('.composer textarea').fill('Hi! Why would you like to join?');
+  await page.keyboard.press('Enter');
+  const q = await cli.waitType('newChatItems', NET, (e) => e.chatItems?.[0]?.chatItem?.content?.msgContent?.text === 'Hi! Why would you like to join?');
+  assert.ok(q.chatItems[0].chatInfo.groupChatScope, 'in the chat with the moderators');
+  const gid = q.chatItems[0].chatInfo.groupInfo.groupId;
+  await cli.cmd(`/_send #${gid}(_support) text I read about it`);
+  await page.locator('.msg.rcv', { hasText: 'I read about it' }).waitFor({ timeout: NET });
+  await shot('18-member-review');
+  await page.locator('.chat-head').getByRole('button', { name: 'Accept' }).click();
+  await cli.waitType('userJoinedGroup', NET, (e) => e.groupInfo?.groupProfile?.displayName === 'reviewed');
+  await page.locator('.chat-head .chat-sub', { hasText: 'only this member and the moderators' }).waitFor({ timeout: 30000 });
+});
+
 /** serves a directory on 127.0.0.1 (a secure context for getUserMedia) */
 function serveDir(dir: string): Promise<{ url: string; close: () => void }> {
   const types: Record<string, string> = { '.html': 'text/html', '.js': 'text/javascript' };

@@ -61,9 +61,9 @@ import {
 } from './files';
 import { ItemStore, VaultAgentStore } from './store';
 import { ChatError, FileApprovalError, localId, profileName, randomIndex } from './common';
-import { GroupManager, type Group, type GroupMember } from './groups';
+import { GroupManager, parseSupportChatId, type Group, type GroupMember } from './groups';
 import { CallManager } from './calls';
-import { contentAllowedInGroup, groupLinkIdOf, groupPrefOn, normMemberId, roleRank, type GroupProfile } from '../core/chat/groups';
+import { contentAllowedInGroup, groupLinkIdOf, groupPrefOn, memberScope, normMemberId, roleRank, type GroupProfile } from '../core/chat/groups';
 import type { Vault } from './vault';
 
 export { ChatError, FileApprovalError, profileName };
@@ -190,6 +190,8 @@ export interface ChatTarget {
   chatId: string;
   group?: Group;
   sender?: GroupMember;
+  /** in the chat of this member with the moderators of the group */
+  support?: string;
 }
 
 export type ChatEvent =
@@ -633,6 +635,15 @@ export class ChatClient {
 
   /** sends to a contact, or to the members of a group */
   private async sendToChat(chatId: string, m: ChatMessage): Promise<void> {
+    const sc = this.supportChat(chatId);
+    if (sc) {
+      const err = this.groups.canSendSupport(sc.g, sc.memberId);
+      if (err) throw new ChatError(err);
+      // the events of messages carry their chat; file descriptions and cancellations follow their message
+      if (['x.msg.update', 'x.msg.del', 'x.msg.react'].includes(m.event)) m.params.scope = memberScope(sc.memberId);
+      await this.groups.sendSupport(sc.g, sc.memberId, m);
+      return;
+    }
     const g = this.state.groups?.[chatId];
     if (!g) {
       await this.send(this.activeContact(chatId), m);
@@ -649,6 +660,18 @@ export class ChatClient {
 
   group(id: string): Group | undefined {
     return this.state.groups?.[id];
+  }
+
+  /** the chat of a member with the moderators of a group, by its ID */
+  supportChat(chatId: string): { g: Group; memberId: string } | undefined {
+    const p = parseSupportChatId(chatId);
+    const g = p && this.state.groups?.[p.groupId];
+    return g ? { g, memberId: p.memberId } : undefined;
+  }
+
+  /** the group of a group chat, or of the chat of a member with its moderators */
+  groupOf(chatId: string): Group | undefined {
+    return this.state.groups?.[chatId] ?? this.supportChat(chatId)?.g;
   }
 
   /** the TTL of messages in a group: its disappearing messages preference */
@@ -706,14 +729,16 @@ export class ChatClient {
   }
 
   private async sendContent(contactId: string, content: MsgContent, quoteItemId?: string, file?: ChatFile): Promise<ChatItem> {
-    const g = this.state.groups?.[contactId];
+    const sc = this.supportChat(contactId);
+    const g = sc?.g ?? this.state.groups?.[contactId];
     const c = g ? undefined : this.activeContact(contactId);
     if (g) {
-      const err = this.groups.canSend(g) ?? contentAllowedInGroup(g.profile, content);
+      const err = (sc ? this.groups.canSendSupport(g, sc.memberId) : this.groups.canSend(g)) ?? contentAllowedInGroup(g.profile, content);
       if (err) throw new ChatError(err);
     }
     const sharedMsgId = newSharedMsgId();
     const mc: MsgContainer = { content };
+    if (sc) mc.scope = memberScope(sc.memberId);
     let quote: ChatItem['quote'];
     if (quoteItemId) {
       const q = (await this.chatItems(contactId)).find((i) => i.id === quoteItemId);
@@ -741,7 +766,7 @@ export class ChatClient {
     try {
       if (c) item.agentMsgId = await this.send(c, xMsgNew(sharedMsgId, mc));
       else {
-        await this.groups.send(g!, xMsgNew(sharedMsgId, mc));
+        await (sc ? this.groups.sendSupport(g!, sc.memberId, xMsgNew(sharedMsgId, mc)) : this.groups.send(g!, xMsgNew(sharedMsgId, mc)));
         item.status = 'sent';
       }
     } catch (e) {
@@ -755,7 +780,8 @@ export class ChatClient {
       }
     }
     await this.updateItem(contactId, item);
-    (c ?? g!).lastActivity = now;
+    if (sc) this.groups.touchSupport(g!, sc.memberId);
+    else (c ?? g!).lastActivity = now;
     await this.saveState();
     if (file && item.status !== 'error') this.startUpload(contactId, item.id, file.id);
     return item;
@@ -777,7 +803,7 @@ export class ChatClient {
     const i = items.findIndex((x) => x.id === itemId);
     if (i < 0) return;
     const item = items[i];
-    const g = this.state.groups?.[contactId];
+    const g = this.groupOf(contactId);
     // group moderators can delete the messages of other members for everyone
     if (forEveryone && g && item.dir === 'rcv' && item.sharedMsgId && item.memberId && !item.deleted && this.canModerate(g, item)) {
       await this.sendToChat(contactId, xMsgDel(newSharedMsgId(), item.sharedMsgId, item.memberId));
@@ -813,7 +839,7 @@ export class ChatClient {
   async react(contactId: string, itemId: string, emoji: string, add: boolean): Promise<void> {
     const item = (await this.chatItems(contactId)).find((i) => i.id === itemId);
     if (!item || !item.sharedMsgId) return;
-    const g = this.state.groups?.[contactId];
+    const g = this.groupOf(contactId);
     // in groups: whose message it is
     const author = g ? (item.dir === 'snd' ? g.memberId : item.memberId) : undefined;
     await this.sendToChat(contactId, xMsgReact(newSharedMsgId(), item.sharedMsgId, emoji, add, author));
@@ -825,7 +851,8 @@ export class ChatClient {
   }
 
   async markRead(contactId: string): Promise<void> {
-    const c = this.state.contacts[contactId] ?? this.state.groups?.[contactId];
+    const sc = this.supportChat(contactId);
+    const c = sc ? sc.g.support?.[sc.memberId] : (this.state.contacts[contactId] ?? this.state.groups?.[contactId]);
     if (!c) return;
     const items = await this.chatItems(contactId);
     let changed = -1;
@@ -1574,7 +1601,9 @@ export class ChatClient {
         // forwarded by an admin, with the time it was sent: the history of the group goes before newer
         // messages, and is not counted as unread
         const latest = meta.forwarded ? await this.insertItem(chatId, item) : (await this.addItem(chatId, item), true);
-        if (chat && latest) chat.unread++;
+        if (g && t.support) {
+          if (latest) this.groups.touchSupport(g, t.support, 1);
+        } else if (chat && latest) chat.unread++;
         if (item.file?.status === 'rcvAccepted') {
           this.trackTransfer(item.file.id, chatId, item.id);
           this.startDownload(chatId, item.id, item.file.id);

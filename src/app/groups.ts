@@ -3,22 +3,28 @@
 // forwards messages between members that are not connected to each other yet (x.grp.msg.forward).
 import type { AgentEvent, MsgResult, ResolvedLink } from '../core/agent/agent';
 import {
+  ACCEPTED_TO_GROUP_MESSAGE,
   DEFAULT_GROUP_PREFERENCES,
   fwdMemberName,
+  GROUP_KNOCKING_VERSION,
   groupLinkClientData,
   groupPrefOn,
   groupShortLinkData,
   isForwardedGroupMsg,
   memberInfo,
+  memberScope,
   newGroupLinkId,
   newMemberId,
   normMemberId,
+  PENDING_REVIEW_MESSAGE,
   roleRank,
+  scopeMemberId,
   xGrpAcpt,
   xGrpDel,
   xGrpInfo,
   xGrpInv,
   xGrpLeave,
+  xGrpLinkAcpt,
   xGrpLinkInv,
   xGrpLinkMem,
   xGrpMemCon,
@@ -78,6 +84,13 @@ export interface GroupMember {
   viaLink?: boolean;
   /** joined via our group link, and the app showed the welcome message from the link already */
   welcomeMsgId?: string;
+  /**
+   * joined via a group link that needs a review: until a moderator accepts the member, it is
+   * connected only to the moderators, and chats only with them
+   */
+  review?: boolean;
+  /** when the member was accepted after a review */
+  acceptedAt?: number;
   blocked?: boolean;
   /** messages kept until the connection is ready (base64) */
   pending?: string[];
@@ -104,6 +117,8 @@ export interface Group {
   intros?: Record<string, 'sent' | 'forwarded' | 'connected'>;
   /** as an admin: how many recent messages we send to new members (the apps send 100); 0 for all */
   historySize?: number;
+  /** the chats of members with the moderators (by the member's ID; ours, as a member) */
+  support?: Record<string, { unread: number; lastActivity: number }>;
   link?: { connId: string; link: string; groupLinkId: string; role: GroupMemberRole };
   createdAt: number;
   lastActivity: number;
@@ -123,6 +138,16 @@ export const memberGone = (m: GroupMember): boolean => m.status === 'left' || m.
 export const memberName = (m?: GroupMember): string => profileName(m?.profile);
 export const groupName = (g?: Group): string => g?.localAlias || g?.profile.displayName?.trim() || 'group';
 export const groupActive = (g: Group): boolean => g.status === 'active' || g.status === 'connecting' || g.status === 'pending';
+export const isModerator = (role: GroupMemberRole | undefined): boolean => roleRank(role) >= roleRank('moderator');
+/** new members who join via the group link wait for the review of a moderator */
+export const reviewsMembers = (g: Group): boolean => g.profile.memberAdmission?.review === 'all';
+
+/** the chat of a member with the moderators of a group: its ID */
+export const supportChatId = (groupId: string, memberId: string): string => `${groupId}#${memberId}`;
+export function parseSupportChatId(id: string): { groupId: string; memberId: string } | undefined {
+  const i = id.indexOf('#');
+  return i > 0 ? { groupId: id.slice(0, i), memberId: id.slice(i + 1) } : undefined;
+}
 
 function parseVRSafe(s: unknown): VersionRange | undefined {
   if (typeof s !== 'string') return undefined;
@@ -199,11 +224,35 @@ export class GroupManager {
     return this.members(g).filter((m) => !memberGone(m));
   }
 
+  /** the members who take part in the group: not those waiting for a review */
+  activeMembers(g: Group): GroupMember[] {
+    return this.currentMembers(g).filter((m) => !m.review);
+  }
+
+  /** the members of the chat of a member with the moderators: that member, and the moderators */
+  supportMembers(g: Group, memberId: string): GroupMember[] {
+    return this.currentMembers(g).filter((m) => m.memberId === memberId || (isModerator(m.role) && !m.review));
+  }
+
+  /** the members waiting for a review */
+  reviewMembers(g: Group): GroupMember[] {
+    return this.currentMembers(g).filter((m) => m.review);
+  }
+
   canSend(g: Group): string | undefined {
     if (g.status === 'pending') return 'the group admins have not accepted you yet';
     if (g.status !== 'active' && g.status !== 'connecting') return g.status === 'invited' ? 'join the group first' : 'you are not a member of this group';
     if (roleRank(g.role) < roleRank('author')) return 'observers cannot send messages';
     return undefined;
+  }
+
+  /** a member chats with the moderators also while waiting to be accepted; moderators chat with any member */
+  canSendSupport(g: Group, memberId: string): string | undefined {
+    if (!groupActive(g)) return 'you are not a member of this group';
+    if (memberId === g.memberId) return isModerator(g.role) ? 'this chat is for members' : undefined;
+    if (g.status !== 'active' || !isModerator(g.role)) return 'only moderators chat with members';
+    const m = g.members[memberId];
+    return !m || memberGone(m) ? 'the member left the group' : undefined;
   }
 
   private infoOf(m: GroupMember): MemberInfo {
@@ -217,6 +266,19 @@ export class GroupManager {
 
   private event(g: Group, text: string, memberId?: string): Promise<void> {
     return this.chat.addEvent(g.id, text, memberId);
+  }
+
+  /** the chat of a member with the moderators: listed from its first message or event */
+  touchSupport(g: Group, memberId: string, unread = 0): void {
+    const s = ((g.support ??= {})[memberId] ??= { unread: 0, lastActivity: 0 });
+    s.lastActivity = Date.now();
+    s.unread += unread;
+  }
+
+  /** an event in the chat of a member with the moderators */
+  private async supportEvent(g: Group, memberId: string, text: string): Promise<void> {
+    this.touchSupport(g, memberId);
+    await this.chat.addEvent(supportChatId(g.id, memberId), text, memberId);
   }
 
   // ---- sending
@@ -268,9 +330,18 @@ export class GroupManager {
 
   /** sends a message to the group; returns the number of members it was sent to or kept for */
   async send(g: Group, msg: ChatMessage, except?: string): Promise<number> {
+    return this.sendToMembers(g, this.members(g).filter((m) => !m.review), msg, except);
+  }
+
+  /** a message in the chat of a member with the moderators */
+  async sendSupport(g: Group, memberId: string, msg: ChatMessage): Promise<number> {
+    return this.sendToMembers(g, this.supportMembers(g, memberId), msg);
+  }
+
+  private async sendToMembers(g: Group, members: GroupMember[], msg: ChatMessage, except?: string): Promise<number> {
     let n = 0;
     let err: unknown;
-    for (const m of this.members(g)) {
+    for (const m of members) {
       if (m.memberId === except) continue;
       const a = this.sendAction(g, m, msg);
       if (a !== 'send' && a !== 'pending') continue;
@@ -489,6 +560,8 @@ export class GroupManager {
     }
     const m: GroupMember = { memberId: newMemberId(), role: g.link.role, profile: memberProfile(profile), category: 'invitee', status: 'accepted', invitedBy: g.memberId, viaLink: true, v: msg?.v, createdAt: Date.now() };
     if (typeof msg?.params.welcomeMsgId === 'string') m.welcomeMsgId = msg.params.welcomeMsgId;
+    // the member learns that it waits from the group profile, and from x.grp.link.acpt once connected
+    if (reviewsMembers(g)) m.review = true;
     const gli: GroupLinkInvitation = {
       fromMember: { memberId: g.memberId, memberRole: g.role },
       fromMemberName: this.ourProfile(g).displayName,
@@ -517,8 +590,10 @@ export class GroupManager {
   /** a new member is connected: it is announced to the members, and they are introduced to it */
   private async introduceToAll(g: Group, n: GroupMember): Promise<void> {
     g.intros ??= {};
-    for (const m of this.currentMembers(g)) {
+    for (const m of this.activeMembers(g)) {
       if (m.memberId === n.memberId || m.status !== 'connected' || !m.connId || m.memberId === HOST_PLACEHOLDER) continue;
+      // after a review: the moderators know the member already
+      if (g.intros[pairKey(n.memberId, m.memberId)]) continue;
       try {
         await this.sendTo(m, xGrpMemNew(this.infoOf(n), newSharedMsgId()));
         await this.sendTo(n, xGrpMemIntro(this.infoOf(m)));
@@ -528,6 +603,33 @@ export class GroupManager {
       }
     }
     await this.save(g);
+  }
+
+  /**
+   * a member who joined via a link that needs a review (introduceToModerators of the apps): it learns
+   * that it waits, and is introduced to the moderators only, to chat with them
+   */
+  private async introduceToModerators(g: Group, n: GroupMember): Promise<void> {
+    g.intros ??= {};
+    await this.sendTo(n, (n.v?.max ?? 0) >= GROUP_KNOCKING_VERSION ? xGrpLinkAcpt('pending_review', n.role, n.memberId) : xMsgNew(newSharedMsgId(), { content: { type: 'text', text: PENDING_REVIEW_MESSAGE } }));
+    for (const m of this.supportMembers(g, n.memberId)) {
+      if (m.memberId === n.memberId || m.status !== 'connected' || !m.connId || (m.v?.max ?? 0) < GROUP_KNOCKING_VERSION) continue;
+      try {
+        await this.sendTo(m, xGrpMemNew(this.infoOf(n), newSharedMsgId(), memberScope(n.memberId)));
+        await this.sendTo(n, xGrpMemIntro(this.infoOf(m)));
+        g.intros[pairKey(n.memberId, m.memberId)] = 'sent';
+      } catch (e) {
+        console.warn('introduction failed', e);
+      }
+    }
+    await this.save(g);
+  }
+
+  /** a member we added was accepted after its review: the others meet it, and it gets the history */
+  private async welcomeAccepted(g: Group, n: GroupMember): Promise<void> {
+    n.acceptedAt = Date.now();
+    await this.introduceToAll(g, n);
+    if (groupPrefOn(g.profile, 'history')) await this.sendHistory(g, n).catch((e) => console.warn('sending the history failed', e));
   }
 
   /**
@@ -541,7 +643,7 @@ export class GroupManager {
     if (!n.connId) return;
     const all = await this.chat.chatItems(g.id);
     const limit = g.historySize ?? HISTORY_ITEMS;
-    const recent = all.filter((it) => it.sharedMsgId && (it.dir === 'rcv' || (it.dir === 'snd' && it.status !== 'error' && it.ts < n.createdAt)) && !it.deleted && it.content?.type !== 'report');
+    const recent = all.filter((it) => it.sharedMsgId && (it.dir === 'rcv' || (it.dir === 'snd' && it.status !== 'error' && it.ts < (n.acceptedAt ?? n.createdAt))) && !it.deleted && it.content?.type !== 'report');
     const items = limit > 0 ? recent.slice(-limit) : recent;
     const bySharedId = new Map(all.map((it) => [it.sharedMsgId, it]));
     const msgs: ChatMessage[] = [];
@@ -582,10 +684,14 @@ export class GroupManager {
     for (const body of bodies) await this.deliver(n.connId, body, false, false);
   }
 
-  /** forwards a member's message to the members it is not connected to yet */
+  /**
+   * forwards a member's message to the members it is not connected to yet; a message in the chat of
+   * a member with the moderators only to them
+   */
   private async forward(g: Group, s: GroupMember, msg: ChatMessage, brokerTs: number): Promise<void> {
     if (roleRank(g.role) < roleRank('admin') || !g.intros || !isForwardedGroupMsg(msg)) return;
-    for (const m of this.currentMembers(g)) {
+    const scope = scopeMemberId(msg.params);
+    for (const m of scope ? this.supportMembers(g, scope) : this.activeMembers(g)) {
       if (m.memberId === s.memberId || m.status !== 'connected') continue;
       const st = g.intros[pairKey(s.memberId, m.memberId)];
       if (!st || st === 'connected') continue;
@@ -670,9 +776,10 @@ export class GroupManager {
     g.memberId = ourId;
     g.role = gli.invitedMember.memberRole;
     if (gli.groupProfile?.displayName) g.profile = gli.groupProfile;
-    g.status = gli.accepted === 'pending' || gli.accepted === 'pending_review' ? 'pending' : 'connecting';
+    // acceptanceToStatus of the apps: a group that reviews new members says so in its profile
+    g.status = gli.accepted === 'pending' || gli.accepted === 'pending_review' || reviewsMembers(g) ? 'pending' : 'connecting';
     await this.save(g);
-    if (g.status === 'pending') await this.event(g, 'please wait for the group admins to accept you');
+    if (g.status === 'pending') await this.event(g, reviewsMembers(g) ? 'the moderators of this group review new members: you can chat with them until they accept you' : 'please wait for the group admins to accept you');
     return { allow: this.chat.encodeInfo(xInfo(this.ourProfile(g)), false) };
   }
 
@@ -697,15 +804,17 @@ export class GroupManager {
         if (g.status === 'connecting') g.status = 'active';
         await this.save(g);
         await this.event(g, g.status === 'pending' ? `connected to ${memberName(m)} — waiting to be accepted` : 'you joined the group');
-        // the welcome message, from the admin who added us (as the apps show it); with the history of
-        // the group, the admin sends it after the history
-        if (g.profile.description?.trim() && !groupPrefOn(g.profile, 'history')) {
-          await this.chat.addItem(g.id, { id: localId(), dir: 'rcv', memberId: m.memberId, content: { type: 'text', text: g.profile.description }, ts: Date.now(), status: 'received' });
-        }
+        if (g.status !== 'pending') await this.localWelcome(g, m);
         return;
       case 'invitee':
-        await this.event(g, `${memberName(m)} joined`, m.memberId);
         if (m.viaLink) await this.sendTo(m, xGrpLinkMem(this.ourProfile(g), newSharedMsgId()));
+        if (m.review) {
+          await this.event(g, `${memberName(m)} wants to join: accept or reject them in the group info`, m.memberId);
+          await this.supportEvent(g, m.memberId, `${memberName(m)} wants to join the group`);
+          await this.introduceToModerators(g, m);
+          return;
+        }
+        await this.event(g, `${memberName(m)} joined`, m.memberId);
         await this.introduceToAll(g, m);
         if (groupPrefOn(g.profile, 'history')) await this.sendHistory(g, m).catch((e) => console.warn('sending the history failed', e));
         return;
@@ -759,6 +868,39 @@ export class GroupManager {
     await this.processEvent(g, s, msg, fwd.brokerTs || Date.now(), true);
   }
 
+  /**
+   * the chat of a content message: the group, or the chat of a member with the moderators (scope).
+   * Members waiting for a review write only there; file descriptions and cancellations have no scope,
+   * and go with the message of their file.
+   */
+  private async contentChat(g: Group, s: GroupMember, msg: ChatMessage): Promise<string | undefined> {
+    const scope = scopeMemberId(msg.params);
+    if (scope) {
+      // moderators have the chats of all members, members only their own
+      if (scope !== g.memberId && !isModerator(g.role)) return undefined;
+      // the member and the moderators write there
+      if (s.memberId !== scope && !isModerator(s.role)) return undefined;
+      this.touchSupport(g, scope);
+      return supportChatId(g.id, scope);
+    }
+    if (msg.event === 'x.msg.file.descr' || msg.event === 'x.file.cancel') {
+      const ref = msg.params.msgId;
+      const chats = [g.id, supportChatId(g.id, s.memberId), supportChatId(g.id, g.memberId), ...Object.keys(g.support ?? {}).map((id) => supportChatId(g.id, id))];
+      for (const id of chats) if ((await this.chat.chatItems(id)).some((i) => i.dir === 'rcv' && i.sharedMsgId === ref && i.memberId === s.memberId)) return id;
+      return g.id;
+    }
+    return s.review ? undefined : g.id;
+  }
+
+  /**
+   * the welcome message, from the admin who added us, as the apps show it (maybeCreateGroupDescrLocal);
+   * with the history of the group, the admin sends it after the history
+   */
+  private async localWelcome(g: Group, host: GroupMember): Promise<void> {
+    if (!g.profile.description?.trim() || groupPrefOn(g.profile, 'history')) return;
+    await this.chat.addItem(g.id, { id: localId(), dir: 'rcv', memberId: host.memberId, content: { type: 'text', text: g.profile.description }, ts: Date.now(), status: 'received' });
+  }
+
   /** may this member introduce or announce a member with this role (checkHostRole) */
   private canIntroduce(s: GroupMember, role: GroupMemberRole): boolean {
     return roleRank(s.role) >= roleRank('admin') && roleRank(s.role) >= roleRank(role);
@@ -772,10 +914,14 @@ export class GroupManager {
       case 'x.msg.del':
       case 'x.msg.react':
       case 'x.msg.file.descr':
-      case 'x.file.cancel':
+      case 'x.file.cancel': {
         if (s.blocked && msg.event === 'x.msg.new') return;
-        await this.chat.processContent({ chatId: g.id, group: g, sender: s }, msg, { brokerTs, forwarded });
+        const chatId = await this.contentChat(g, s, msg);
+        if (!chatId) return;
+        const support = chatId === g.id ? undefined : parseSupportChatId(chatId)!.memberId;
+        await this.chat.processContent({ chatId, group: g, sender: s, support }, msg, { brokerTs, forwarded });
         return;
+      }
       case 'x.info':
         if (p.profile) {
           s.profile = memberProfile(p.profile as Profile);
@@ -785,21 +931,51 @@ export class GroupManager {
       case 'x.grp.link.mem':
         if (s.memberId === g.hostMemberId && p.profile) s.profile = memberProfile(p.profile as Profile);
         return;
-      case 'x.grp.link.acpt':
-        if (s.memberId === g.hostMemberId && normMemberId(p.memberId) === g.memberId) {
-          if (typeof p.role === 'string') g.role = p.role;
-          if (g.status === 'pending') g.status = 'active';
+      case 'x.grp.link.acpt': {
+        // the admin who added us, or a moderator after a review (xGrpLinkAcpt of the apps)
+        const id = normMemberId(p.memberId);
+        const role = typeof p.role === 'string' ? (p.role as GroupMemberRole) : undefined;
+        if (!id || (s.memberId !== g.hostMemberId && !isModerator(s.role)) || (role && roleRank(role) > roleRank(s.role))) return;
+        if (id === g.memberId) {
+          if (p.acceptance === 'pending_review') {
+            if (g.status !== 'pending') {
+              g.status = 'pending';
+              await this.event(g, 'the moderators of this group review new members: you can chat with them until they accept you');
+            }
+            return;
+          }
+          if (p.acceptance !== 'accepted' || g.status !== 'pending') return;
+          if (role) g.role = role;
+          g.status = 'active';
           await this.event(g, `${memberName(s)} accepted you`, s.memberId);
+          const host = g.members[g.hostMemberId ?? ''];
+          if (host) await this.localWelcome(g, host);
+          if (g.support?.[g.memberId]) await this.supportEvent(g, g.memberId, `${memberName(s)} accepted you`);
+          return;
         }
+        // another moderator accepted a member waiting for a review
+        const t = g.members[id];
+        if (!t?.review || memberGone(t) || p.acceptance !== 'accepted') return;
+        t.review = false;
+        if (role) t.role = role;
+        await this.event(g, `${memberName(s)} accepted ${memberName(t)}`, s.memberId);
+        await this.supportEvent(g, t.memberId, `${memberName(s)} accepted ${memberName(t)}`);
+        if (t.category === 'invitee') await this.welcomeAccepted(g, t);
         return;
+      }
       case 'x.grp.mem.new': {
         const mi = p.memberInfo as MemberInfo | undefined;
         const id = normMemberId(mi?.memberId);
         if (!mi || !id || !mi.profile || id === g.memberId || !this.canIntroduce(s, mi.memberRole)) return;
         const ex = g.members[id];
         if (ex && ex.status !== 'unknown') return;
-        g.members[id] = { ...(ex ?? {}), memberId: id, role: mi.memberRole, profile: memberProfile(mi.profile), v: parseVRSafe(mi.v), category: 'post', status: 'announced', invitedBy: s.memberId, createdAt: ex?.createdAt ?? Date.now() };
-        await this.event(g, `${memberName(s)} added ${profileName(mi.profile)}`, s.memberId);
+        // to the moderators: a member who waits for their review
+        const review = scopeMemberId(p) === id;
+        g.members[id] = { ...(ex ?? {}), memberId: id, role: mi.memberRole, profile: memberProfile(mi.profile), v: parseVRSafe(mi.v), category: 'post', status: 'announced', invitedBy: s.memberId, createdAt: ex?.createdAt ?? Date.now(), ...(review ? { review: true } : {}) };
+        if (review) {
+          await this.event(g, `${profileName(mi.profile)} wants to join: accept or reject them in the group info`, id);
+          await this.supportEvent(g, id, `${profileName(mi.profile)} wants to join the group`);
+        } else await this.event(g, `${memberName(s)} added ${profileName(mi.profile)}`, s.memberId);
         return;
       }
       case 'x.grp.mem.intro': {
@@ -985,6 +1161,43 @@ export class GroupManager {
     void this.dropMember(m, 10000);
   }
 
+  /**
+   * a moderator accepts a member who joined via a link that needs a review (APIAcceptMember): the
+   * member and the moderators learn it, and the admin who added the member introduces it to the others
+   */
+  async acceptMember(groupId: string, memberId: string, role?: GroupMemberRole): Promise<void> {
+    const g = this.must(groupId);
+    const m = g.members[memberId];
+    if (g.status !== 'active' || !isModerator(g.role)) throw new ChatError('only moderators accept new members');
+    if (!m?.review || memberGone(m)) throw new ChatError('this member is not waiting for a review');
+    const r = role ?? m.role;
+    // as for roles: moderators accept members up to their own role
+    if (roleRank(r) > roleRank(g.role) || roleRank(r) < 0) throw new ChatError(`you cannot accept a member as ${r}`);
+    await this.sendSupport(g, memberId, xGrpLinkAcpt('accepted', r, memberId, newSharedMsgId()));
+    if ((m.v?.max ?? 0) < GROUP_KNOCKING_VERSION) await this.sendTo(m, xMsgNew(newSharedMsgId(), { content: { type: 'text', text: ACCEPTED_TO_GROUP_MESSAGE } })).catch(() => {});
+    m.review = false;
+    m.role = r;
+    await this.save(g);
+    await this.event(g, `you accepted ${memberName(m)}`, memberId);
+    await this.supportEvent(g, memberId, `you accepted ${memberName(m)}`);
+    if (m.category === 'invitee') await this.welcomeAccepted(g, m);
+  }
+
+  /** an admin rejects a member waiting for a review: only the member and the moderators know it */
+  async rejectMember(groupId: string, memberId: string): Promise<void> {
+    const g = this.must(groupId);
+    const m = g.members[memberId];
+    // as in the apps: moderators accept members, removing them takes an admin
+    if (g.status !== 'active' || roleRank(g.role) < roleRank('admin')) throw new ChatError('only admins reject new members');
+    if (!m?.review || memberGone(m)) return;
+    await this.sendSupport(g, memberId, xGrpMemDel(memberId, newSharedMsgId()));
+    m.status = 'removed';
+    await this.save(g);
+    await this.event(g, `you rejected ${memberName(m)}`, memberId);
+    await this.supportEvent(g, memberId, `you rejected ${memberName(m)}`);
+    void this.dropMember(m, 10000);
+  }
+
   async setRole(groupId: string, memberId: string, role: GroupMemberRole): Promise<void> {
     const g = this.must(groupId);
     this.assertAdmin(g);
@@ -997,7 +1210,7 @@ export class GroupManager {
     await this.event(g, `you changed the role of ${memberName(m)} to ${role}`, memberId);
   }
 
-  async updateProfile(groupId: string, patch: Partial<Pick<GroupProfile, 'displayName' | 'fullName' | 'description' | 'image' | 'groupPreferences'>>): Promise<void> {
+  async updateProfile(groupId: string, patch: Partial<Pick<GroupProfile, 'displayName' | 'fullName' | 'description' | 'image' | 'groupPreferences' | 'memberAdmission'>>): Promise<void> {
     const g = this.must(groupId);
     if (g.status !== 'active' || g.role !== 'owner') throw new ChatError('only group owners can change the group profile');
     const profile: GroupProfile = { ...g.profile, ...patch };
@@ -1022,6 +1235,7 @@ export class GroupManager {
     delete this.groups[g.id];
     await this.chat.saveState();
     await this.chat.deleteChatItems(g.id);
+    for (const id of Object.keys(g.support ?? {})) await this.chat.deleteChatItems(supportChatId(g.id, id));
     void this.dropConnections(g, 10000);
   }
 

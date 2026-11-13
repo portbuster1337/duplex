@@ -51,6 +51,7 @@ export interface GroupProfile {
   groupPreferences?: GroupPreferences;
   /** channels (relay-mediated groups) have this */
   publicGroup?: unknown;
+  /** review: 'all' — members who join via the group link wait until a moderator accepts them */
   memberAdmission?: { review?: string };
   [k: string]: unknown;
 }
@@ -144,7 +145,7 @@ export const xGrpInv = (groupInvitation: GroupInvitation, msgId?: string) => ev(
 export const xGrpAcpt = (memberId: string, profile?: Profile) => ev('x.grp.acpt', { memberId, ...(profile ? { profile } : {}) });
 export const xGrpLinkInv = (groupLinkInvitation: GroupLinkInvitation) => ev('x.grp.link.inv', { groupLinkInvitation });
 export const xGrpLinkMem = (profile: Profile, msgId?: string) => ev('x.grp.link.mem', { profile }, msgId);
-export const xGrpMemNew = (mi: MemberInfo, msgId?: string) => ev('x.grp.mem.new', { memberInfo: mi }, msgId);
+export const xGrpMemNew = (mi: MemberInfo, msgId?: string, scope?: MsgScope) => ev('x.grp.mem.new', { memberInfo: mi, ...(scope ? { scope } : {}) }, msgId);
 export const xGrpMemIntro = (mi: MemberInfo, msgId?: string) => ev('x.grp.mem.intro', { memberInfo: mi }, msgId);
 export const xGrpMemInv = (memberId: string, groupConnReq: string, msgId?: string) => ev('x.grp.mem.inv', { memberId, memberIntro: { groupConnReq } }, msgId);
 export const xGrpMemFwd = (mi: MemberInfo, groupConnReq: string, msgId?: string) => ev('x.grp.mem.fwd', { memberInfo: mi, memberIntro: { groupConnReq } }, msgId);
@@ -156,6 +157,30 @@ export const xGrpLeave = (msgId?: string) => ev('x.grp.leave', {}, msgId);
 export const xGrpDel = (msgId?: string) => ev('x.grp.del', {}, msgId);
 export const xGrpInfo = (groupProfile: GroupProfile, msgId?: string) => ev('x.grp.info', { groupProfile }, msgId);
 export const xGrpPrefs = (groupPreferences: GroupPreferences, msgId?: string) => ev('x.grp.prefs', { groupPreferences }, msgId);
+/** a member who joined via a link is accepted, or is to wait for the review of a moderator */
+export const xGrpLinkAcpt = (acceptance: GroupAcceptance, role: GroupMemberRole, memberId: string, msgId?: string) => ev('x.grp.link.acpt', { acceptance, role, memberId }, msgId);
+
+/**
+ * the chat of a member with the moderators of a group (the member support scope of the apps): admins
+ * use any member's ID, members their own
+ */
+export interface MsgScope {
+  type: 'member';
+  memberId: string;
+}
+
+export const memberScope = (memberId: string): MsgScope => ({ type: 'member', memberId });
+
+/** the member whose chat with the moderators a message is in */
+export function scopeMemberId(params: Record<string, unknown> | undefined): string | undefined {
+  const s = params?.scope as Partial<MsgScope> | undefined;
+  return s && typeof s === 'object' && s.type === 'member' ? normMemberId(s.memberId) : undefined;
+}
+
+/** the apps' messages for members of versions before knocking (groupKnockingVersion) */
+export const GROUP_KNOCKING_VERSION = 15;
+export const PENDING_REVIEW_MESSAGE = 'Please wait for group moderators to review your request to join the group.';
+export const ACCEPTED_TO_GROUP_MESSAGE = 'You are accepted to the group.';
 
 /** a message of another member, forwarded by an admin to members that are not connected to it yet */
 export function xGrpMsgForward(memberId: string, memberName: string, brokerTs: number, msg: ChatMessage): ChatMessage {

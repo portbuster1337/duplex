@@ -666,6 +666,13 @@ h3 {
   flex-shrink: 0;
 }
 
+.badge.attention {
+  margin-left: 4px;
+  background: var(--accent-soft);
+  color: var(--accent);
+  white-space: nowrap;
+}
+
 .empty-list {
   padding: 30px 20px;
   text-align: center;
@@ -1584,6 +1591,29 @@ button.quote:hover:not(:disabled) {
 
 button.small {
   padding: 5px 12px;
+}
+
+/* above the messages: a member waiting to be accepted, or members waiting for a review */
+.chat-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: 8px 12px;
+  padding: 8px 16px;
+  background: var(--accent-soft);
+  border-bottom: 1px solid var(--border);
+  font-size: 13.5px;
+}
+
+.review-buttons {
+  display: inline-flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.chat-head .review-buttons {
+  margin-right: 4px;
 }
 
 .chat.dragging .messages {

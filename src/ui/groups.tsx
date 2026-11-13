@@ -4,7 +4,7 @@ import type { JSX } from 'preact';
 import { useState } from 'preact/hooks';
 import type { Session } from '../app/session';
 import { profileName, type Contact } from '../app/chat';
-import { groupActive, groupName, HISTORY_ITEMS, memberGone, memberName, type Group, type GroupMember } from '../app/groups';
+import { groupActive, groupName, HISTORY_ITEMS, isModerator, memberGone, memberName, reviewsMembers, supportChatId, type Group, type GroupMember } from '../app/groups';
 import { groupPrefOn, roleRank, type GroupMemberRole } from '../core/chat/groups';
 import type { Profile } from '../core/chat/protocol';
 import { Avatar, resizeImage } from './util';
@@ -96,7 +96,7 @@ export function NewGroup({ session, onCreated }: { session: Session; onCreated: 
   );
 }
 
-export function GroupInfo({ session, group, onClose, onDeleted }: { session: Session; group: Group; onClose: () => void; onDeleted: () => void }): JSX.Element {
+export function GroupInfo({ session, group, onClose, onDeleted, onOpenChat }: { session: Session; group: Group; onClose: () => void; onDeleted: () => void; onOpenChat?: (chatId: string) => void }): JSX.Element {
   const chat = session.chat;
   useChatUpdates(session);
   const g = chat.group(group.id) ?? group;
@@ -108,8 +108,17 @@ export function GroupInfo({ session, group, onClose, onDeleted }: { session: Ses
   const active = g.status === 'active';
   const admin = active && roleRank(g.role) >= roleRank('admin');
   const owner = active && g.role === 'owner';
+  const moderator = active && isModerator(g.role);
+  // the members waiting for a review are listed apart, for the moderators
+  const waiting = moderator ? chat.groups.reviewMembers(g) : [];
+  const supportChats = moderator
+    ? Object.entries(g.support ?? {})
+        .filter(([id]) => id !== g.memberId && g.members[id] && !g.members[id].review)
+        .sort((a, b) => b[1].lastActivity - a[1].lastActivity)
+    : [];
   const members = chat.groups
     .members(g)
+    .filter((m) => !m.review || memberGone(m))
     .slice()
     .sort((a, b) => Number(memberGone(a)) - Number(memberGone(b)) || roleRank(b.role) - roleRank(a.role) || memberName(a).localeCompare(memberName(b)));
   const run = async (f: () => Promise<void>, done?: () => void) => {
@@ -158,6 +167,58 @@ export function GroupInfo({ session, group, onClose, onDeleted }: { session: Ses
           </select>
           <span class="hint">More messages take longer to arrive: they go through the member's queue, which holds a limited number at a time. Other admins send their own choice.</span>
         </label>
+      )}
+      {owner && (
+        <Toggle
+          checked={reviewsMembers(g)}
+          onChange={(v) => run(() => chat.groups.updateProfile(g.id, { memberAdmission: v ? { review: 'all' } : undefined }))}
+          label="Review new members"
+          hint="People who join via the group link wait until a moderator accepts them. Until then they chat only with the moderators, and do not see the group."
+        />
+      )}
+      {waiting.length > 0 && (
+        <>
+          <h4 class="members-head">
+            Waiting for review <span class="muted">{waiting.length}</span>
+          </h4>
+          <ul class="members">
+            {waiting.map((m) => (
+              <li class="member" key={m.memberId}>
+                <Avatar profile={m.profile} size={32} />
+                <span class="member-name">
+                  {memberName(m)}
+                  {m.status !== 'connected' && <span class="muted small"> · connecting…</span>}
+                </span>
+                <button class="small" onClick={() => onOpenChat?.(supportChatId(g.id, m.memberId))}>
+                  Chat
+                </button>
+                <ReviewButtons session={session} g={g} m={m} />
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {supportChats.length > 0 && (
+        <>
+          <h4 class="members-head">Chats with members</h4>
+          <ul class="members">
+            {supportChats.map(([id, sc]) => (
+              <li class="member" key={id}>
+                <Avatar profile={g.members[id].profile} size={32} />
+                <button class="link-btn member-name" onClick={() => onOpenChat?.(supportChatId(g.id, id))}>
+                  {memberName(g.members[id])}
+                </button>
+                {sc.unread > 0 && <span class="badge">{sc.unread}</span>}
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+      {groupActive(g) && !isModerator(g.role) && onOpenChat && (
+        <button onClick={() => onOpenChat(supportChatId(g.id, g.memberId))}>
+          <Icon name="shield" size={16} /> Chat with the moderators
+          {(g.support?.[g.memberId]?.unread ?? 0) > 0 && <span class="badge">{g.support![g.memberId].unread}</span>}
+        </button>
       )}
       <label>
         Local name (only you see it)
@@ -245,6 +306,32 @@ export function GroupInfo({ session, group, onClose, onDeleted }: { session: Ses
         </div>
       )}
     </Modal>
+  );
+}
+
+/** a moderator accepts a member who waits for a review; an admin can also reject them */
+export function ReviewButtons({ session, g, m }: { session: Session; g: Group; m: GroupMember }): JSX.Element {
+  const [busy, setBusy] = useState(false);
+  const run = async (f: () => Promise<void>) => {
+    setBusy(true);
+    try {
+      await f();
+    } catch (e) {
+      toast(errorText(e), 'error');
+    }
+    setBusy(false);
+  };
+  return (
+    <span class="review-buttons">
+      <button class="small primary" disabled={busy} onClick={() => run(() => session.chat.groups.acceptMember(g.id, m.memberId))}>
+        Accept
+      </button>
+      {roleRank(g.role) >= roleRank('admin') && (
+        <button class="small danger" disabled={busy} onClick={() => run(() => session.chat.groups.rejectMember(g.id, m.memberId))}>
+          Reject
+        </button>
+      )}
+    </span>
   );
 }
 

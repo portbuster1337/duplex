@@ -3,7 +3,7 @@ import type { JSX } from 'preact';
 import { useEffect, useMemo, useReducer, useState } from 'preact/hooks';
 import type { Session } from '../app/session';
 import { contentText, profileName, type ChatItem, type Contact, type ContactRequest, type PendingInvitation } from '../app/chat';
-import { groupName, memberName, type Group } from '../app/groups';
+import { groupName, isModerator, memberGone, memberName, type Group } from '../app/groups';
 import type { Profile } from '../core/chat/protocol';
 import { Avatar, fmtTime, plainText } from './util';
 import { Icon } from './icons';
@@ -139,11 +139,12 @@ export function Main({ session, onLock, onWiped }: { session: Session; onLock: (
   );
   const up = chat.connectedServers().length;
   const selContact = sel?.kind === 'contact' ? chat.contact(sel.id) : undefined;
-  const selGroup = sel?.kind === 'group' ? chat.group(sel.id) : undefined;
+  const selGroup = sel?.kind === 'group' ? chat.groupOf(sel.id) : undefined;
   const selRequest = sel?.kind === 'request' ? chat.state.requests[sel.id] : undefined;
   const selInvitation = sel?.kind === 'invitation' ? chat.state.invitations[sel.id] : undefined;
   const hasSel = !!(selContact || selGroup || selRequest || selInvitation);
-  const openChat = (id: string) => setSel(chat.isGroup(id) ? { kind: 'group', id } : { kind: 'contact', id });
+  // groups, and the chats of members with the moderators of a group
+  const openChat = (id: string) => setSel(chat.groupOf(id) ? { kind: 'group', id } : { kind: 'contact', id });
 
   return (
     <div class={`layout ${hasSel ? 'has-sel' : ''}`}>
@@ -178,7 +179,7 @@ export function Main({ session, onLock, onWiped }: { session: Session; onLock: (
             e.kind === 'contact' ? (
               <ContactRow key={e.c.id} c={e.c} items={previews[e.c.id]} active={sel?.kind === 'contact' && sel.id === e.c.id} onClick={() => setSel({ kind: 'contact', id: e.c.id })} />
             ) : (
-              <GroupRow key={e.g.id} g={e.g} items={previews[e.g.id]} active={sel?.kind === 'group' && sel.id === e.g.id} onClick={() => setSel({ kind: 'group', id: e.g.id })} />
+              <GroupRow key={e.g.id} g={e.g} items={previews[e.g.id]} active={sel?.kind === 'group' && (sel.id === e.g.id || sel.id.startsWith(`${e.g.id}#`))} onClick={() => setSel({ kind: 'group', id: e.g.id })} />
             ),
           )}
           {!contacts.length && !groups.length && !requests.length && !invitations.length && (
@@ -193,7 +194,7 @@ export function Main({ session, onLock, onWiped }: { session: Session; onLock: (
       </aside>
       <main class="main">
         {selContact || selGroup ? (
-          <ChatView key={(selContact ?? selGroup)!.id} session={session} chatId={(selContact ?? selGroup)!.id} onBack={() => setSel(undefined)} onDeleted={() => setSel(undefined)} onOpen={openChat} />
+          <ChatView key={sel!.id} session={session} chatId={sel!.id} onBack={() => setSel(undefined)} onDeleted={() => setSel(undefined)} onOpen={openChat} />
         ) : selRequest ? (
           <RequestView session={session} request={selRequest} onDone={(c) => setSel(c ? { kind: 'contact', id: c.id } : undefined)} onBack={() => setSel(undefined)} />
         ) : selInvitation ? (
@@ -252,6 +253,9 @@ function ContactRow({ c, items, active, onClick }: { c: Contact; items?: ChatIte
 function GroupRow({ g, items, active, onClick }: { g: Group; items?: ChatItem[]; active: boolean; onClick: () => void }): JSX.Element {
   const p = lastItemPreview(items, g);
   const status = g.status === 'invited' ? 'invitation to join' : g.status === 'joining' || g.status === 'connecting' ? 'connecting…' : g.status === 'pending' ? 'waiting to be accepted' : '';
+  // moderators: members waiting for a review, and the chats of members with the moderators
+  const waiting = isModerator(g.role) ? Object.values(g.members).filter((m) => m.review && !memberGone(m)).length : 0;
+  const attention = waiting + Object.values(g.support ?? {}).reduce((n, s) => n + s.unread, 0);
   return (
     <button class={`row ${active ? 'active' : ''}`} onClick={onClick} role="listitem">
       <Avatar profile={g.profile as Profile} size={44} />
@@ -268,6 +272,11 @@ function GroupRow({ g, items, active, onClick }: { g: Group; items?: ChatItem[];
         <span class="row-bottom">
           <span class={`row-preview ${status ? 'italic accent' : ''}`}>{status || p.text}</span>
           {g.unread > 0 && !g.muted && <span class="badge">{g.unread}</span>}
+          {attention > 0 && (
+            <span class="badge attention" title={waiting ? `${waiting} waiting for review` : 'new messages in chats with members'}>
+              {waiting ? `${waiting} waiting` : attention}
+            </span>
+          )}
         </span>
       </span>
     </button>

@@ -7,7 +7,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { ChatClient, type ChatItem, type Contact } from '../../src/app/chat';
-import type { Group, GroupMember } from '../../src/app/groups';
+import { supportChatId, type Group, type GroupMember } from '../../src/app/groups';
 import { MemoryBackend, Vault } from '../../src/app/vault';
 import { parseServer } from '../../src/core/smp/server';
 import { tcpConnector } from '../helpers/tcp';
@@ -257,6 +257,81 @@ test('the history of a group reaches new members: from Duplex, and from the CLI 
   assert.ok(iCarol < iEve && iEve < iJoined, `the history goes before joining: ${list.map((i) => i.content.text).join(' | ')}`);
   assert.ok(list[iCarol].brokerTs! < list[iJoined].ts);
   assert.equal(chat.group(h.id)!.unread, 0, 'the history is not unread');
+});
+
+test('member review: Duplex waits for the review of the CLI, and reviews who joins its own link', { skip: !SERVER }, async () => {
+  // the group of carol reviews new members: Duplex joins its link, waits, and chats with the moderators
+  await carol.cmd('/g #knock');
+  await carol.cmd('/set admission review #knock all');
+  const r = await carol.cmd('/create link #knock');
+  const link = r.groupLink?.connLinkContact?.connShortLink ?? r.groupLink?.connLinkContact?.connFullLink;
+  const preview = await chat.previewLink(link);
+  const g = await chat.joinGroup(link, { resolved: preview.resolved });
+  await until(() => member(g, 'carol')?.status === 'connected', NET, 'connected to the host');
+  assert.equal(chat.group(g.id)!.status, 'pending');
+  const own = supportChatId(g.id, chat.group(g.id)!.memberId);
+  await chat.sendText(own, 'please let me in');
+  const got = await carol.waitType('newChatItems', NET, (e) => groupItem(e, 'knock', 'please let me in'));
+  const gId = got.chatItems[0].chatInfo.groupInfo.groupId;
+  const gmId = got.chatItems[0].chatItem.chatDir.groupMember.groupMemberId;
+  assert.ok(got.chatItems[0].chatInfo.groupChatScope, `in the chat with the moderators: ${JSON.stringify(got.chatItems[0].chatInfo).slice(0, 200)}`);
+  await carol.cmd(`/_send #${gId}(_support:${gmId}) text one moment please`);
+  await until(() => items(own).some((i) => i.dir === 'rcv' && i.content.text === 'one moment please'), NET, 'the reply of the moderator');
+  assert.ok(!items(g.id).some((i) => i.content.text === 'one moment please'), 'not in the group chat');
+  await carol.cmd(`/_accept member #${gId} ${gmId} member`);
+  await until(() => chat.group(g.id)?.status === 'active', NET, 'accepted');
+  await carol.cmd('#knock you are in');
+  await until(() => rcvText(g, 'carol', 'you are in'), NET, 'a message after the review');
+
+  // Duplex's group reviews new members: carol is a member, eve joins the link
+  const dg = await chat.groups.create({ displayName: 'dknock' });
+  await chat.groups.updateProfile(dg.id, { memberAdmission: { review: 'all' } });
+  await chat.groups.invite(dg.id, carolC.id);
+  await cliJoins(carol, 'dknock');
+  await until(() => member(dg, 'carol')?.status === 'connected', NET, 'carol connected');
+  const dlink = await chat.groups.createLink(dg.id);
+  await eve.cmd(`/c ${dlink}`);
+  const em = await until(() => member(dg, 'eve')?.status === 'connected' && member(dg, 'eve'), NET, 'eve connected');
+  assert.ok(em.review, 'eve waits for the review');
+  const eg = ((await eve.cmd('/gs')).groups ?? []).find((x: any) => (x.groupInfo ?? x).groupProfile?.displayName === 'dknock');
+  const eveGroupId = (eg.groupInfo ?? eg).groupId;
+  await eve.cmd(`/_send #${eveGroupId}(_support) text hello moderators`);
+  const eveChat = supportChatId(dg.id, em.memberId);
+  await until(() => items(eveChat).some((i) => i.dir === 'rcv' && i.content.text === 'hello moderators'), NET, 'the message of eve to the moderators');
+  await chat.sendText(eveChat, 'hi eve, one moment');
+  await eve.waitType('newChatItems', NET, (e) => groupItem(e, 'dknock', 'hi eve, one moment'));
+  // carol, who is not a moderator, does not know eve yet
+  const before = await carol.cmd('/ms #dknock');
+  assert.ok(!(before.group?.members ?? []).some((m: any) => m.memberProfile.displayName === 'eve'), JSON.stringify(before).slice(0, 300));
+  await chat.groups.acceptMember(dg.id, em.memberId);
+  await eve.waitType('userJoinedGroup', NET, (e) => e.groupInfo?.groupProfile?.displayName === 'dknock');
+  await carol.waitType('connectedToGroupMember', NET, (e) => e.groupInfo?.groupProfile?.displayName === 'dknock' && e.member?.memberProfile?.displayName === 'eve');
+  await chat.sendText(dg.id, 'welcome eve');
+  await eve.waitType('newChatItems', NET, (e) => groupItem(e, 'dknock', 'welcome eve'));
+});
+
+test('member review: Duplex as a moderator of the CLI accepts a member', { skip: !SERVER }, async () => {
+  await carol.cmd('/g #mknock');
+  await carol.cmd('/set admission review #mknock all');
+  await carol.cmd(`/a #mknock @${daveAtCarol} moderator`);
+  const g = await duplexJoins('mknock');
+  assert.equal(chat.group(g.id)!.role, 'moderator');
+  const r = await carol.cmd('/create link #mknock');
+  await eve.cmd(`/c ${r.groupLink?.connLinkContact?.connShortLink ?? r.groupLink?.connLinkContact?.connFullLink}`);
+  // carol introduces eve to the moderators only
+  const em = await until(() => member(g, 'eve')?.status === 'connected' && member(g, 'eve'), NET, 'connected to eve');
+  assert.ok(em.review);
+  const eg = ((await eve.cmd('/gs')).groups ?? []).find((x: any) => (x.groupInfo ?? x).groupProfile?.displayName === 'mknock');
+  await eve.cmd(`/_send #${(eg.groupInfo ?? eg).groupId}(_support) text may I join?`);
+  const eveChat = supportChatId(g.id, em.memberId);
+  await until(() => items(eveChat).some((i) => i.dir === 'rcv' && i.content.text === 'may I join?'), NET, 'the message of eve');
+  await chat.groups.acceptMember(g.id, em.memberId);
+  // carol, the host, introduces eve to the others after the moderator accepted her
+  await eve.waitType('userJoinedGroup', NET, (e) => e.groupInfo?.groupProfile?.displayName === 'mknock');
+  await carol.cmd('#mknock hello all');
+  await eve.waitType('newChatItems', NET, (e) => groupItem(e, 'mknock', 'hello all'));
+  await eve.cmd('#mknock thanks dave');
+  await until(() => rcvText(g, 'eve', 'thanks dave'), NET, 'a message of eve in the group');
 });
 
 test('leaving and removing members', { skip: !SERVER }, async () => {
