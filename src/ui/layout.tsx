@@ -106,10 +106,16 @@ export function Main({ session, onLock, onWiped }: { session: Session; onLock: (
   useEffect(() => {
     const mins = session.settings.autoLockMinutes;
     if (!mins) return;
-    let t = setTimeout(onLock, mins * 60000);
+    // not during a call
+    const lock = () => {
+      const st = session.chat.calls.active?.status;
+      if (st && st !== 'ended') t = setTimeout(lock, mins * 60000);
+      else onLock();
+    };
+    let t = setTimeout(lock, mins * 60000);
     const reset = () => {
       clearTimeout(t);
-      t = setTimeout(onLock, mins * 60000);
+      t = setTimeout(lock, mins * 60000);
     };
     const evs = ['pointerdown', 'keydown', 'wheel', 'touchstart'];
     evs.forEach((e) => window.addEventListener(e, reset, { passive: true }));

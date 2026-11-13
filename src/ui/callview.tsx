@@ -17,7 +17,7 @@ class CallEngine {
   private early: string[] = [];
   onChange: () => void = () => {};
 
-  constructor(private session: Session) {
+  constructor(readonly session: Session) {
     const chat = session.chat;
     chat.callEncryption = supportsCallEncryption;
     chat.calls.onSignal = (s) => {
@@ -102,8 +102,12 @@ class CallEngine {
 
 let engine: CallEngine | undefined;
 
+/** the engine of this session (a new one after the profile is unlocked again) */
 export function callEngine(session: Session): CallEngine {
-  if (!engine) engine = new CallEngine(session);
+  if (engine?.session !== session) {
+    engine?.close();
+    engine = new CallEngine(session);
+  }
   return engine;
 }
 
@@ -147,6 +151,8 @@ export function CallScreen({ session }: { session: Session }): JSX.Element | nul
     return () => {
       off();
       eng.onChange = () => {};
+      // locked: the call stops with the session
+      eng.close();
     };
   }, [session]);
   const call = chat.calls.active;
