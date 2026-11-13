@@ -91,7 +91,7 @@ export function useReceive(session: Session, contactId: string, it: ChatItem): {
   const modal = servers ? (
     <Modal title="Download from an unknown server?" onClose={() => setServers(undefined)}>
       <p>
-        The file is on <b>{servers.join(', ')}</b>, a file server that you do not use. Your relay connects to it from this computer, so the server can see your IP address and when you download the file. Everything in the file stays end-to-end encrypted.
+        The file is on <b>{servers.join(', ')}</b>, a file server that you do not use. It will see the IP address that your relay connects from (your own, with a relay on this computer) and when you download the file. The file itself stays end-to-end encrypted.
       </p>
       <div class="row">
         <button onClick={() => setServers(undefined)}>Cancel</button>
