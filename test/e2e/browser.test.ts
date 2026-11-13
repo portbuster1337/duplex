@@ -121,6 +121,39 @@ test('the chats are restored after reload and unlock', async () => {
   await shot('7-after-reload');
 });
 
+test('the security code is the same as in the official client, and disappearing messages can be set', async () => {
+  await page.getByLabel('Contact info').click();
+  await page.locator('.security-code summary').click();
+  const code = (await page.locator('.security-code .code').textContent())!.trim();
+  const cc = await cli.cmd(`/code @${ME}`);
+  assert.equal(cc.connectionCode, code);
+  await page.getByLabel('Disappearing messages').selectOption('300');
+  await cli.waitType('contactUpdated', NET, (e) => e.toContact?.profile?.preferences?.timedMessages?.ttl === 300);
+  await shot('8-contact-info');
+  await page.getByLabel('Close').click();
+  await page.locator('.chat-sub', { hasText: 'disappearing after 5 minutes' }).waitFor({ timeout: 30000 });
+  const input = page.getByLabel('Message', { exact: true });
+  await input.fill('This message disappears in 5 minutes');
+  await input.press('Enter');
+  const got = await cli.waitType('newChatItems', NET, (e) => itemTexts(e).includes('This message disappears in 5 minutes'));
+  assert.equal(got.chatItems[0].chatItem.meta.itemTimed?.ttl, 300);
+});
+
+test('an incognito 1-time link shares a random profile', async () => {
+  await page.getByLabel('New chat').first().click();
+  await page.locator('.link-box .mono').waitFor({ timeout: NET });
+  await page.locator('.modal .toggle-row', { hasText: 'Incognito' }).locator('input').check();
+  const hint = page.locator('.modal .toggle-row', { hasText: 'Incognito' }).locator('.hint');
+  await hint.filter({ hasText: 'random profile:' }).waitFor({ timeout: NET });
+  const name = (await hint.textContent())!.split(': ').pop()!.trim();
+  const link = (await page.locator('.link-box .mono').textContent())!.trim();
+  await page.getByText('Close and wait for the contact').click();
+  const r = await cli.cmd(`/c ${link}`);
+  assert.equal(r.type, 'sentConfirmation');
+  const con = await cli.waitType('contactConnected', NET);
+  assert.equal(con.contact.profile.displayName, name);
+});
+
 test('another tab can take over, and this one disconnects', async () => {
   const page2 = await page.context().newPage();
   await page2.goto(APP);

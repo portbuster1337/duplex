@@ -15,6 +15,7 @@ import {
   generateKeyPair,
   hkdf,
   publicKey,
+  sha256,
   sign,
   verify,
   type KeyAlg,
@@ -22,6 +23,7 @@ import {
 } from '../../src/core/crypto/crypto';
 import { generateE2EParams, initRcvRatchet, initSndRatchet, pqX3dhRcv, pqX3dhSnd, ratchetDecrypt, ratchetEncrypt, RatchetError, type Ratchet, type SkippedKeys } from '../../src/core/crypto/ratchet';
 import { fromHex, fromUtf8, toHex, utf8 } from '../../src/core/util/bytes';
+import { securityCode } from '../../src/core/agent/agent';
 
 const range = (a: number, b: number) => Uint8Array.from({ length: b - a }, (_, i) => a + i);
 
@@ -182,6 +184,18 @@ test('double ratchet: both directions, out of order, duplicates', () => {
   assert.equal(bob.receive(alice.send('first')), 'first');
   assert.equal(alice.receive(bob.send('step')), 'step');
   assert.equal(bob.receive(late), 'late');
+});
+
+test('security codes are formatted like verificationCode of simplex-chat', () => {
+  // T.pack . unwords . chunks 5 . show . os2ip
+  assert.equal(securityCode(sha256(utf8('abc'))), '84342 36848 70908 00366 52383 49281 42263 66010 48836 95016 51437 74629 85829 71681 70899 65');
+  assert.equal(securityCode(Uint8Array.of(0, 0, 1, 2)), '258');
+});
+
+test('both parties of a double ratchet have the same security code', () => {
+  const { alice, bob } = pair();
+  assert.equal(securityCode(sha256(alice.ad)), securityCode(sha256(bob.ad)));
+  assert.notEqual(securityCode(sha256(alice.ad)), securityCode(sha256(pair().alice.ad)));
 });
 
 test('double ratchet messages have the same size', () => {

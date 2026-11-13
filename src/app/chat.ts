@@ -26,6 +26,7 @@ import {
   type MsgContent,
   type Profile,
 } from '../core/chat/protocol';
+import { ADJECTIVES, NOUNS } from '../core/chat/names';
 import { ItemStore, VaultAgentStore } from './store';
 import type { Vault } from './vault';
 
@@ -46,8 +47,14 @@ export interface Contact {
   sendReceipts?: boolean;
   favorite?: boolean;
   muted?: boolean;
-  /** timed messages TTL in seconds, set when both sides allow it */
+  /** disappearing messages: the TTL in seconds of the messages sent to this contact */
   ttl?: number;
+  /** the contact's disappearing messages preference, from its profile */
+  peerTimed?: { allow?: string; ttl?: number };
+  /** the random profile shared with this contact instead of ours (incognito) */
+  incognito?: Profile;
+  /** the security code when it was verified */
+  verifiedCode?: string;
 }
 
 export interface PendingInvitation {
@@ -56,6 +63,7 @@ export interface PendingInvitation {
   link: string;
   createdAt: number;
   label?: string;
+  incognito?: Profile;
 }
 
 export interface ContactRequest {
@@ -86,6 +94,8 @@ export interface ChatItem {
   reactions?: Record<string, { me?: boolean; peer?: boolean }>;
   /** disappearing message: deletion time */
   deleteAt?: number;
+  /** a received disappearing message: its TTL in seconds, counted from when it is read */
+  ttl?: number;
   file?: { name: string; size: number };
   error?: string;
   integrity?: string;
@@ -136,6 +146,38 @@ const DEFAULT_PREFERENCES = {
 
 export function withDefaultPreferences(p: Profile): Profile {
   return { ...p, preferences: { ...DEFAULT_PREFERENCES, ...(p.preferences ?? {}), voice: { allow: 'no' }, files: { allow: 'no' }, calls: { allow: 'no' } } };
+}
+
+function randomIndex(n: number): number {
+  const b = new Uint32Array(1);
+  const limit = Math.floor(2 ** 32 / n) * n;
+  for (;;) {
+    crypto.getRandomValues(b);
+    if (b[0] < limit) return b[0] % n;
+  }
+}
+
+/** a random profile for an incognito connection, named like those of the official apps */
+export function randomProfile(): Profile {
+  const adjective = ADJECTIVES[randomIndex(ADJECTIVES.length)];
+  let noun = NOUNS[randomIndex(NOUNS.length)];
+  for (let i = 0; i < 2 && noun === adjective; i++) noun = NOUNS[randomIndex(NOUNS.length)];
+  return { displayName: adjective + noun, fullName: '' };
+}
+
+export const TTL_CHOICES = [300, 3600, 8 * 3600, 86400, 7 * 86400, 30 * 86400];
+
+export function ttlText(s: number): string {
+  const units: Array<[number, string]> = [
+    [30 * 86400, 'month'],
+    [7 * 86400, 'week'],
+    [86400, 'day'],
+    [3600, 'hour'],
+    [60, 'minute'],
+    [1, 'second'],
+  ];
+  for (const [n, u] of units) if (s >= n && s % n === 0) return `${s / n} ${u}${s / n === 1 ? '' : 's'}`;
+  return `${s} seconds`;
 }
 
 export function profileName(p?: Profile): string {
@@ -236,8 +278,11 @@ export class ChatClient {
   async chatItems(contactId: string): Promise<ChatItem[]> {
     let it = this.items.get(contactId);
     if (!it) {
-      it = await this.itemStore.load(contactId);
+      const loaded = await this.itemStore.load(contactId);
+      const now = Date.now();
+      it = loaded.filter((i) => !i.deleteAt || i.deleteAt > now);
       this.items.set(contactId, it);
+      if (it.length !== loaded.length) await this.itemStore.save(contactId, it, 0);
     }
     return it;
   }
@@ -258,8 +303,11 @@ export class ChatClient {
     this.emit({ type: 'items', contactId });
   }
 
-  private ourProfile(): Profile {
-    return withDefaultPreferences(this.settings.profile);
+  /** the profile sent to a contact: incognito or ours, with the disappearing messages TTL for this contact */
+  private ourProfile(c?: { incognito?: Profile; ttl?: number }): Profile {
+    const p = withDefaultPreferences(c?.incognito ?? this.settings.profile);
+    if (c?.ttl) p.preferences = { ...p.preferences, timedMessages: { allow: 'yes', ttl: c.ttl } };
+    return p;
   }
 
   private encodeInfo(m: ChatMessage): Bytes {
@@ -271,10 +319,22 @@ export class ChatClient {
   // ---- connecting
 
   /** creates a 1-time invitation link */
-  async createInvitation(label?: string): Promise<PendingInvitation> {
-    const r = await this.agent.createInvitation({ userData: contactShortLinkData(this.ourProfile()) });
-    const inv: PendingInvitation = { id: localId(), connId: r.connId, link: r.link, createdAt: Date.now(), label };
+  async createInvitation(opts: { label?: string; incognito?: boolean } = {}): Promise<PendingInvitation> {
+    const incognito = opts.incognito ? randomProfile() : undefined;
+    const r = await this.agent.createInvitation({ userData: contactShortLinkData(this.ourProfile({ incognito })) });
+    const inv: PendingInvitation = { id: localId(), connId: r.connId, link: r.link, createdAt: Date.now(), label: opts.label, incognito };
     this.state.invitations[inv.id] = inv;
+    await this.saveState();
+    return inv;
+  }
+
+  /** shares a random profile (or ours again) with whoever uses this 1-time link */
+  async setInvitationIncognito(id: string, on: boolean): Promise<PendingInvitation> {
+    const inv = this.state.invitations[id];
+    if (!inv) throw new ChatError('link not found');
+    const incognito = on ? randomProfile() : undefined;
+    await this.agent.updateLinkData(inv.connId, contactShortLinkData(this.ourProfile({ incognito })));
+    inv.incognito = incognito;
     await this.saveState();
     return inv;
   }
@@ -302,7 +362,7 @@ export class ChatClient {
   }
 
   /** connects via a 1-time invitation or a contact address */
-  async connect(link: string, opts: { resolved?: Awaited<ReturnType<Agent['resolveLink']>>; message?: string } = {}): Promise<Contact> {
+  async connect(link: string, opts: { resolved?: Awaited<ReturnType<Agent['resolveLink']>>; message?: string; incognito?: boolean } = {}): Promise<Contact> {
     const resolved = opts.resolved ?? (await this.agent.resolveLink(link));
     if (resolved.connReq.data.clientData) {
       // group links carry group data
@@ -316,15 +376,18 @@ export class ChatClient {
     const d = parseShortLinkData(resolved.userData);
     const profile: Profile = d.profile ?? { displayName: 'contact', fullName: '' };
     const isInv = resolved.connReq.mode === 'invitation';
+    const incognito = opts.incognito ? randomProfile() : undefined;
+    const ours = this.ourProfile({ incognito });
     let connInfo: Bytes;
-    if (isInv) connInfo = this.encodeInfo(xInfo(this.ourProfile()));
+    if (isInv) connInfo = this.encodeInfo(xInfo(ours));
     else {
       const msg = opts.message?.trim() ? { msgId: newSharedMsgId(), content: { type: 'text', text: opts.message.trim() } as MsgContent } : undefined;
-      connInfo = this.encodeInfo(xContact(this.ourProfile(), newSharedMsgId(), msg));
+      connInfo = this.encodeInfo(xContact(ours, newSharedMsgId(), msg));
     }
     const connId = await this.agent.joinConnection(resolved, connInfo);
     const now = Date.now();
-    const c: Contact = { id: localId(), connId, profile, status: isInv ? 'connecting' : 'requested', via: isInv ? 'invitation-joined' : 'address-request', createdAt: now, lastActivity: now, unread: 0 };
+    const c: Contact = { id: localId(), connId, profile, status: isInv ? 'connecting' : 'requested', via: isInv ? 'invitation-joined' : 'address-request', createdAt: now, lastActivity: now, unread: 0, incognito };
+    this.notePeerPrefs(c, profile);
     this.state.contacts[c.id] = c;
     this.connToContact.set(connId, c.id);
     await this.saveState();
@@ -367,6 +430,7 @@ export class ChatClient {
     delete this.state.requests[reqId];
     const now = Date.now();
     const c: Contact = { id: localId(), connId, profile: r.profile, status: 'connecting', via: 'address-accepted', createdAt: now, lastActivity: now, unread: 0 };
+    this.notePeerPrefs(c, r.profile);
     this.state.contacts[c.id] = c;
     this.connToContact.set(connId, c.id);
     await this.saveState();
@@ -411,9 +475,10 @@ export class ChatClient {
         quote = { sharedMsgId: q.sharedMsgId, text: contentText(q.content), sent: q.dir === 'snd' };
       }
     }
-    if (c.ttl) mc.ttl = c.ttl;
+    const ttl = this.sendTtl(c);
+    if (ttl) mc.ttl = ttl;
     const now = Date.now();
-    const item: ChatItem = { id: localId(), dir: 'snd', sharedMsgId, content, ts: now, status: 'sending', quote, deleteAt: c.ttl ? now + c.ttl * 1000 : undefined };
+    const item: ChatItem = { id: localId(), dir: 'snd', sharedMsgId, content, ts: now, status: 'sending', quote, deleteAt: ttl ? now + ttl * 1000 : undefined };
     await this.addItem(contactId, item);
     try {
       item.agentMsgId = await this.send(c, xMsgNew(sharedMsgId, mc));
@@ -474,9 +539,11 @@ export class ChatClient {
     if (!c) return;
     const items = await this.chatItems(contactId);
     let changed = -1;
+    const now = Date.now();
     items.forEach((it, i) => {
       if (it.dir === 'rcv' && it.status === 'received') {
         it.status = 'read';
+        if (it.ttl && !it.deleteAt) it.deleteAt = now + it.ttl * 1000;
         if (changed < 0) changed = i;
       }
     });
@@ -523,12 +590,79 @@ export class ChatClient {
   /** updates our profile and sends it to all contacts */
   async updateProfile(profile: Profile): Promise<void> {
     await this.saveSettings({ profile });
-    const p = this.ourProfile();
-    const info = xInfo(p);
+    // contacts that know an incognito profile keep it
     for (const c of Object.values(this.state.contacts)) {
-      if (c.status === 'active') await this.send(c, info).catch(() => {});
+      if (c.status === 'active' && !c.incognito) await this.send(c, xInfo(this.ourProfile(c))).catch(() => {});
     }
-    if (this.state.address) await this.agent.updateAddressData(this.state.address.connId, contactShortLinkData(p)).catch(() => {});
+    if (this.state.address) await this.agent.updateLinkData(this.state.address.connId, contactShortLinkData(this.ourProfile())).catch(() => {});
+  }
+
+  // ---- disappearing messages and security codes
+
+  /** whether the contact accepts disappearing messages */
+  peerAllowsTimed(c: Contact): boolean {
+    return c.peerTimed?.allow !== 'no';
+  }
+
+  /** the TTL of the messages sent to this contact now, if any */
+  disappearingTtl(c: Contact): number | undefined {
+    return this.sendTtl(c);
+  }
+
+  private sendTtl(c: Contact): number | undefined {
+    return c.ttl && this.peerAllowsTimed(c) ? c.ttl : undefined;
+  }
+
+  /** sets the TTL of the messages sent to this contact (and offers it to the contact, as the apps do) */
+  async setDisappearing(contactId: string, ttl: number | undefined): Promise<void> {
+    const c = this.activeContact(contactId);
+    if (ttl && !this.peerAllowsTimed(c)) throw new ChatError('the contact does not allow disappearing messages');
+    c.ttl = ttl || undefined;
+    await this.send(c, xInfo(this.ourProfile(c)));
+    await this.saveState();
+    await this.addEvent(c.id, c.ttl ? `you set disappearing messages to ${ttlText(c.ttl)}` : 'you turned off disappearing messages');
+  }
+
+  /** records the contact's preferences; a changed TTL is used for our messages too, like the apps do */
+  private notePeerPrefs(c: Contact, profile: Profile | undefined, update = false): string | undefined {
+    const tm = profile?.preferences?.timedMessages;
+    const next = { allow: tm?.allow, ttl: typeof tm?.ttl === 'number' && tm.ttl > 0 ? tm.ttl : undefined };
+    const prev = c.peerTimed;
+    c.peerTimed = next;
+    if (!update) return undefined;
+    // contacts made by an earlier version have no recorded preferences
+    if (!prev) {
+      if (next.allow !== 'no' && next.ttl && next.ttl !== c.ttl) {
+        c.ttl = next.ttl;
+        return `the contact set disappearing messages to ${ttlText(next.ttl)}`;
+      }
+      return undefined;
+    }
+    if (next.allow === 'no' && prev.allow !== 'no') return 'the contact does not allow disappearing messages';
+    if (next.allow !== 'no' && next.ttl !== prev.ttl && next.ttl !== c.ttl) {
+      c.ttl = next.ttl;
+      return next.ttl ? `the contact set disappearing messages to ${ttlText(next.ttl)}` : 'the contact turned off disappearing messages';
+    }
+    if (next.allow !== 'no' && prev.allow === 'no') return 'the contact allows disappearing messages again';
+    return undefined;
+  }
+
+  /** the security code to compare with the contact (the same as in the SimpleX Chat apps) */
+  securityCode(contactId: string): string | undefined {
+    const c = this.state.contacts[contactId];
+    return c ? this.agent.securityCode(c.connId) : undefined;
+  }
+
+  /** marks the connection as verified (with the code of this connection), or clears it */
+  async setVerified(contactId: string, verified: boolean): Promise<void> {
+    const c = this.state.contacts[contactId];
+    if (!c) return;
+    c.verifiedCode = verified ? this.securityCode(contactId) : undefined;
+    await this.saveState();
+  }
+
+  isVerified(c: Contact): boolean {
+    return !!c.verifiedCode && c.verifiedCode === this.agent.securityCode(c.connId);
   }
 
   private async addEvent(contactId: string, text: string): Promise<void> {
@@ -568,7 +702,7 @@ export class ChatClient {
         const inv = Object.values(this.state.invitations).find((i) => i.connId === e.connId);
         if (!c) {
           const now = Date.now();
-          c = { id: localId(), connId: e.connId, profile: profile ?? { displayName: 'contact', fullName: '' }, status: 'connecting', via: 'invitation-created', createdAt: now, lastActivity: now, unread: 0 };
+          c = { id: localId(), connId: e.connId, profile: profile ?? { displayName: 'contact', fullName: '' }, status: 'connecting', via: 'invitation-created', createdAt: now, lastActivity: now, unread: 0, incognito: inv?.incognito };
           this.state.contacts[c.id] = c;
           this.connToContact.set(e.connId, c.id);
           await this.addEvent(c.id, 'connecting…');
@@ -576,16 +710,18 @@ export class ChatClient {
           if (profile) c.profile = profile;
           if (c.status === 'requested') c.status = 'connecting';
         }
+        this.notePeerPrefs(c, profile);
         if (m?.v) c.peerChatVR = m.v;
         if (inv) delete this.state.invitations[inv.id];
         await this.saveState();
-        return { allow: this.encodeInfo(xInfo(this.ourProfile())) };
+        return { allow: this.encodeInfo(xInfo(this.ourProfile(c))) };
       }
       case 'INFO': {
         const c = this.contactByConn(e.connId);
         const m = this.parseInfo(e.connInfo);
         if (c && m?.event === 'x.info' && m.params.profile) {
           c.profile = m.params.profile as Profile;
+          this.notePeerPrefs(c, c.profile);
           if (m.v) c.peerChatVR = m.v;
           await this.saveState();
         }
@@ -704,7 +840,7 @@ export class ChatClient {
         }
         if (mc.forward) item.forwarded = true;
         if (mc.file) item.file = { name: mc.file.fileName, size: mc.file.fileSize };
-        if (typeof mc.ttl === 'number' && mc.ttl > 0) item.deleteAt = brokerTs + mc.ttl * 1000;
+        if (typeof mc.ttl === 'number' && mc.ttl > 0) item.ttl = mc.ttl;
         c.unread++;
         await this.addItem(c.id, item);
         return true;
@@ -737,7 +873,11 @@ export class ChatClient {
         return false;
       }
       case 'x.info': {
-        if (m.params.profile) c.profile = m.params.profile as Profile;
+        if (m.params.profile) {
+          c.profile = m.params.profile as Profile;
+          const note = this.notePeerPrefs(c, c.profile, true);
+          if (note) await this.addEvent(c.id, note);
+        }
         return false;
       }
       case 'x.direct.del': {

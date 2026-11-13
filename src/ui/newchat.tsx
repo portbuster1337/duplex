@@ -58,6 +58,8 @@ export function LinkShare({ link, note }: { link: string; note?: string }): JSX.
 function Invite({ session, onOpen }: { session: Session; onOpen: (s: Selection) => void }): JSX.Element {
   const [inv, setInv] = useState<PendingInvitation>();
   const [err, setErr] = useState('');
+  // the incognito switch moves at once; the link data is updated on the router in the background
+  const [wantIncognito, setWantIncognito] = useState<boolean>();
   useEffect(() => {
     let cancelled = false;
     session.chat
@@ -75,9 +77,25 @@ function Invite({ session, onOpen }: { session: Session; onOpen: (s: Selection) 
         <Spinner label="Creating a 1-time link…" />
       </div>
     );
+  const updating = wantIncognito !== undefined;
   return (
     <>
       <LinkShare link={inv.link} note="Show this QR code or send the link to your contact, ideally in person or via another trusted channel. The link can be used only once — the person who uses it first will connect with you." />
+      <Toggle
+        checked={wantIncognito ?? !!inv.incognito}
+        disabled={updating}
+        label="Incognito"
+        hint={updating ? 'Updating the link…' : inv.incognito ? `Your contact will see a random profile: ${inv.incognito.displayName}` : 'Share a new random profile with this contact instead of yours'}
+        onChange={async (v) => {
+          setWantIncognito(v);
+          try {
+            setInv({ ...(await session.chat.setInvitationIncognito(inv.id, v)) });
+          } catch (e) {
+            toast(errorText(e), 'error');
+          }
+          setWantIncognito(undefined);
+        }}
+      />
       <div class="row">
         <button class="link-btn" onClick={() => onOpen({ kind: 'invitation', id: inv.id })}>
           Close and wait for the contact
@@ -93,6 +111,7 @@ function Connect({ session, onOpen }: { session: Session; onOpen: (s: Selection)
   const [err, setErr] = useState('');
   const [preview, setPreview] = useState<Awaited<ReturnType<Session['chat']['previewLink']>>>();
   const [message, setMessage] = useState('');
+  const [incognito, setIncognito] = useState(false);
 
   const doPreview = async () => {
     setErr('');
@@ -112,7 +131,7 @@ function Connect({ session, onOpen }: { session: Session; onOpen: (s: Selection)
     setBusy(true);
     setErr('');
     try {
-      const c = await session.chat.connect(link, { resolved: preview?.resolved, message });
+      const c = await session.chat.connect(link, { resolved: preview?.resolved, message, incognito });
       onOpen({ kind: 'contact', id: c.id });
     } catch (e) {
       setErr(errorText(e));
@@ -157,6 +176,7 @@ function Connect({ session, onOpen }: { session: Session; onOpen: (s: Selection)
               ? 'You will share your profile with this contact. The connection is established once both of you are online.'
               : 'A contact request with your profile will be sent. The address owner can accept or reject it.'}
           </p>
+          <Toggle checked={incognito} onChange={setIncognito} label="Connect incognito" hint="Share a new random profile with this contact instead of yours" />
           {preview.kind === 'contact' && (
             <label>
               Message (optional)

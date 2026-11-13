@@ -53,27 +53,36 @@ export const ITEMS_PER_CHUNK = 50;
 
 export class ItemStore<T extends { id: string }> {
   private writes = new Map<string, Promise<void>>();
+  /** the number of stored chunks of each chat */
+  private counts = new Map<string, number>();
 
   constructor(private vault: Vault) {}
 
   async load(chatId: string): Promise<T[]> {
     const meta = await this.vault.get<{ chunks: number }>(`items:${chatId}:meta`);
+    this.counts.set(chatId, meta?.chunks ?? 0);
     if (!meta) return [];
     const out: T[] = [];
     for (let i = 0; i < meta.chunks; i++) out.push(...((await this.vault.get<T[]>(`items:${chatId}:${i}`)) ?? []));
     return out;
   }
 
-  /** writes the chunks containing the given indices (or all) */
+  /**
+   * writes the chunks from the one containing changedFrom; chunks past the end (after deletions) are
+   * removed, so that deleted messages do not stay in the storage
+   */
   save(chatId: string, items: T[], changedFrom = 0): Promise<void> {
     const prev = this.writes.get(chatId) ?? Promise.resolve();
     const snapshot = items.slice();
     const next = prev.then(async () => {
       const chunks = Math.max(1, Math.ceil(snapshot.length / ITEMS_PER_CHUNK));
+      const stored = this.counts.get(chatId) ?? (await this.vault.get<{ chunks: number }>(`items:${chatId}:meta`))?.chunks ?? 0;
       for (let i = Math.floor(changedFrom / ITEMS_PER_CHUNK); i < chunks; i++) {
         await this.vault.put(`items:${chatId}:${i}`, snapshot.slice(i * ITEMS_PER_CHUNK, (i + 1) * ITEMS_PER_CHUNK));
       }
       await this.vault.put(`items:${chatId}:meta`, { chunks });
+      for (let i = chunks; i < stored; i++) await this.vault.del(`items:${chatId}:${i}`);
+      this.counts.set(chatId, chunks);
     });
     this.writes.set(chatId, next.catch(() => {}));
     return next;
@@ -85,6 +94,7 @@ export class ItemStore<T extends { id: string }> {
       const meta = await this.vault.get<{ chunks: number }>(`items:${chatId}:meta`);
       if (meta) for (let i = 0; i < meta.chunks; i++) await this.vault.del(`items:${chatId}:${i}`);
       await this.vault.del(`items:${chatId}:meta`);
+      this.counts.set(chatId, 0);
     });
     this.writes.set(chatId, next.catch(() => {}));
     return next;

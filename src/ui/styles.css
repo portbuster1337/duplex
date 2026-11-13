@@ -467,6 +467,10 @@ h3 {
   color: #f5b301;
 }
 
+.incog {
+  color: var(--muted);
+}
+
 .row-time {
   font-size: 12px;
   color: var(--muted);
@@ -959,6 +963,49 @@ code {
 
 .request-msg {
   font-style: italic;
+}
+
+.chat-name .verified {
+  color: var(--ok);
+  vertical-align: -2px;
+  margin-left: 4px;
+}
+
+.security-code {
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 10px 14px;
+}
+
+.security-code summary {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-weight: 600;
+}
+
+.security-code[open] {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: stretch;
+}
+
+.security-code .qr {
+  align-self: center;
+}
+
+.security-code .code {
+  text-align: center;
+  font-size: 15px;
+  letter-spacing: 0.04em;
+  word-spacing: 0.3em;
+  margin: 0;
+}
+
+.note .icon {
+  vertical-align: -3px;
 }
 
 /* modals */

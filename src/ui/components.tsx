@@ -24,14 +24,14 @@ export function Modal({ title, onClose, children, wide }: { title: string; onClo
   );
 }
 
-export function Toggle({ checked, onChange, label, hint }: { checked: boolean; onChange: (v: boolean) => void; label: string; hint?: string }): JSX.Element {
+export function Toggle({ checked, onChange, label, hint, disabled }: { checked: boolean; onChange: (v: boolean) => void; label: string; hint?: string; disabled?: boolean }): JSX.Element {
   return (
     <label class="toggle-row">
       <span>
         <span class="toggle-label">{label}</span>
         {hint && <span class="hint">{hint}</span>}
       </span>
-      <input type="checkbox" role="switch" checked={checked} onChange={(e) => onChange((e.target as HTMLInputElement).checked)} />
+      <input type="checkbox" role="switch" checked={checked} disabled={disabled} onChange={(e) => onChange((e.target as HTMLInputElement).checked)} />
     </label>
   );
 }

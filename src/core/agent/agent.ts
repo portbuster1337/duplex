@@ -1,7 +1,7 @@
 // SMP agent: duplex connections over pairs of SMP queues, with the fast connection handshake
 // (sender-secured queues), double ratchet e2e encryption, message integrity, delivery receipts,
 // contact addresses and short links (Simplex.Messaging.Agent).
-import { b64url, b64urlNoPad, equal, randomBytes, type Bytes } from '../util/bytes';
+import { b64url, b64urlNoPad, equal, randomBytes, toHex, type Bytes } from '../util/bytes';
 import { dh, generateKeyPair, sha256, sha3_384, sign, cbDecrypt, cbEncrypt, CryptoError, type KeyPair, type PrivateKey, type PublicKey } from '../crypto/crypto';
 import {
   E2E_VERSIONS,
@@ -249,6 +249,13 @@ function checkIntegrity(prevExtId: number, extId: number, prevHash: Bytes, recei
   return 'bad message hash';
 }
 
+/** verificationCode of simplex-chat: the hash as a decimal number, in groups of 5 digits */
+export function securityCode(hash: Bytes): string {
+  return BigInt('0x' + (toHex(hash) || '0'))
+    .toString()
+    .replace(/(\d{5})(?=\d)/g, '$1 ');
+}
+
 export function isNetworkError(e: unknown): boolean {
   return !(e instanceof SMPError) && !(e instanceof AgentError) && !(e instanceof CryptoError);
 }
@@ -313,6 +320,12 @@ export class Agent {
 
   getConn(id: string): Conn | undefined {
     return this.conns.get(id);
+  }
+
+  /** the security code of a connection, which both parties can compare (codeAD in simplexmq) */
+  securityCode(connId: string): string | undefined {
+    const ad = this.conns.get(connId)?.ratchet?.ad;
+    return ad ? securityCode(sha256(ad)) : undefined;
   }
 
   allConns(): Conn[] {
@@ -652,16 +665,20 @@ export class Agent {
     return { connId: c.id, link, fullLink: strConnReq(connReq) };
   }
 
-  /** updates the user data (e.g. profile) stored with an address short link */
-  async updateAddressData(connId: string, userData: Bytes): Promise<void> {
+  /**
+   * updates the user data (e.g. the profile) stored with the short link of an address, or of a 1-time
+   * invitation that was not used yet (the router refuses it once the joining party has the link)
+   */
+  async updateLinkData(connId: string, userData: Bytes): Promise<void> {
     await this.withLock(connId, async () => {
       const c = this.mustConn(connId);
       const sl = c.rcv?.shortLink;
-      if (c.mode !== 'contact' || !c.rcv || !sl) throw new AgentError('not an address with a short link');
-      const ld: ConnLinkData = { mode: 'contact', agentVersions: AGENT_VERSIONS, data: { direct: true, owners: [], relays: [], userData } };
+      if (!c.rcv || !sl) throw new AgentError('the connection has no short link');
+      const ld: ConnLinkData =
+        c.mode === 'contact' ? { mode: 'contact', agentVersions: AGENT_VERSIONS, data: { direct: true, owners: [], relays: [], userData } } : { mode: 'invitation', agentVersions: AGENT_VERSIONS, userData };
       const lb = encodeLinkData(ld);
       const signed = new Encoder().bytes(sign(sl.rootPriv, lb)).raw(lb).finish();
-      const key = contactShortLinkKdf(sl.linkKey).key;
+      const key = c.mode === 'contact' ? contactShortLinkKdf(sl.linkKey).key : invShortLinkKdf(sl.linkKey);
       await this.network.send(c.rcv.server, c.rcv.rcvId, { tag: 'LSET', linkId: sl.linkId, data: { fixedData: sl.encFixedData, userData: encryptUserData(key, signed) } }, c.rcv.rcvPrivKey);
     });
   }

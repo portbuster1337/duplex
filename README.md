@@ -14,8 +14,12 @@ Chat are trademarks of SimpleX Chat Ltd.
 - **No user IDs.** You connect by sharing a 1-time link (or its QR code), or a contact address that
   people can send contact requests to. Links of the SimpleX Chat apps work too, short and full ones.
 - **Works with the SimpleX Chat apps**: text with SimpleX markdown, replies, edits, deletion (for
-  everyone or for you), reactions, delivery receipts, received disappearing messages, profile
-  pictures, contact addresses with automatic or manual acceptance of requests.
+  everyone or for you), reactions, delivery receipts, disappearing messages (set by either side),
+  profile pictures, contact addresses with automatic or manual acceptance of requests.
+- **Incognito connections**: a 1-time link or a connection can share a new random profile (named
+  like those of the apps) instead of yours.
+- **Security codes**: compare a contact's code (or scan its QR code in the apps) to check that nobody
+  is in the middle of the connection; the code is the same one the SimpleX Chat apps show.
 - **End-to-end encrypted** with the double ratchet (X448, AES-256-GCM, header encryption), per-queue
   NaCl boxes, and TLS 1.3 to servers that are pinned to the fingerprint in their address.
 - **Encrypted at rest.** Everything stored in the browser (IndexedDB) is encrypted with

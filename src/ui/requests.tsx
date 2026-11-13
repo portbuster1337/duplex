@@ -84,6 +84,11 @@ export function InvitationView({ session, inv, onDone, onBack }: { session: Sess
       </header>
       <div class="panel">
         <LinkShare link={inv.link} note="The contact will appear here once they use the link and you are both online." />
+        {inv.incognito && (
+          <p class="note">
+            <Icon name="incognito" size={16} /> Incognito: whoever uses this link sees the random profile <b>{inv.incognito.displayName}</b>, not yours.
+          </p>
+        )}
         <button
           class="danger"
           onClick={async () => {

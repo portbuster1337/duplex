@@ -183,6 +183,7 @@ function ContactRow({ c, items, active, onClick }: { c: Contact; items?: ChatIte
         <span class="row-top">
           <span class="row-name">
             {c.localAlias || profileName(c.profile)}
+            {c.incognito && <Icon name="incognito" size={13} class="incog" title={`incognito as ${c.incognito.displayName}`} />}
             {c.favorite && <Icon name="star" size={12} class="fav" />}
           </span>
           <span class="row-time">{p.ts ? fmtTime(p.ts) : ''}</span>

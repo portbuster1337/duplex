@@ -117,7 +117,7 @@ test('contact address request and accept', { skip: !SERVER }, async () => {
   await alice.a.sendMessage(aliceConnId, utf8('welcome'));
   assert.equal(fromUtf8((await bob.wait('MSG')).body), 'welcome');
   // the address data can be updated
-  await alice.a.updateAddressData(addr.connId, utf8('new profile'));
+  await alice.a.updateLinkData(addr.connId, utf8('new profile'));
   const r2 = await bob.a.resolveLink(addr.link);
   assert.equal(fromUtf8(r2.userData!), 'new profile');
   alice.a.stop();

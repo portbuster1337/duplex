@@ -2,9 +2,9 @@
 import type { JSX } from 'preact';
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
 import type { Session } from '../app/session';
-import { contentText, profileName, type ChatItem, type Contact } from '../app/chat';
+import { contentText, profileName, TTL_CHOICES, ttlText, type ChatItem, type Contact } from '../app/chat';
 import { REACTIONS } from '../core/chat/protocol';
-import { Avatar, fmtClock, fmtDay, fmtSize, isSimplexLink, Markdown, plainText, safeImage } from './util';
+import { Avatar, fmtClock, fmtDay, fmtSize, isSimplexLink, Markdown, plainText, QRCode, safeImage } from './util';
 import { Icon } from './icons';
 import { errorText, Modal, toast, Toggle } from './components';
 import { useChatUpdates } from './layout';
@@ -91,6 +91,8 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
   const shownItems = items.filter((i) => !i.deleteAt || i.deleteAt > Date.now()).slice(-limit);
   const canSend = contact.status === 'active';
   const name = contact.localAlias || profileName(contact.profile);
+  const ttl = chat.disappearingTtl(contact);
+  const verified = chat.isVerified(contact);
   let lastDay = '';
 
   return (
@@ -102,8 +104,19 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
         <button class="chat-title" onClick={() => setInfo(true)}>
           <Avatar profile={contact.profile} size={36} />
           <span>
-            <span class="chat-name">{name}</span>
-            <span class="chat-sub">{contact.status === 'active' ? (contact.profile.fullName || 'end-to-end encrypted') : contact.status === 'deleted' ? 'deleted the connection' : contact.status === 'requested' ? 'waiting for the contact to accept' : 'connecting…'}</span>
+            <span class="chat-name">
+              {name}
+              {verified && <Icon name="shieldCheck" size={15} class="verified" title="security code verified" />}
+            </span>
+            <span class="chat-sub">
+              {contact.status === 'active'
+                ? [contact.incognito ? `incognito as ${contact.incognito.displayName}` : contact.profile.fullName || 'end-to-end encrypted', ttl ? `disappearing after ${ttlText(ttl)}` : ''].filter(Boolean).join(' · ')
+                : contact.status === 'deleted'
+                  ? 'deleted the connection'
+                  : contact.status === 'requested'
+                    ? 'waiting for the contact to accept'
+                    : 'connecting…'}
+            </span>
           </span>
         </button>
         <button class="icon-btn" onClick={() => setInfo(true)} aria-label="Contact info" title="Contact info">
@@ -164,7 +177,7 @@ export function ChatView({ session, contact, onBack, onDeleted }: { session: Ses
             rows={1}
             value={text}
             disabled={!canSend}
-            placeholder={canSend ? 'Message' : contact.status === 'deleted' ? 'The contact deleted the connection' : 'Waiting for the connection…'}
+            placeholder={canSend ? (ttl ? `Message (disappears after ${ttlText(ttl)})` : 'Message') : contact.status === 'deleted' ? 'The contact deleted the connection' : 'Waiting for the connection…'}
             onInput={(e) => {
               const ta = e.target as HTMLTextAreaElement;
               setText(ta.value);
@@ -270,7 +283,7 @@ function Bubble({ it, onMenu, onLink, onReact }: { it: ChatItem; onMenu: (x: num
           </>
         )}
         <span class="meta">
-          {it.deleteAt && <Icon name="clock" size={11} title="disappearing message" />}
+          {(it.deleteAt || it.ttl) && <Icon name="clock" size={11} title={it.deleteAt ? `disappears ${new Date(it.deleteAt).toLocaleString()}` : `disappears ${ttlText(it.ttl!)} after it is read`} />}
           {it.edited && !it.deleted && <span>edited</span>}
           {it.integrity && <span class="err" title={it.integrity}>!</span>}
           <span>{fmtClock(it.brokerTs ?? it.ts)}</span>
@@ -381,6 +394,13 @@ function ContactInfo({ session, contact, onClose, onDeleted }: { session: Sessio
       <Toggle checked={contact.sendReceipts ?? session.settings.sendReceipts} onChange={(v) => chat.updateContact(contact.id, { sendReceipts: v })} label="Send delivery receipts" hint="Let this contact see when messages are delivered to you" />
       <Toggle checked={!!contact.favorite} onChange={(v) => chat.updateContact(contact.id, { favorite: v })} label="Favorite" />
       <Toggle checked={!!contact.muted} onChange={(v) => chat.updateContact(contact.id, { muted: v })} label="Mute notifications" />
+      {contact.incognito && (
+        <p class="note">
+          <Icon name="incognito" size={16} /> You are incognito with this contact: they see the random profile <b>{contact.incognito.displayName}</b>, not yours.
+        </p>
+      )}
+      <Disappearing session={session} contact={contact} />
+      <SecurityCode session={session} contact={contact} />
       <div class="kv">
         <span>Status</span>
         <span>{contact.status}</span>
@@ -419,6 +439,84 @@ function ContactInfo({ session, contact, onClose, onDeleted }: { session: Sessio
         )}
       </div>
     </Modal>
+  );
+}
+
+function Disappearing({ session, contact }: { session: Session; contact: Contact }): JSX.Element {
+  const chat = session.chat;
+  const [busy, setBusy] = useState(false);
+  const allowed = chat.peerAllowsTimed(contact);
+  const current = contact.ttl ?? 0;
+  const choices = current && !TTL_CHOICES.includes(current) ? [...TTL_CHOICES, current].sort((a, b) => a - b) : TTL_CHOICES;
+  return (
+    <label>
+      Disappearing messages
+      <select
+        value={String(allowed ? current : 0)}
+        disabled={busy || contact.status !== 'active' || !allowed}
+        onChange={async (e) => {
+          setBusy(true);
+          try {
+            await chat.setDisappearing(contact.id, Number((e.target as HTMLSelectElement).value) || undefined);
+          } catch (err) {
+            toast(errorText(err), 'error');
+          }
+          setBusy(false);
+        }}
+      >
+        <option value="0">Off</option>
+        {choices.map((s) => (
+          <option value={String(s)}>{ttlText(s)}</option>
+        ))}
+      </select>
+      <span class="hint">
+        {allowed
+          ? 'New messages are deleted for both of you after this time; the ones you receive, from when you read them. Your contact can change it too.'
+          : 'The contact does not allow disappearing messages.'}
+      </span>
+    </label>
+  );
+}
+
+function SecurityCode({ session, contact }: { session: Session; contact: Contact }): JSX.Element {
+  const chat = session.chat;
+  const code = chat.securityCode(contact.id);
+  const verified = chat.isVerified(contact);
+  const [other, setOther] = useState('');
+  if (!code || contact.status !== 'active') return <></>;
+  const same = (a: string, b: string) => a.replace(/\s+/g, '') === b.replace(/\s+/g, '');
+  return (
+    <details class="security-code">
+      <summary>
+        <Icon name={verified ? 'shieldCheck' : 'shield'} size={16} /> Security code {verified ? '(verified)' : ''}
+      </summary>
+      <p class="hint">
+        Compare this code with the one your contact sees (in the SimpleX Chat apps: contact info → Verify security code, where they can also scan this QR code). If they are the same, nobody is in the middle of your connection.
+      </p>
+      <QRCode text={code} size={180} />
+      <p class="mono code">{code}</p>
+      {verified ? (
+        <button onClick={() => chat.setVerified(contact.id, false)}>Clear verification</button>
+      ) : (
+        <>
+          <label>
+            Paste your contact's code to compare (optional)
+            <input value={other} onInput={(e) => setOther((e.target as HTMLInputElement).value)} inputMode="numeric" spellcheck={false} />
+          </label>
+          {other.trim() && <p class={same(other, code) ? 'ok' : 'error'}>{same(other, code) ? 'The codes are the same.' : 'The codes are different!'}</p>}
+          <button
+            class="primary"
+            disabled={!!other.trim() && !same(other, code)}
+            onClick={async () => {
+              await chat.setVerified(contact.id, true);
+              toast('Marked as verified');
+            }}
+          >
+            Mark as verified
+          </button>
+        </>
+      )}
+    </details>
   );
 }
 
