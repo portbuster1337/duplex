@@ -4,7 +4,7 @@ An unofficial, privacy-focused web client compatible with the [SimpleX network](
 It runs entirely in the browser, as static files: there is no Duplex server, no account and nothing
 to install.
 
-**Open it: <https://portbuster.codeberg.page/duplex/>** (about: <https://portbuster.codeberg.page/duplex/about/>)
+**Open it: <https://portbuster1337.github.io/duplex/>** (about: <https://portbuster1337.github.io/duplex/about/>, also on Codeberg: <https://portbuster.codeberg.page/duplex/>)
 
 Duplex is independent and is not affiliated with or endorsed by SimpleX Chat Ltd. SimpleX and SimpleX
 Chat are trademarks of SimpleX Chat Ltd.
